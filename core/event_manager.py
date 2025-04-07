@@ -27,6 +27,8 @@ class EventFlowMonitor:
             EventType.SIGNAL: {EventType.ORDER},  # Signals should lead to Orders
             EventType.ORDER: {EventType.EXECUTION, EventType.FILL},  # Orders should lead to Execution and/or Fills
             EventType.FILL: {EventType.POSITION},  # Fills should lead to Position updates
+            EventType.POSITION: {EventType.ACCOUNT},  # Position updates should lead to Account updates
+            EventType.EXECUTION: {EventType.FILL},  # Executions should lead to Fills
         }
         
         # Track actual events seen
@@ -42,6 +44,8 @@ class EventFlowMonitor:
             EventType.ORDER: 5.0,
             EventType.FILL: 5.0,
             EventType.EXECUTION: 10.0,
+            EventType.POSITION: 5.0,
+            EventType.ACCOUNT: 5.0,
         }
         
         # Statistics
@@ -286,7 +290,10 @@ class EventManager:
             "last_error": None,
             "last_error_time": None,
             "error_count": 0,
-            "error_history": []  # Keep a history of recent errors
+            "error_history": [],  # Keep a history of recent errors
+            "validation_errors": 0,  # Track validation errors
+            "retry_attempts": 0,  # Track retry attempts
+            "retry_successes": 0,  # Track successful retries
         }
         
         # Event logger reference (will be set by register_event_logger)
@@ -297,11 +304,17 @@ class EventManager:
         if enable_monitoring:
             self.flow_monitor = EventFlowMonitor(self)
 
+        # Retry queue for events that failed due to queue overflow
+        self.retry_queue = queue.Queue(maxsize=queue_size)
+        
         # Print event queue information        
         self.logger.info(f"Event queue initialized with max size: {self.event_queue.maxsize}")
         
         # Start diagnostic logging
         threading.Thread(target=self._diagnostic_logging_thread, daemon=True).start()
+        
+        # Start retry thread
+        threading.Thread(target=self._retry_thread, daemon=True).start()
 
     def start(self):
         """Start the event processing thread."""
@@ -418,7 +431,12 @@ class EventManager:
             if hasattr(event, 'validate'):
                 event.validate()
         except EventValidationError as e:
-            self.logger.warning(f"Event validation warning: {e} - will publish anyway")
+            # Don't publish invalid events
+            error_msg = f"Event validation error: {e} - event will not be published"
+            self.logger.error(error_msg)
+            self._record_error(error_msg, e)
+            self.stats["validation_errors"] += 1
+            return False
         except Exception as e:
             error_msg = f"Error validating event: {e}"
             self.logger.error(error_msg)
@@ -452,23 +470,73 @@ class EventManager:
             return True
             
         except queue.Full:
-            self.stats["queue_overflow_count"] += 1
-            self.logger.warning(f"Event queue full, event dropped: {event.event_type}")
-            
-            # Detailed diagnostic logging for queue overflow
-            self.logger.error(f"QUEUE OVERFLOW: Queue size={self.event_queue.qsize()}/{self.event_queue.maxsize}, Events published={self.stats['events_published']}, Events processed={self.stats['events_processed']}")
-            
-            # Log subscriber count for this event type to help diagnose
-            if event.event_type in self._subscribers:
-                subscriber_count = len(self._subscribers[event.event_type])
-                self.logger.error(f"Event type {event.event_type} has {subscriber_count} subscribers")
-            
-            return False
+            # Add to retry queue instead of dropping
+            try:
+                self.retry_queue.put(event, block=False)
+                self.logger.warning(f"Event queue full, event added to retry queue: {event.event_type}")
+                return True
+            except queue.Full:
+                # Both queues are full, now we have to drop
+                self.stats["queue_overflow_count"] += 1
+                self.logger.error(f"Event queue and retry queue full, event dropped: {event.event_type}")
+                
+                # Detailed diagnostic logging for queue overflow
+                self.logger.error(f"QUEUE OVERFLOW: Queue size={self.event_queue.qsize()}/{self.event_queue.maxsize}, Events published={self.stats['events_published']}, Events processed={self.stats['events_processed']}")
+                
+                # Log subscriber count for this event type to help diagnose
+                if event.event_type in self._subscribers:
+                    subscriber_count = len(self._subscribers[event.event_type])
+                    self.logger.error(f"Event type {event.event_type} has {subscriber_count} subscribers")
+                
+                return False
         except Exception as e:
             error_msg = f"Error publishing event: {str(e)}"
             self.logger.error(error_msg)
             self._record_error(error_msg, e)
             return False
+
+    def _retry_thread(self):
+        """Thread that retries publishing events from the retry queue"""
+        while True:
+            try:
+                # Sleep to avoid spinning
+                time.sleep(0.1)
+                
+                # Check if there are events to retry
+                if self.retry_queue.empty():
+                    continue
+                
+                # Check if main queue has space
+                if self.event_queue.full():
+                    continue
+                
+                # Get event from retry queue
+                event = self.retry_queue.get(block=False)
+                self.stats["retry_attempts"] += 1
+                
+                # Try to add to main queue
+                try:
+                    self.event_queue.put(event, block=False)
+                    self.stats["retry_successes"] += 1
+                    self.logger.info(f"Successfully retried event: {event.event_type}")
+                except queue.Full:
+                    # Put back in retry queue
+                    try:
+                        self.retry_queue.put(event, block=False)
+                    except queue.Full:
+                        # Both queues are full, drop the event
+                        self.stats["queue_overflow_count"] += 1
+                        self.logger.error(f"Event dropped during retry: {event.event_type}")
+                
+                # Mark as done
+                self.retry_queue.task_done()
+                
+            except queue.Empty:
+                # No events in retry queue
+                pass
+            except Exception as e:
+                self.logger.error(f"Error in retry thread: {str(e)}")
+                self.logger.error(traceback.format_exc())
 
     def publish_sync(self, event: Event) -> int:
         """
@@ -484,6 +552,23 @@ class EventManager:
             error_msg = f"Invalid event object: {type(event)}"
             self.logger.error(error_msg)
             self._record_error(error_msg)
+            return 0
+            
+        # Validate event if it has a validate method
+        try:
+            if hasattr(event, 'validate'):
+                event.validate()
+        except EventValidationError as e:
+            # Don't process invalid events
+            error_msg = f"Event validation error in sync publish: {e} - event will not be processed"
+            self.logger.error(error_msg)
+            self._record_error(error_msg, e)
+            self.stats["validation_errors"] += 1
+            return 0
+        except Exception as e:
+            error_msg = f"Error validating event in sync publish: {e}"
+            self.logger.error(error_msg)
+            self._record_error(error_msg, e)
             return 0
             
         # Directly dispatch to callbacks
@@ -694,6 +779,7 @@ class EventManager:
         # Add current queue size to stats
         current_stats = self.stats.copy()
         current_stats['current_queue_size'] = self.event_queue.qsize()
+        current_stats['current_retry_queue_size'] = self.retry_queue.qsize()
         
         # Remove detailed error history unless requested
         if not include_details:
@@ -722,7 +808,10 @@ class EventManager:
             "events_processed": 0,
             "queue_overflow_count": 0,
             "callbacks_executed": 0,
-            "callback_errors": 0
+            "callback_errors": 0,
+            "validation_errors": 0,
+            "retry_attempts": 0,
+            "retry_successes": 0
         })
         
         if self.flow_monitor:
@@ -749,6 +838,4 @@ class EventManager:
             self._diag_last_sample_time = current_time
             
             # Log diagnostic information
-            self.logger.info(f"Event queue size: {self.event_queue.qsize()}, Max queue size: {self.stats['max_queue_size']}, Publish rate: {publish_rate:.2f} events/s, Process rate: {process_rate:.2f} events/s")
-
-        
+            self.logger.info(f"Event queue size: {self.event_queue.qsize()}, Retry queue size: {self.retry_queue.qsize()}, Max queue size: {self.stats['max_queue_size']}, Publish rate: {publish_rate:.2f} events/s, Process rate: {process_rate:.2f} events/s")

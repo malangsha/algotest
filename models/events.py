@@ -95,6 +95,8 @@ class MarketDataEvent(Event):
         super().__post_init__()
         if self.event_type is None:
             self.event_type = EventType.MARKET_DATA
+        if self.data is None:
+            self.data = {}
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert market data event to dictionary."""
@@ -311,6 +313,14 @@ class OrderEvent(Event):
                 self.status = OrderStatus(self.status)
             except (ValueError, TypeError):
                 pass
+        
+        # Set order_time if not provided
+        if self.order_time is None:
+            self.order_time = self.timestamp
+            
+        # Set last_update_time if not provided
+        if self.last_update_time is None:
+            self.last_update_time = self.timestamp
 
     def _standardize_side_and_action(self):
         """Standardize between side and action for backward compatibility"""
@@ -445,6 +455,10 @@ class ExecutionEvent(OrderEvent):
         if self.leaves_quantity is None and self.quantity is not None and self.cumulative_filled_quantity is not None:
             self.leaves_quantity = self.quantity - self.cumulative_filled_quantity
             
+        # Set cumulative_filled_quantity if not provided
+        if self.cumulative_filled_quantity is None:
+            self.cumulative_filled_quantity = self.filled_quantity
+            
     def validate(self) -> bool:
         """
         Validate that the execution event has all required fields.
@@ -453,7 +467,7 @@ class ExecutionEvent(OrderEvent):
             bool: True if valid, raises exception otherwise
         """
         super().validate()
-        required_fields = ["order_id", "symbol", "status"]
+        required_fields = ["order_id", "symbol", "status", "execution_id"]
         return validate_event(self, required_fields)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -649,6 +663,10 @@ class SignalEvent(Event):
                 self.side = OrderSide(self.side)
             except (ValueError, TypeError):
                 pass
+        
+        # If price is not set but signal_price is, use signal_price
+        if self.price is None and self.signal_price is not None:
+            self.price = self.signal_price
 
     def validate(self) -> bool:
         """
@@ -658,7 +676,7 @@ class SignalEvent(Event):
             bool: True if valid, raises exception otherwise
         """
         super().validate()
-        required_fields = ["symbol", "signal_type", "signal_price", "signal_time", "strategy_id"]
+        required_fields = ["symbol", "signal_type", "signal_price", "signal_time", "strategy_id", "side"]
         return validate_event(self, required_fields)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -725,6 +743,19 @@ class TradeEvent(Event):
         super().__post_init__()
         if self.event_type is None:
             self.event_type = EventType.TRADE
+        if self.trade_id is None:
+            self.trade_id = str(uuid.uuid4())
+
+    def validate(self) -> bool:
+        """
+        Validate that the trade event has all required fields.
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["trade_id", "order_id", "symbol", "side", "quantity", "price"]
+        return validate_event(self, required_fields)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert trade event to dictionary."""
@@ -734,7 +765,7 @@ class TradeEvent(Event):
             "order_id": self.order_id,
             "symbol": self.symbol,
             "exchange": self.exchange,
-            "side": self.side.value,
+            "side": self.side.value if isinstance(self.side, OrderSide) else self.side,
             "quantity": self.quantity,
             "price": self.price,
             "commission": self.commission,
@@ -754,7 +785,7 @@ class TradeEvent(Event):
             order_id=data["order_id"],
             symbol=data["symbol"],
             exchange=data["exchange"],
-            side=OrderSide(data["side"]),
+            side=OrderSide(data["side"]) if isinstance(data["side"], str) else data["side"],
             quantity=data["quantity"],
             price=data["price"],
             commission=data.get("commission", 0.0),
@@ -780,6 +811,19 @@ class PositionEvent(Event):
         super().__post_init__()
         if self.event_type is None:
             self.event_type = EventType.POSITION
+        if self.closing_trade_details is None:
+            self.closing_trade_details = {}
+
+    def validate(self) -> bool:
+        """
+        Validate that the position event has all required fields.
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["symbol", "quantity", "average_price"]
+        return validate_event(self, required_fields)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert position event to dictionary."""
@@ -833,6 +877,17 @@ class AccountEvent(Event):
         super().__post_init__()
         if self.event_type is None:
             self.event_type = EventType.ACCOUNT
+
+    def validate(self) -> bool:
+        """
+        Validate that the account event has all required fields.
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["balance", "equity"]
+        return validate_event(self, required_fields)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert account event to dictionary."""
@@ -889,6 +944,17 @@ class StrategyEvent(Event):
         if self.data is None:
             self.data = {}
 
+    def validate(self) -> bool:
+        """
+        Validate that the strategy event has all required fields.
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["strategy_id", "status"]
+        return validate_event(self, required_fields)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert strategy event to dictionary."""
         result = super().to_dict()
@@ -931,6 +997,17 @@ class SystemEvent(Event):
         if self.data is None:
             self.data = {}
 
+    def validate(self) -> bool:
+        """
+        Validate that the system event has all required fields.
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["system_event_type", "message"]
+        return validate_event(self, required_fields)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert system event to dictionary."""
         result = super().to_dict()
@@ -952,5 +1029,71 @@ class SystemEvent(Event):
             system_event_type=data["system_event_type"],
             message=data["message"],
             severity=data.get("severity", "INFO"),
+            data=data.get("data", {})
+        )
+
+@dataclass
+class RiskBreachEvent(Event):
+    """Event for risk management breaches."""
+    
+    risk_type: str = None  # Type of risk breach (e.g., "POSITION_LIMIT", "DRAWDOWN_LIMIT")
+    symbol: Optional[str] = None  # Symbol related to the breach, if applicable
+    strategy_id: Optional[str] = None  # Strategy related to the breach, if applicable
+    action: Optional[str] = None  # Suggested action (e.g., "exit_position", "reduce_position")
+    position: Optional[float] = None  # Current position size, if applicable
+    threshold: Optional[float] = None  # Threshold that was breached
+    current_value: Optional[float] = None  # Current value that triggered the breach
+    message: Optional[str] = None  # Human-readable description of the breach
+    data: Optional[Dict[str, Any]] = None  # Additional data related to the breach
+    
+    def __post_init__(self):
+        super().__post_init__()
+        if self.event_type is None:
+            self.event_type = EventType.RISK_BREACH
+        if self.data is None:
+            self.data = {}
+            
+    def validate(self) -> bool:
+        """
+        Validate that the risk breach event has all required fields.
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["risk_type"]
+        return validate_event(self, required_fields)
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert risk breach event to dictionary."""
+        result = super().to_dict()
+        result.update({
+            "risk_type": self.risk_type,
+            "symbol": self.symbol,
+            "strategy_id": self.strategy_id,
+            "action": self.action,
+            "position": self.position,
+            "threshold": self.threshold,
+            "current_value": self.current_value,
+            "message": self.message,
+            "data": self.data
+        })
+        return result
+        
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'RiskBreachEvent':
+        """Create risk breach event from dictionary."""
+        return cls(
+            event_type=EventType(data["event_type"]),
+            timestamp=data["timestamp"],
+            event_id=data.get("event_id"),
+            risk_type=data["risk_type"],
+            symbol=data.get("symbol"),
+            strategy_id=data.get("strategy_id"),
+            action=data.get("action"),
+            position=data.get("position"),
+            threshold=data.get("threshold"),
+            current_value=data.get("current_value"),
+            message=data.get("message"),
             data=data.get("data", {})
         )

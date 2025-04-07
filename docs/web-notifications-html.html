@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="card-title">Notifications</h5>
+                </div>
+                <div class="card-body">
+                    <div class="notification-filters mb-4">
+                        <div class="btn-group" role="group">
+                            <button type="button" class="btn btn-outline-primary active" data-filter="all">All</button>
+                            <button type="button" class="btn btn-outline-primary" data-filter="trade">Trades</button>
+                            <button type="button" class="btn btn-outline-primary" data-filter="system">System</button>
+                            <button type="button" class="btn btn-outline-primary" data-filter="alert">Alerts</button>
+                        </div>
+                        <div class="float-right">
+                            <button id="markAllRead" class="btn btn-sm btn-outline-secondary">Mark All as Read</button>
+                            <button id="clearAllNotifications" class="btn btn-sm btn-outline-danger">Clear All</button>
+                        </div>
+                    </div>
+                    
+                    <div class="notification-list">
+                        {% if notifications %}
+                            {% for notification in notifications %}
+                                <div class="notification-item {{ 'unread' if not notification.read else '' }}" data-type="{{ notification.type }}">
+                                    <div class="notification-icon">
+                                        {% if notification.type == 'trade' %}
+                                            <i class="fas fa-exchange-alt"></i>
+                                        {% elif notification.type == 'system' %}
+                                            <i class="fas fa-cogs"></i>
+                                        {% elif notification.type == 'alert' %}
+                                            <i class="fas fa-bell"></i>
+                                        {% endif %}
+                                    </div>
+                                    <div class="notification-content">
+                                        <h6>{{ notification.title }}</h6>
+                                        <p>{{ notification.message }}</p>
+                                        <small class="text-muted">{{ notification.timestamp }}</small>
+                                    </div>
+                                    <div class="notification-actions">
+                                        <button class="btn btn-sm btn-link mark-read" data-id="{{ notification.id }}">
+                                            <i class="fas fa-check"></i>
+                                        </button>
+                                        <button class="btn btn-sm btn-link delete-notification" data-id="{{ notification.id }}">
+                                            <i class="fas fa-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            {% endfor %}
+                        {% else %}
+                            <div class="text-center py-5">
+                                <i class="fas fa-bell fa-3x text-muted mb-3"></i>
+                                <p>No notifications to display</p>
+                            </div>
+                        {% endif %}
+                    </div>
+                    
+                    {% if notifications|length > 10 %}
+                    <div class="pagination-container text-center mt-4">
+                        <nav aria-label="Notification pagination">
+                            <ul class="pagination justify-content-center">
+                                <li class="page-item disabled">
+                                    <a class="page-link" href="#" tabindex="-1">Previous</a>
+                                </li>
+                                <li class="page-item active"><a class="page-link" href="#">1</a></li>
+                                <li class="page-item"><a class="page-link" href="#">2</a></li>
+                                <li class="page-item"><a class="page-link" href="#">3</a></li>
+                                <li class="page-item">
+                                    <a class="page-link" href="#">Next</a>
+                                </li>
+                            </ul>
+                        </nav>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/notifications.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,53 @@
+# config/config.yaml
+system:
+  log_level: INFO
+  data_dir: "data/"
+  output_dir: "output/"
+  max_threads: 4
+
+market:
+  default_exchange: "NYSE"
+  trading_hours:
+    start: "09:30"
+    end: "16:00"
+  timezone: "America/New_York"
+  
+execution:
+  default_order_type: "MARKET"
+  max_order_size: 1000
+  slippage_model: "fixed"
+  slippage_factor: 0.0005
+  commission_model: "percentage"
+  commission_rate: 0.0015
+
+risk:
+  max_position_size: 100000
+  max_drawdown: 0.05
+  position_sizing: "percentage"
+  position_size_percentage: 0.02
+  stop_loss_percentage: 0.02
+  max_open_positions: 10
+
+# config/strategies.yaml
+strategies:
+  moving_average_crossover:
+    class: "MovingAverageCrossover"
+    params:
+      short_window: 20
+      long_window: 50
+      instruments: ["AAPL", "MSFT", "GOOGL"]
+      
+  mean_reversion:
+    class: "MeanReversion"
+    params:
+      lookback_period: 20
+      z_score_threshold: 2.0
+      instruments: ["SPY", "QQQ"]
+      
+  momentum:
+    class: "Momentum"
+    params:
+      lookback_period: 90
+      holding_period: 30
+      top_n: 5
+      instruments: ["AAPL", "MSFT", "GOOGL", "AMZN", "FB", "NFLX"]

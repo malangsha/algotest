@@ -1,0 +1,216 @@
+# Trading Framework Configuration
+
+# System Configuration
+system:
+  name: "AlgoTrading Framework"
+  mode: "paper"  # Options: "backtest", "live", "paper"
+  timezone: "Asia/Kolkata"
+  log_level: "DEBUG"  # Options: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+  log_dir: "logs"
+  data_dir: "data"
+  output_dir: "output"
+  max_threads: 20
+  heartbeat_interval: 1  # seconds
+  max_strategy_interval: 300
+
+# --- Broker Connection Configuration --- 
+# Defines how to connect to the execution broker (used by ExecutionHandler)
+broker_connections:
+  # Primary connection to use for live/paper trading
+  active_connection: "finvasia_live" # Name matching one of the connections below
+
+  connections:
+    - connection_name: "finvasia_live"
+      broker_type: "finvasia" # Matches the factory name (lowercase)
+      secrets: "config/.env.finvasia" # Contains user_id, password, api_key, twofa, vc, imei
+      api:
+        api_url: "https://api.shoonya.com/NorenWClientTP/"
+        timeout: 10
+        max_retries: 3
+        retry_delay: 1
+        debug: false
+      # Removed order defaults - should be handled by OrderManager/Strategy
+      # Removed market data settings - moved to market_data section
+
+    - connection_name: "simulated_broker"
+      broker_type: "simulated" # Assumes a brokers/simulated_broker.py exists
+      # No secrets needed for simulated
+      api:
+        timeout: 1
+        max_retries: 1
+        retry_delay: 0
+
+# --- Market Data Configuration --- 
+# Defines the source and settings for market data (used by LiveEngine/BacktestEngine)
+market_data:
+  # Source type for live/paper trading (used by LiveEngine)
+  live_feed_type: "finvasia_ws" # Options: "finvasia_ws", "simulated", "zerodha_ws", etc.
+                                # Should correspond to a class in live/market_data_feeds.py
+
+  # Source type for backtesting (used by BacktestingEngine)
+  backtest_data_source: "csv" # Options: "csv", "database", "api"
+
+  # Settings for specific feed types
+  feed_settings:
+    finvasia_ws:
+      # Credentials will be taken from the active broker_connection
+      # ws_url: "wss://api.shoonya.com/NorenWSTP/" # Can be overridden
+      reconnect_interval: 5
+      max_reconnect_attempts: 10
+      enable_persistence: true
+      persistence_path: "./data/finvasia_ticks"
+      persistence_interval: 600   # 10 minutes
+      max_ticks_in_memory: 20000
+      cache_file: "./cache/finvasia_symbols.json"
+      cache_expiry: 86400 # 24 hours
+
+    simulated:
+      initial_prices: # Optional: Symbol -> Initial Price
+        RELIANCE-EQ: 2800.0
+      volatility: 0.002
+      tick_interval: 1.0
+      price_jump_probability: 0.05
+      max_price_jump: 0.02
+      risk_free_rate: 0.05
+
+  # Settings for backtest data sources
+  backtest_sources:
+    csv:
+      dir: "data/historical"
+      format: "OHLCV" # Open, High, Low, Close, Volume
+    database:
+      type: "sqlite"
+      path: "data/market_data.db"
+      # Add host, port, user, pass, db_name if not sqlite
+
+# --- General Market Info --- 
+market:
+  default_exchange: "NSE"
+  exchanges:
+    - "NSE"
+    - "BSE"
+    - "NFO"
+    - "MCX"
+  market_hours:
+    start: "09:15:00"
+    end: "15:30:00"
+  pre_market_hours:
+    start: "09:00:00"
+    end: "09:15:00"
+  post_market_hours:
+    start: "15:30:00"
+    end: "16:00:00"
+  holidays: ["2025-01-26", "2025-08-15", "2025-10-02"]
+  data_retention_days: 15
+
+# --- Component Configurations --- 
+
+data_manager:
+  use_cache: true
+  cache_limit: 10000 # Max items per symbol in memory
+  use_redis: false
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+  persistence: # Settings for DataManager's own persistence (e.g., aggregated data)
+    enabled: false
+    path: "./data/processed"
+    interval: 300
+
+portfolio:
+  initial_capital: 1000000.0
+  max_leverage: 1.0 # Not strictly enforced yet, more for risk checks
+  # Max position constraints moved to risk section for centralization
+
+risk:
+  # Position Sizing Limits
+  max_position_size_pct: 0.20 # Max size as % of portfolio equity for a single position
+  max_position_value_abs: 200000 # Max absolute value (INR) for a single position
+  max_open_positions: 10
+  
+  # Exposure Limits
+  max_total_exposure_pct: 0.8 # Max total positions value / equity
+
+  # Drawdown Limit
+  max_drawdown_pct: 0.10 # 10% max drawdown from peak equity
+
+  # Position Sizing Model (used by RiskManager to suggest size, might be overridden by strategy)
+  position_sizing_model: "percent_risk" # Options: "fixed_fraction", "percent_risk", "fixed_risk", "kelly"
+  sizing_params:
+    fixed_fraction: 0.05 # e.g., 5% of portfolio value per trade
+    percent_risk: 0.01 # e.g., Risk 1% of portfolio value per trade (needs stop-loss)
+    fixed_risk_amount: 1000 # e.g., Risk $1000 per trade (needs stop-loss)
+    kelly_fraction: 0.5 # e.g., Use half-Kelly sizing (needs win_rate, win_loss_ratio)
+    # Volatility adjusted sizing might need more params
+
+  # Strategy Level Limits (Optional: Can be overridden in strategy config)
+  strategy_defaults:
+    max_daily_trades: 50
+    max_daily_loss_pct: 0.02 # 2% max loss per day for a strategy
+
+performance:
+  benchmark: "NIFTY 50"
+  metrics: # Metrics to calculate and report
+    - "total_return"
+    - "annualized_return"
+    - "sharpe_ratio"
+    - "sortino_ratio"
+    - "max_drawdown"
+    - "win_rate"
+    - "profit_factor"
+    # - "expectancy"
+    # - "cagr"
+  reporting:
+    frequency: "end_of_day" # Options: "real_time", "hourly", "end_of_day"
+    format: "json" # Options: "csv", "json"
+    save_trades: true
+    save_equity_curve: true
+
+backtest:
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 1000000 # Use portfolio.initial_capital
+  commission:
+    model: "percentage"
+    value: 0.0005 # 0.05%
+  slippage:
+    model: "percentage"
+    value: 0.001 # 0.1%
+
+live: # Specific settings for live mode
+  paper_trading: true # Set to true to enable paper trading simulation in FinvasiaBroker
+  allow_shorting: false
+  emergency_stop_on_broker_failure: false
+  notifications:
+    enable: false
+    # ... notification settings ...
+
+event_manager:
+  max_queue_size: 10000
+  # workers: 10 # Removed, using single processing thread for simplicity now
+
+# --- Instruments --- 
+# Define available instruments here. Strategies will select from this list.
+# More detailed definitions might be loaded dynamically from broker/files.
+instruments:
+  - symbol: "RELIANCE-EQ"
+    id: "RELIANCE" # Unique ID if needed, otherwise symbol is used
+    instrument_type: "EQ"
+    exchange: "NSE"
+    asset_type: "equity"
+    currency: "INR"
+    tick_size: 0.05
+    lot_size: 1
+    is_tradable: true
+
+  - symbol: "TCS-EQ"
+    id: "TCS"
+    instrument_type: "EQ"
+    exchange: "NSE"
+    asset_type: "equity"
+    currency: "INR"
+    tick_size: 0.05
+    lot_size: 1
+    is_tradable: true
+

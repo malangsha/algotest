@@ -1,0 +1,70 @@
+# Trading Strategies Configuration
+
+strategies:
+  - name: "moving_average_crossover"
+    type: "moving_average_crossover"
+    active: true
+    universe:
+      type: "explicit"
+      value: ["RELIANCE-EQ", "TCS-EQ", "HDFCBANK-EQ", "INFY-EQ", "ICICIBANK-EQ", "NIFTY23MAR19000CE"]
+      min_market_cap: 10000  # Crores
+      max_stocks: 10
+    parameters:
+      fast_period: 9
+      slow_period: 21
+      signal_period: 9
+    execution:
+      order_type: "LIMIT"
+      limit_price_buffer: 0.1  # percentage
+      entry_timing: "next_bar"
+      exit_timing: "immediate"
+      time_in_force: "DAY"  # Options: "DAY", "IOC", "GTC"
+    risk:
+      position_size: 5.0  # percentage of portfolio
+      max_positions: 5
+      stop_loss: 2.0  # percentage
+      trailing_stop: true
+      trailing_stop_distance: 1.0  # percentage
+      take_profit: 5.0  # percentage
+    schedule:
+      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+      start_time: "09:20:00"
+      end_time: "15:15:00"
+      frequency: "1m"
+    filters:
+      min_volume: 100000
+      max_spread: 0.5  # percentage
+      min_price: 100
+      max_price: 5000
+    fill_handling:
+      adjust_stop_loss: true
+      partial_fills: "accept"
+      timeout: 60  # seconds to wait for fill  
+    lifecycle:
+      warmup_bars: 30  # Number of bars needed before generating signals
+      cooldown_after_stop_loss: 5  # Bars to wait after stop loss before new entry
+
+  # - name: "mtf_strategy_1"
+  #   type: "multi_timeframe_strategy"
+  #   active: true
+  #   universe:
+  #     value: ["RELIANCE-EQ", "TCS-EQ"]
+  #   parameters:
+  #     fast_ma_period: 9
+  #     slow_ma_period: 21
+  #     timeframe: "1m"
+  #     additional_timeframes: ["5m"]
+  #   # Other settings...
+
+  # - name: "mtf_strategy_2"
+  #   type: "multi_timeframe_strategy"
+  #   active: true
+  #   universe:
+  #     value: ["HDFCBANK-EQ", "INFY-EQ"]
+  #   parameters:
+  #     fast_ma_period: 5
+  #     slow_ma_period: 15
+  #     timeframe: "3m"
+  #     additional_timeframes: ["15m", "1h"]    
+      
+      

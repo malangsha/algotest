@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -14,6 +13,7 @@ from utils.constants import MarketDataType, InstrumentType
 from models.market_data import MarketData
 from models.market_data import Quote
 from utils.config_loader import ConfigLoader
+from core.logging_manager import get_logger
 
 class LiveEngine(TradingEngine):
     """
@@ -32,17 +32,15 @@ class LiveEngine(TradingEngine):
         # Call the parent constructor to initialize base components
         super().__init__(config, strategy_config)
 
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger(__name__)
         self.logger.info("Initializing Live Trading Engine")
 
-        # Initialize additional live-specific events and components
-        self.market_events_queue = []
+        # Initialize live-specific components
         self.heartbeat_interval = self.config.get("system", {}).get("heartbeat_interval", 5)  # seconds
         self.last_market_data_time = None
-        self.last_strategy_run_time = {strategy_id: None for strategy_id in self.strategies}       
+        self.last_strategy_run_time = {strategy_id: None for strategy_id in self.strategies}
 
-        # Enhanced monitoring
-        self.monitoring_thread = None
+        # Enhanced monitoring metrics
         self.metrics = {
             "tick_count": 0,
             "order_count": 0,
@@ -51,14 +49,19 @@ class LiveEngine(TradingEngine):
             "last_tick_time": None
         }
 
-        # Initialize the engine
-        self.initialize()
-
-        self.instrument_objects = self._get_instrument_objects()
         # Initialize market data feed
+        self.instrument_objects = self._get_instrument_objects()
         self.market_data_feed = self.initialize_market_data_feed()
+        
+        # Connect market data feed to data manager
+        if self.market_data_feed and hasattr(self, 'data_manager'):
+            self.data_manager.market_data_feed = self.market_data_feed
+            self.logger.info("Connected market data feed to data manager")
 
+        # Initialize monitoring thread
+        self.monitoring_thread = None
 
+        # Register live-specific event handlers
         self._register_additional_event_handlers()
 
         self.logger.info("Live Engine initialized successfully")
@@ -77,13 +80,10 @@ class LiveEngine(TradingEngine):
 
         self.logger.info(f"Active instruments: {self.active_instruments}")
 
-        instruments_config = self.config.get('instruments', [])
         # Convert string symbols to Instrument objects
         for instrument in self.active_instruments:
-            if isinstance(instrument, str):
-                # Convert string to Instrument object if it's in self.instruments
-                if instrument in self.instruments:
-                    instrument_objects.append(self.instruments[instrument])
+            if isinstance(instrument, str) and instrument in self.instruments:
+                instrument_objects.append(self.instruments[instrument])
             elif isinstance(instrument, Instrument):
                 instrument_objects.append(instrument)
 
@@ -91,36 +91,6 @@ class LiveEngine(TradingEngine):
 
     def initialize_market_data_feed(self):
         """Initialize the market data feed."""
-        # Get the instruments from the config
-        instruments_config = self.config.get('instruments', [])
-
-        # Convert string symbols to Instrument objects if needed
-        self.instrument_objects = []
-        for instrument in self.active_instruments:
-            if isinstance(instrument, str):
-                # Convert string to Instrument object
-                for instr_config in instruments_config:
-                    if instr_config.get('symbol') == instrument:
-                        instrument = Instrument(
-                            instrument_id=instr_config.get('id', instr_config.get('symbol')),
-                            instrument_type=instr_config.get('instrument_type', InstrumentType.EQUITY),
-                            symbol=instr_config['symbol'],
-                            exchange=instr_config.get('exchange', ''),
-                            asset_type=instr_config.get('asset_type', ''),
-                            currency=instr_config.get('currency', ''),
-                            tick_size=instr_config.get('tick_size', 0.01),
-                            lot_size=instr_config.get('lot_size', 1.0),
-                            margin_requirement=instr_config.get('margin_requirement', 1.0),
-                            is_tradable=instr_config.get('is_tradable', True),
-                            expiry_date=instr_config.get('expiry_date'),
-                            additional_info=instr_config.get('additional_info', {})
-                        )
-                        self.instrument_objects.append(instrument)
-            elif isinstance(instrument, Instrument):
-                self.instrument_objects.append(instrument)
-
-        self.logger.info(f"Creating market data feed with {len(self.instrument_objects)} instruments")
-
         # Get feed type from market_data config
         market_data_config = self.config.get('market_data', {})
         feed_type = market_data_config.get('live_feed_type', 'simulated')  # Default to simulated if not specified
@@ -130,38 +100,17 @@ class LiveEngine(TradingEngine):
         # Get feed-specific settings
         feed_settings = market_data_config.get('feed_settings', {}).get(feed_type, {})
 
-        # Merge broker API settings if needed by the feed (e.g., FinvasiaFeed)
-        # This assumes feed settings might need credentials or URLs from the active broker connection
-        broker_config = None
-        if hasattr(self.broker, 'broker_name'):
-            broker_name = self.broker.broker_name
-            broker_connections = self.config.get('broker_connections', {})
-            
-            # Handle both list and dictionary formats
-            if isinstance(broker_connections, list):
-                for cfg in broker_connections:
-                    if isinstance(cfg, dict) and cfg.get('connection_name') == broker_name:
-                        broker_config = cfg
-                        break
-            elif isinstance(broker_connections, dict):
-                connections = broker_connections.get('connections', [])
-                active_connection = broker_connections.get('active_connection')
-                
-                # Find the active connection config
-                for cfg in connections:
-                    if isinstance(cfg, dict) and cfg.get('connection_name') == active_connection:
-                        broker_config = cfg
-                        break
-
+        # Merge broker API settings if needed
         if self.broker:
-            # Pass relevant broker details that the feed might require
-            feed_settings['user_id'] = self.broker.user_id
-            feed_settings['password'] = self.broker.password
-            feed_settings['api_key'] = self.broker.api_key
-            feed_settings['twofa'] = self.broker.twofa
-            feed_settings['vc'] = self.broker.vc
-            feed_settings['api_url'] = self.broker.api_url
-            feed_settings['websocket_url'] = self.broker.ws_url
+            feed_settings.update({
+                'user_id': self.broker.user_id,
+                'password': self.broker.password,
+                'api_key': self.broker.api_key,
+                'twofa': self.broker.twofa,
+                'vc': self.broker.vc,
+                'api_url': self.broker.api_url,
+                'websocket_url': self.broker.ws_url
+            })
 
         # Create the market data feed
         data_feed = MarketDataFeed(
@@ -176,21 +125,23 @@ class LiveEngine(TradingEngine):
 
     def _register_additional_event_handlers(self):
         """Register live-specific event handlers."""
-        self.logger.info(f"registering additional event handlers")
+        self.logger.info("Registering additional event handlers")
+        
         # Register for trade events
         self.event_manager.subscribe(
             EventType.TRADE,
-            self._on_trade_event,
+            self._on_trade_event,            
             component_name="LiveEngine"
         )
 
         # Register for risk breach events
         self.event_manager.subscribe(
             EventType.RISK_BREACH,
-            self._on_risk_breach,
+            self._on_risk_breach,            
             component_name="LiveEngine"
         )
 
+    # override the _on_market_data method to update the metrics
     def _on_market_data(self, event: MarketDataEvent):
         """
         Called when market data is received.
@@ -199,6 +150,7 @@ class LiveEngine(TradingEngine):
         Args:
             event: Market data event
         """
+        self.logger.debug(f"Received MarketDataEvent: {event}")
         # Update last tick time
         self.metrics["last_tick_time"] = datetime.now()
         self.metrics["tick_count"] += 1
@@ -207,26 +159,8 @@ class LiveEngine(TradingEngine):
         self.logger.info(f"forwarding market data event to parent engine for futher processing")
         super()._on_market_data(event)
 
-    def _on_order_event(self, order):
-        """
-        Called when an order update is received from the broker.
-
-        Args:
-            order: Updated order object
-        """
-        # Update metrics
-        self.metrics["order_count"] += 1
-
-        self.logger.info(f"forwarding order event to parent engine for futher processing")
-        super()._on_order_event(order)
-
     def _on_trade_event(self, event: TradeEvent):
-        """
-        Handle trade events.
-
-        Args:
-            event: Trade event
-        """
+        """Handle trade events."""
         self.logger.info(f"Trade executed: {event.trade.trade_id}, instrument: {event.trade.instrument.symbol}")
 
         # Update position
@@ -247,12 +181,7 @@ class LiveEngine(TradingEngine):
         self.metrics["execution_count"] += 1
 
     def _on_risk_breach(self, event):
-        """
-        Handle risk breach events.
-
-        Args:
-            event: Risk breach event
-        """
+        """Handle risk breach events."""
         breach_type = event.breach_type if hasattr(event, 'breach_type') else "Unknown"
         self.logger.warning(f"Risk breach detected: {breach_type}")
 
@@ -268,12 +197,7 @@ class LiveEngine(TradingEngine):
         self.metrics["error_count"] += 1
 
     def _emergency_stop(self, reason: str):
-        """
-        Emergency stop of trading when serious risk breach is detected.
-
-        Args:
-            reason: Reason for the emergency stop
-        """
+        """Emergency stop of trading when serious risk breach is detected."""
         self.logger.critical(f"EMERGENCY STOP: {reason}")
 
         # Cancel all open orders
@@ -314,8 +238,6 @@ class LiveEngine(TradingEngine):
     def _reject_oversized_orders(self):
         """Reject any orders that exceed position size limits."""
         self.logger.warning("Rejecting oversized orders")
-        # This would typically involve updating risk limits in the risk manager
-        # For now, we simply log the action
 
     def start(self):
         """Start the live trading engine."""
@@ -325,13 +247,8 @@ class LiveEngine(TradingEngine):
 
         self.logger.info("Starting live trading engine")
 
-        # Call parent's start method to start all processing threads
-        if not super().start():
-            self.logger.error("Failed to start base engine")
-            return False
-
-        # Start market data feed
         try:
+            # Start market data feed first
             if self.market_data_feed:
                 self.market_data_feed.start()
                 self.logger.info("Market data feed started successfully")
@@ -339,19 +256,30 @@ class LiveEngine(TradingEngine):
                 self.logger.error("Market data feed not initialized")
                 self.stop()
                 return False
+            
+            # Start base engine components (base engine components have access to market data feed now)
+            if not super().start():
+                self.logger.error("Failed to start base engine")
+                return False
+
+            # Start monitoring thread
+            self.monitoring_thread = threading.Thread(target=self._run_monitoring_loop, daemon=True)
+            self.monitoring_thread.start()
+
+            self.running = True
+
+            # print event manager statistics
+            self.event_manager.print_event_statistics()
+            
+            self.logger.info("Event manager started successfully")
+
+            self.logger.info("Live trading engine started successfully")
+            return True
 
         except Exception as e:
-            self.logger.error(f"Failed to start market data feed: {str(e)}")
-            self.broker.disconnect()
-            self.running = False
-            raise LiveTradingException("Failed to start live trading engine: market data feed failure")
-
-        # Start monitoring thread
-        self.monitoring_thread = threading.Thread(target=self._run_monitoring_loop, daemon=True)
-        self.monitoring_thread.start()
-
-        self.logger.info("Live trading engine started successfully")
-        return True
+            self.logger.error(f"Failed to start live trading engine: {str(e)}")
+            self.stop()
+            return False
 
     def stop(self):
         """Stop the live trading engine."""
@@ -376,8 +304,8 @@ class LiveEngine(TradingEngine):
         # Save trading session data
         self._save_session_data()
 
-        # Call parent's stop method to handle base engine components
-        super().stop()        
+        # Stop base engine components
+        super().stop()
 
     def _run_monitoring_loop(self):
         """Monitoring loop to check system health."""
@@ -471,7 +399,6 @@ class LiveEngine(TradingEngine):
                 # If connection issues persist, consider stopping
                 if not self.broker.is_connected():
                     self.logger.critical("Persistent broker connection issues, considering emergency stop")
-                    # Decision logic for whether to stop or continue with retry
                     emergency_stop = self.config.get("live", {}).get("emergency_stop_on_broker_failure", False)
                     if emergency_stop:
                         self._emergency_stop("Persistent broker connection failure")
@@ -522,21 +449,11 @@ class LiveEngine(TradingEngine):
             "order_count": self.metrics["order_count"],
             "execution_count": self.metrics["execution_count"],
             "error_count": self.metrics["error_count"],
-            "last_tick_time": self.metrics["last_tick_time"].isoformat() if self.metrics["last_tick_time"] else None,
-            "market_data_queue_size": self.market_data_queue.qsize() if hasattr(self, 'market_data_queue') else None,
-            "order_queue_size": self.order_queue.qsize() if hasattr(self, 'order_queue') else None,
-            "signal_queue_size": self.signal_queue.qsize() if hasattr(self, 'signal_queue') else None,
-            "execution_queue_size": self.execution_queue.qsize() if hasattr(self, 'execution_queue') else None
+            "last_tick_time": self.metrics["last_tick_time"].isoformat() if self.metrics["last_tick_time"] else None
         }
 
     def get_status(self) -> Dict[str, Any]:
-        """
-        Get current status of the trading engine.
-        Enhances the parent's get_status method with live-specific information.
-
-        Returns:
-            Dictionary with status information
-        """
+        """Get current status of the trading engine."""
         # Get base status from parent class
         status = super().get_status()
 
@@ -554,12 +471,7 @@ class LiveEngine(TradingEngine):
         return status
 
     def add_instrument(self, instrument: Instrument):
-        """
-        Add a new instrument to the market data feed.
-
-        Args:
-            instrument: Instrument to add
-        """
+        """Add a new instrument to the market data feed."""
         if self.market_data_feed:
             self.market_data_feed.subscribe(instrument)
             self.logger.info(f"Added instrument to market data feed: {instrument.symbol}")
@@ -567,12 +479,7 @@ class LiveEngine(TradingEngine):
             self.logger.warning(f"Cannot add instrument {instrument.symbol}: market data feed not initialized")
 
     def remove_instrument(self, instrument: Instrument):
-        """
-        Remove an instrument from the market data feed.
-
-        Args:
-            instrument: Instrument to remove
-        """
+        """Remove an instrument from the market data feed."""
         if self.market_data_feed:
             self.market_data_feed.unsubscribe(instrument)
             self.logger.info(f"Removed instrument from market data feed: {instrument.symbol}")
@@ -580,10 +487,7 @@ class LiveEngine(TradingEngine):
             self.logger.warning(f"Cannot remove instrument {instrument.symbol}: market data feed not initialized")
 
     def run(self):
-        """
-        Start the live trading engine and run until stopped.
-        Entry point used by main.py
-        """
+        """Start the live trading engine and run until stopped."""
         try:
             self.logger.info("Starting live trading engine run")
             success = self.start()
@@ -592,10 +496,7 @@ class LiveEngine(TradingEngine):
                 self.logger.error("Failed to start live trading engine")
                 return False
 
-            # # Run continuously until stopped by user (e.g., Ctrl+C)
-            # while self.running:
-            #     time.sleep(1)
-
+            # Run the engine loop
             super()._run_engine()
 
             return True
@@ -609,4 +510,4 @@ class LiveEngine(TradingEngine):
             self.stop()
             self.logger.info("Live trading engine stopped")
             return True
-    
+

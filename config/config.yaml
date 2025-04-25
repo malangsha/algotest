@@ -3,15 +3,54 @@
 # System Configuration
 system:
   name: "AlgoTrading Framework"
-  mode: "paper"  # Options: "backtest", "live", "paper"
+  mode: "live"  # Options: "backtest", "live", "paper"
   timezone: "Asia/Kolkata"
   log_level: "DEBUG"  # Options: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
   log_dir: "logs"
   data_dir: "data"
   output_dir: "output"
   max_threads: 20
-  heartbeat_interval: 1  # seconds
+  heartbeat_interval: 5  # seconds
   max_strategy_interval: 300
+
+# Logging configuration
+logging:  
+  log_level: "INFO"  # Can be DEBUG, INFO, WARNING, ERROR, CRITICAL  
+  log_format: "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+
+  log_dir: "logs"
+  console_output: true
+  file_output: true
+  json_format: false  
+  capture_warnings: true  
+  
+  max_file_size_mb: 50
+  backup_count: 5 
+  
+  component_levels:
+    core.engine: "DEBUG"
+    core.market_data: "DEBUG"
+    core.order_manager: "DEBUG" 
+    strategies: "DEBUG"
+    brokers: "DEBUG"
+    backtest: "DEBUG"
+    live: "DEBUG"    
+  
+  error_email_config:
+    enabled: false
+    mailhost: "smtp.example.com"
+    fromaddr: "algotrading@example.com"
+    toaddrs: ["alerts@example.com"]
+    subject: "AlgoTrading ERROR Alert"
+    credentials:
+      username: "alert_user"
+      password: "alert_password"
+    secure: true
+  
+  # Syslog configuration (optional)
+  syslog_output: false
+  syslog_address: "localhost:514"
+  syslog_facility: 1  # LOG_USER
 
 # --- Broker Connection Configuration --- 
 # Defines how to connect to the execution broker (used by ExecutionHandler)
@@ -29,32 +68,24 @@ broker_connections:
         max_retries: 3
         retry_delay: 1
         debug: false
-      # Removed order defaults - should be handled by OrderManager/Strategy
-      # Removed market data settings - moved to market_data section
 
     - connection_name: "simulated_broker"
-      broker_type: "simulated" # Assumes a brokers/simulated_broker.py exists
-      # No secrets needed for simulated
+      broker_type: "simulated"
       api:
         timeout: 1
         max_retries: 1
         retry_delay: 0
 
 # --- Market Data Configuration --- 
-# Defines the source and settings for market data (used by LiveEngine/BacktestEngine)
 market_data:
-  # Source type for live/paper trading (used by LiveEngine)
   live_feed_type: "finvasia_ws" # Options: "finvasia_ws", "simulated", "zerodha_ws", etc.
-                                # Should correspond to a class in live/market_data_feeds.py
-
+                                
   # Source type for backtesting (used by BacktestingEngine)
   backtest_data_source: "csv" # Options: "csv", "database", "api"
 
   # Settings for specific feed types
   feed_settings:
     finvasia_ws:
-      # Credentials will be taken from the active broker_connection
-      # ws_url: "wss://api.shoonya.com/NorenWSTP/" # Can be overridden
       reconnect_interval: 5
       max_reconnect_attempts: 10
       enable_persistence: true
@@ -103,18 +134,32 @@ market:
   holidays: ["2025-01-26", "2025-08-15", "2025-10-02"]
   data_retention_days: 15
 
-# --- Component Configurations --- 
+  # Underlying configurations (Index or Stocks)
+  underlyings:
+    - symbol: "NIFTY INDEX"
+      exchange: "NSE"
+      derivative_exchange: "NFO"
+      strike_interval: 100
+      expiry: "weekly"
+      atm_range: 3  # Number of strikes above and below ATM
+    - symbol: "NIFTY BANK"
+      exchange: "NSE"
+      derivative_exchange: "NFO"
+      strike_interval: 100
+      expiry: "weekly"
+      atm_range: 3
 
+# --- Component Configurations --- 
 data_manager:
   use_cache: true
   cache_limit: 10000 # Max items per symbol in memory
-  use_redis: false
+  use_redis: true
   redis:
     host: "localhost"
     port: 6379
     db: 0
   persistence: # Settings for DataManager's own persistence (e.g., aggregated data)
-    enabled: false
+    enabled: true
     path: "./data/processed"
     interval: 300
 
@@ -193,24 +238,24 @@ event_manager:
 # --- Instruments --- 
 # Define available instruments here. Strategies will select from this list.
 # More detailed definitions might be loaded dynamically from broker/files.
-instruments:
-  - symbol: "RELIANCE-EQ"
-    id: "RELIANCE" # Unique ID if needed, otherwise symbol is used
-    instrument_type: "EQ"
-    exchange: "NSE"
-    asset_type: "equity"
-    currency: "INR"
-    tick_size: 0.05
-    lot_size: 1
-    is_tradable: true
+# instruments:
+#   - symbol: "RELIANCE-EQ"
+#     id: "RELIANCE" # Unique ID if needed, otherwise symbol is used
+#     instrument_type: "EQ"
+#     exchange: "NSE"
+#     asset_type: "equity"
+#     currency: "INR"
+#     tick_size: 0.05
+#     lot_size: 1
+#     is_tradable: true
 
-  - symbol: "TCS-EQ"
-    id: "TCS"
-    instrument_type: "EQ"
-    exchange: "NSE"
-    asset_type: "equity"
-    currency: "INR"
-    tick_size: 0.05
-    lot_size: 1
-    is_tradable: true
+#   - symbol: "NIFTY17APR25C22800"
+#     id: "NIFTY17APR25C22800"
+#     instrument_type: "OPT"
+#     exchange: "NFO"
+#     asset_type: "options"
+#     currency: "INR"
+#     tick_size: 0.05
+#     lot_size: 75
+#     is_tradable: true
 

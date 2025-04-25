@@ -5,7 +5,8 @@ import time
 import traceback
 from typing import Dict, List, Callable, Any, Optional, Type, Set
 from datetime import datetime
-from models.events import Event, EventType, EventValidationError
+from models.events import Event, EventType, EventValidationError, EventPriority, MarketDataEvent, BarEvent, OrderEvent, FillEvent, PositionEvent, SignalEvent, TimerEvent, SystemEvent, AccountEvent, RiskBreachEvent, ExecutionEvent
+from collections import defaultdict
 
 class EventFlowMonitor:
     """
@@ -243,6 +244,25 @@ class EventManager:
     Central hub for event distribution in the algotrading framework.
     Uses both a queue mechanism for asynchronous processing and direct callbacks.
     """
+    
+    # Map event types to their priorities
+    EVENT_PRIORITIES = {
+        EventType.MARKET_DATA: EventPriority.NORMAL,
+        EventType.ORDER: EventPriority.HIGH,
+        EventType.TRADE: EventPriority.HIGH,
+        EventType.POSITION: EventPriority.LOW,
+        EventType.STRATEGY: EventPriority.HIGH,
+        EventType.SYSTEM: EventPriority.LOW,
+        EventType.SIGNAL: EventPriority.HIGH,
+        EventType.FILL: EventPriority.HIGH,
+        EventType.ACCOUNT: EventPriority.LOW,
+        EventType.CUSTOM: EventPriority.HIGH,
+        EventType.TIMER: EventPriority.LOW,
+        EventType.RISK_BREACH: EventPriority.HIGH,
+        EventType.EXECUTION: EventPriority.HIGH,
+        EventType.BAR: EventPriority.NORMAL
+    }
+    
     def __init__(self, queue_size: int = 5000, process_sleep: float = 0.001, enable_monitoring: bool = True):
         """
         Initialize the Event Manager.
@@ -255,7 +275,7 @@ class EventManager:
         self.logger = logging.getLogger(__name__)
         
         # Event queue for asynchronous processing
-        self.event_queue = queue.Queue(maxsize=queue_size)
+        self.event_queue = queue.PriorityQueue(maxsize=queue_size)
         self._queue_size = queue_size  # Store for reference
         
         # Dict mapping event types to lists of subscriber callbacks
@@ -316,16 +336,32 @@ class EventManager:
         # Start retry thread
         threading.Thread(target=self._retry_thread, daemon=True).start()
 
-    def start(self):
-        """Start the event processing thread."""
+        self._enable_monitoring = enable_monitoring
+        self._monitoring_thread = None
+        self._stop_monitoring = False
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        """
+        Start the event processing thread.
+        
+        Returns:
+            bool: True if started successfully, False otherwise
+        """
         if self._is_running:
             self.logger.warning("Event manager is already running")
-            return
+            return True
             
-        self._is_running = True
-        self._processing_thread = threading.Thread(target=self.process_events, daemon=True)
-        self._processing_thread.start()
-        self.logger.info("Event manager started")
+        try:
+            self._is_running = True
+            self._processing_thread = threading.Thread(target=self.process_events, daemon=True)
+            self._processing_thread.start()
+            self.logger.info("Event manager started")
+            return True
+        except Exception as e:
+            self._is_running = False
+            self.logger.error(f"Failed to start event manager: {str(e)}")
+            return False
 
     def stop(self):
         """Stop the event processing thread."""
@@ -339,6 +375,15 @@ class EventManager:
             self._processing_thread.join(timeout=5.0)
         
         self.logger.info("Event manager stopped")
+
+    def is_running(self) -> bool:
+        """
+        Check if the event manager is running.
+        
+        Returns:
+            bool: True if the event manager is running, False otherwise
+        """
+        return self._is_running
 
     def _record_error(self, error_message, exception=None):
         """Record an error for monitoring and history"""
@@ -358,40 +403,39 @@ class EventManager:
         if len(self.stats["error_history"]) > 20:
             self.stats["error_history"].pop(0)
     
-    def subscribe(self, event_type: EventType, callback: Callable[[Event], None], component_name: str = None) -> bool:
+    def subscribe(self, event_type: EventType, callback: Callable[[Event], None], component_name: str = None) -> None:
         """
-        Subscribe a component to receive events of a specific type.
+        Subscribe to events of a specific type.
         
         Args:
-            event_type: Type of event to subscribe to
-            callback: Function to call when event is published
-            component_name: Optional name of component for logging
-            
-        Returns:
-            bool: True if subscription was successful
+            event_type: Type of event to subscribe to (from EventType enum)
+            callback: Function to call when event occurs
+            component_name: Optional name of the subscribing component for logging
         """
-        if event_type not in self._subscribers:
-            error_msg = f"Invalid event type: {event_type}: {event_type.value if hasattr(event_type, 'value') else event_type}"
-            self.logger.error(error_msg)
-            self._record_error(error_msg)
-            return False
-            
-        if callback in self._subscribers[event_type]:
-            self.logger.warning(f"Callback already subscribed to {event_type}: {event_type.value if hasattr(event_type, 'value') else event_type}")
-            return False
-            
-        self._subscribers[event_type].append(callback)
-        
-        # Track component registrations for debugging
-        if component_name:
-            if component_name not in self._registered_components:
-                self._registered_components[component_name] = []
-            self._registered_components[component_name].append(event_type)
-            self.logger.info(f"Component '{component_name}' subscribed to {event_type}: {event_type.value if hasattr(event_type, 'value') else event_type} events")
-        else:
-            self.logger.info(f"Anonymous component subscribed to {event_type}: {event_type.value if hasattr(event_type, 'value') else event_type} events")
-            
-        return True
+        try:
+            # Convert string event type to enum if needed
+            if isinstance(event_type, str):
+                event_type = EventType[event_type]
+                
+            if event_type not in self._subscribers:
+                self._subscribers[event_type] = []
+                
+            if callback not in self._subscribers[event_type]:
+                self._subscribers[event_type].append(callback)
+                self.logger.debug(f"Added subscriber for {event_type} events{f' from {component_name}' if component_name else ''}")
+            else:
+                self.logger.debug(f"Callback already subscribed to {event_type} events{f' from {component_name}' if component_name else ''}")
+
+            if component_name:
+                if component_name not in self._registered_components:
+                    self._registered_components[component_name] = []
+                if event_type not in self._registered_components[component_name]:
+                    self._registered_components[component_name].append(event_type)    
+                                    
+        except (KeyError, ValueError) as e:
+            self.logger.error(f"Invalid event type: {event_type}: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Error subscribing to {event_type}: {str(e)}")
 
     def register_event_logger(self, event_logger):
         """
@@ -447,8 +491,12 @@ class EventManager:
         self.logger.debug(f"Publishing event: {event.event_type}: {event_type_value}")
         
         try:
+            # Set event priority based on its type
+            event.priority = self.EVENT_PRIORITIES.get(event.event_type, EventPriority.NORMAL)
+            priority_value = event.priority.value
+            
             # Add to queue for asynchronous processing
-            self.event_queue.put(event, block=False)
+            self.event_queue.put((priority_value, event), block=False)
             self.stats["events_published"] += 1
             self._diag_publish_count += 1  # Increment diagnostic counter
             
@@ -466,6 +514,9 @@ class EventManager:
             # Log warning if queue is filling up (but not yet full)
             if current_size > self.event_queue.maxsize * 0.8:
                 self.logger.warning(f"Event queue is at {current_size}/{self.event_queue.maxsize} capacity ({current_size/self.event_queue.maxsize*100:.1f}%)")
+            
+            if self._enable_monitoring:
+                self.flow_monitor._on_event(event)
             
             return True
             
@@ -611,7 +662,16 @@ class EventManager:
         for _ in range(max_events):
             try:
                 # Get event with a small timeout
-                event = self.event_queue.get(block=True, timeout=0.001)
+                priority, event = self.event_queue.get(block=True, timeout=0.001)
+                
+                # Update event type statistics
+                event_type = event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type)
+                self.stats["events_by_type"][event_type] += 1
+                
+                # Update last event time
+                if "last_event_times" not in self.stats:
+                    self.stats["last_event_times"] = {}
+                self.stats["last_event_times"][event_type] = datetime.now()
                 
                 # Dispatch event to subscribers
                 callbacks_executed = self._dispatch_event(event)
@@ -665,12 +725,19 @@ class EventManager:
         callbacks_executed = 0
         start_time = time.time()
         slow_callbacks = []
-        
+
+        # self.logger.debug(f"Dispatching {event.event_type} (type: {type(event.event_type)})")
+        # subscribers = self._subscribers.get(event.event_type, [])
+        # self.logger.debug(f"Subscribers for {event.event_type}: {len(subscribers)}")
+
         # Execute callbacks for this event type
         if event.event_type in self._subscribers:
             for callback in self._subscribers[event.event_type]:
                 callback_start = time.time()
                 try:
+                    
+                    # callback_name = callback.__qualname__ if hasattr(callback, "__qualname__") else str(callback)
+                    # self.logger.debug(f"Executing callback: {callback_name}")
                     # Execute the callback
                     callback(event)
                     callbacks_executed += 1
@@ -839,3 +906,138 @@ class EventManager:
             
             # Log diagnostic information
             self.logger.info(f"Event queue size: {self.event_queue.qsize()}, Retry queue size: {self.retry_queue.qsize()}, Max queue size: {self.stats['max_queue_size']}, Publish rate: {publish_rate:.2f} events/s, Process rate: {process_rate:.2f} events/s")
+
+    def print_event_statistics(self, include_components: bool = True, include_priorities: bool = True):
+        """
+        Print event statistics in a nicely formatted way.
+        
+        Args:
+            include_components: Whether to include component registration details
+            include_priorities: Whether to include event priorities
+        """
+        # Get subscriber information
+        subscriber_info = self.get_subscriber_info()
+        
+        # Print header
+        print("\n" + "="*80)
+        print("EVENT MANAGER STATISTICS")
+        print("="*80)
+        
+        # Print event priorities
+        if include_priorities:
+            print("\nEvent Priorities:")
+            print("-"*40)
+            print(f"{'Event Type':<20} | {'Priority':<10} | Description")
+            print("-"*40)
+            for event_type, priority in self.EVENT_PRIORITIES.items():
+                priority_name = priority.name if hasattr(priority, 'name') else str(priority)
+                print(f"{event_type.value:<20} | {priority_name:<10} | {self._get_priority_description(priority)}")
+            print("-"*40)
+        
+        # Print component registrations
+        if include_components:
+            print("\nComponent Registrations:")
+            print("-"*40)
+            
+            # First, collect all components and their events
+            component_events = defaultdict(list)
+            for event_type, info in subscriber_info.items():
+                for component in info["components"]:
+                    component_events[component].append(event_type)
+            
+            if not component_events:
+                print("No components registered")
+            else:
+                # Print in a nice format
+                for component, events in sorted(component_events.items()):
+                    print(f"\nComponent: {component}")
+                    print("Events:")
+                    for event in sorted(events):
+                        count = subscriber_info[event]["count"]
+                        print(f"  - {event:<20} | Subscribers: {count}")
+            
+            print("-"*40)
+
+            # Print event subscribers
+            print("\nEvent Subscribers:")
+            print("-"*40)
+            
+            # Filter out events with no subscribers
+            events_with_subscribers = {et: info for et, info in subscriber_info.items() if info["components"]}
+            
+            if not events_with_subscribers:
+                print("No event subscribers")
+            else:
+                for event_type, info in sorted(events_with_subscribers.items()):
+                    print(f"\nEvent: {event_type}")
+                    print("Subscribers:")
+                    for component in sorted(info["components"]):
+                        # Get the actual callback functions for this event type
+                        callbacks = [cb for cb in self._subscribers.get(EventType(event_type), []) 
+                                   if hasattr(cb, '__name__') and cb.__name__ != '<lambda>']
+                        callback_names = [cb.__name__ for cb in callbacks]
+                        
+                        if callback_names:
+                            print(f"  - {component:<20} | Callbacks: {', '.join(callback_names)}")
+                        else:
+                            print(f"  - {component:<20} | Callbacks: <anonymous>")
+            
+            print("-"*40)
+        
+        # Print event counts
+        print("\nEvent Counts:")
+        print("-"*40)
+        print(f"{'Event Type':<20} | {'Count':<10} | {'Last Event Time':<20}")
+        print("-"*40)
+        
+        # Filter out events with zero count
+        active_events = {et: count for et, count in self.stats["events_by_type"].items() if count > 0}
+        
+        if not active_events:
+            print("No events processed yet")
+        else:
+            for event_type, count in sorted(active_events.items()):
+                last_time = self.stats.get("last_event_times", {}).get(event_type, "Never")
+                print(f"{event_type:<20} | {count:<10} | {last_time}")
+        
+        # Print queue statistics
+        print("\nQueue Statistics:")
+        print("-"*40)
+        print(f"Current Queue Size: {self.event_queue.qsize()}/{self.event_queue.maxsize}")
+        print(f"Max Queue Size: {self.stats['max_queue_size']}")
+        print(f"Queue Overflows: {self.stats['queue_overflow_count']}")
+        print(f"Retry Queue Size: {self.retry_queue.qsize()}")
+        print(f"Retry Successes: {self.stats['retry_successes']}/{self.stats['retry_attempts']}")
+        
+        # Print error statistics
+        print("\nError Statistics:")
+        print("-"*40)
+        print(f"Total Errors: {self.stats['error_count']}")
+        print(f"Validation Errors: {self.stats['validation_errors']}")
+        print(f"Callback Errors: {self.stats['callback_errors']}")
+        
+        if self.stats['last_error']:
+            print(f"\nLast Error ({self.stats['last_error_time']}):")
+            print(f"  {self.stats['last_error']}")
+        
+        # Print flow monitor statistics if available
+        if self.flow_monitor:
+            flow_stats = self.flow_monitor.get_stats()
+            print("\nEvent Flow Statistics:")
+            print("-"*40)
+            print(f"Broken Chains: {flow_stats['broken_chains']}")
+            print(f"Complete Chains: {flow_stats['complete_chains']}")
+            print(f"Active Chains: {flow_stats['active_chains']}")
+            if 'avg_completion_time' in flow_stats:
+                print(f"Average Chain Completion Time: {flow_stats['avg_completion_time']:.2f}s")
+        
+        print("\n" + "="*80)
+
+    def _get_priority_description(self, priority):
+        """Get a human-readable description of the priority level."""
+        descriptions = {
+            EventPriority.HIGH: "High priority - processed immediately",
+            EventPriority.NORMAL: "Normal priority - processed in order",
+            EventPriority.LOW: "Low priority - processed when system is idle"
+        }
+        return descriptions.get(priority, "Unknown priority level")

@@ -1,11 +1,12 @@
 import os
 import yaml
 import json
-from typing import Dict, Any, Optional, List, Callable, Union
 import logging
+from typing import Dict, Any, Optional, List, Callable, Union
 import re
 from pathlib import Path
 
+# Basic logger setup using standard logging
 logger = logging.getLogger(__name__)
 
 class ConfigValidationError(Exception):
@@ -31,6 +32,15 @@ class ConfigLoader:
         
         # Create config directory if it doesn't exist
         os.makedirs(config_dir, exist_ok=True)
+        
+        # Set up a proper logger if core is available
+        try:
+            from core.logging_manager import get_logger
+            global logger
+            logger = get_logger(__name__)
+        except ImportError:
+            # Keep using the basic logger if the import fails
+            pass
 
     def load_yaml(self, file_path: str) -> Dict[str, Any]:
         """
@@ -359,7 +369,7 @@ class ConfigLoader:
                 "data_feed": {
                     "type": "csv",
                     "file_path": "data/market_data.csv",
-                    "symbols": ["AAPL", "MSFT", "GOOG"]
+                    "symbols": ["TCS", "INFY", "RELIANCE"]
                 },
                 "broker": {
                     "type": "simulated",
@@ -376,7 +386,7 @@ class ConfigLoader:
                     {
                         "id": "moving_average_crossover",
                         "name": "Moving Average Crossover",
-                        "symbols": ["AAPL", "MSFT"],
+                        "symbols": ["TCS", "INFY", "RELIANCE"],
                         "parameters": {
                             "short_window": 10,
                             "long_window": 50
@@ -459,32 +469,44 @@ class ConfigLoader:
         return loader.get_value(config, key_path, default)
 
 
-# Create a global instance for easy access
-config_loader = ConfigLoader()
+# We'll use a global variable to store the instance, but initialize it only when needed
+_config_loader_instance = None
+
+def get_config_loader():
+    """
+    Get the global ConfigLoader instance, creating it if it doesn't exist.
+    
+    Returns:
+        ConfigLoader: The global config loader instance
+    """
+    global _config_loader_instance
+    if _config_loader_instance is None:
+        _config_loader_instance = ConfigLoader()
+    return _config_loader_instance
 
 def load_config(config_name: str = "config", reload: bool = False) -> Dict[str, Any]:
     """
     Load a configuration file using the global config loader.
-    
+
     Args:
         config_name: Name of the configuration file without extension
         reload: Whether to reload the configuration from disk even if cached
-        
+
     Returns:
         Dictionary containing the configuration
     """
-    return config_loader.load_config(config_name, reload)
+    return get_config_loader().load_config(config_name, reload)
 
 def get_config_value(config_name: str, key_path: str, default: Optional[Any] = None) -> Any:
     """
     Get a configuration value using the global config loader.
-    
+
     Args:
         config_name: Name of the configuration file without extension
         key_path: Dot-separated path to the configuration value
         default: Default value to return if the key is not found
-        
+
     Returns:
         The configuration value or the default if not found
     """
-    return config_loader.get_config_value(config_name, key_path, default)
+    return get_config_loader().get_config_value(config_name, key_path, default)

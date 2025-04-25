@@ -87,7 +87,7 @@ class LoggingManager:
         # Reset root logger
         for handler in self.root_logger.handlers[:]:
             self.root_logger.removeHandler(handler)
-            
+
         self.root_logger.setLevel(self.log_level)
 
         # Create formatters
@@ -143,14 +143,14 @@ class LoggingManager:
             self.trade_logger = logging.getLogger('trades')
             for handler in self.trade_logger.handlers[:]:
                 self.trade_logger.removeHandler(handler)
-                
+
             self.trade_logger.setLevel(logging.INFO)
             self.trade_logger.propagate = False  # Don't propagate to root logger
             self.trade_logger.addHandler(self.trade_file_handler)
 
             # Special handler for error logs
             error_log_file = os.path.join(self.log_dir, f"errors_{datetime.now().strftime('%Y%m%d')}.log")
-            
+
             if self.max_file_size_bytes > 0 and self.backup_count > 0:
                 self.error_file_handler = logging.handlers.RotatingFileHandler(
                     error_log_file,
@@ -159,23 +159,26 @@ class LoggingManager:
                 )
             else:
                 self.error_file_handler = logging.FileHandler(error_log_file)
-                
+
             self.error_file_handler.setFormatter(formatter)
             self.error_file_handler.setLevel(logging.ERROR)
             self.root_logger.addHandler(self.error_file_handler)
 
         # Add email handler if configured
-        if self.error_email_config:
+        if self.error_email_config and self.error_email_config.get('enabled', False):
             try:
                 from logging.handlers import SMTPHandler
-                
+
                 self.email_handler = SMTPHandler(
                     mailhost=self.error_email_config.get('mailhost', 'localhost'),
                     fromaddr=self.error_email_config.get('fromaddr', 'algotrading@localhost'),
                     toaddrs=self.error_email_config.get('toaddrs', []),
                     subject=self.error_email_config.get('subject', 'AlgoTrading Error'),
-                    credentials=self.error_email_config.get('credentials'),
-                    secure=self.error_email_config.get('secure')
+                    credentials=(
+                        self.error_email_config.get('credentials', {}).get('username'),
+                        self.error_email_config.get('credentials', {}).get('password')
+                    ) if self.error_email_config.get('credentials') else None,
+                    secure=self.error_email_config.get('secure', False)
                 )
                 self.email_handler.setLevel(logging.ERROR)
                 self.email_handler.setFormatter(formatter)
@@ -213,7 +216,7 @@ class LoggingManager:
                     self.syslog_handler = logging.handlers.SysLogHandler(
                         facility=self.syslog_facility
                     )
-                
+
                 self.syslog_handler.setFormatter(formatter)
                 self.root_logger.addHandler(self.syslog_handler)
             except Exception as e:
@@ -244,7 +247,7 @@ class LoggingManager:
                     'module': record.module,
                     'line': record.lineno
                 }
-                
+
                 # Add exception info if available
                 if record.exc_info:
                     log_data['exception'] = {
@@ -252,7 +255,7 @@ class LoggingManager:
                         'message': str(record.exc_info[1]),
                         'traceback': self.formatException(record.exc_info)
                     }
-                
+
                 # Add extra fields
                 for key, value in record.__dict__.items():
                     if key not in ['args', 'asctime', 'created', 'exc_info', 'exc_text', 'filename',
@@ -260,9 +263,9 @@ class LoggingManager:
                                   'msecs', 'message', 'msg', 'name', 'pathname', 'process',
                                   'processName', 'relativeCreated', 'stack_info', 'thread', 'threadName']:
                         log_data[key] = value
-                
+
                 return json.dumps(log_data)
-                
+
         return JsonFormatter()
 
     def _add_error_handler(self):
@@ -271,24 +274,24 @@ class LoggingManager:
             def __init__(self, manager):
                 super().__init__(level=logging.ERROR)
                 self.manager = manager
-                
+
             def emit(self, record):
                 self.manager.error_count += 1
                 self.manager.last_error_time = datetime.now()
-                
+
                 # Call error callbacks
                 for callback in self.manager.error_callbacks:
                     try:
                         callback(record)
                     except Exception as e:
                         sys.stderr.write(f"Error in error callback: {e}\n")
-        
+
         self.root_logger.addHandler(ErrorTrackingHandler(self))
 
     def register_error_callback(self, callback: Callable[[logging.LogRecord], None]) -> None:
         """
         Register a callback to be called when an error is logged.
-        
+
         Args:
             callback: Function to call with the LogRecord when an error occurs
         """
@@ -328,17 +331,17 @@ class LoggingManager:
             logging.Logger: Logger instance
         """
         logger = logging.getLogger(name)
-        
+
         # Set component-specific level if configured
         if name in self.component_levels:
             logger.setLevel(self.component_levels[name])
-            
+
         return logger
-        
+
     def get_error_stats(self) -> Dict[str, Any]:
         """
         Get statistics about logged errors.
-        
+
         Returns:
             Dict[str, Any]: Error statistics
         """
@@ -346,11 +349,11 @@ class LoggingManager:
             'error_count': self.error_count,
             'last_error_time': self.last_error_time.isoformat() if self.last_error_time else None
         }
-        
+
     def configure_from_dict(self, config: Dict[str, Any]) -> None:
         """
         Configure the logging system from a dictionary.
-        
+
         Args:
             config: Dictionary containing logging configuration
         """
@@ -385,30 +388,33 @@ class LoggingManager:
             self.syslog_address = config['syslog_address']
         if 'syslog_facility' in config:
             self.syslog_facility = config['syslog_facility']
-            
+
         # Reconfigure logging
         self.configure()
-        
+
     def _parse_log_level(self, level) -> int:
         """
         Parse a log level from string or int.
-        
+
         Args:
             level: Log level as string or int
-            
+
         Returns:
             int: Logging level
         """
         if isinstance(level, int):
             return level
-            
+
         if isinstance(level, str):
             level_upper = level.upper()
             if hasattr(logging, level_upper):
                 return getattr(logging, level_upper)
-                
+
         # Default to INFO if invalid
         return logging.INFO
+
+# Global logging manager instance
+_global_logging_manager = None
 
 def setup_logging(log_level: Union[int, str] = logging.INFO,
                  log_dir: str = "logs",
@@ -428,29 +434,52 @@ def setup_logging(log_level: Union[int, str] = logging.INFO,
     Returns:
         LoggingManager: The configured logging manager instance
     """
+    global _global_logging_manager
+
+    # Parse log_level if it's a string
+    if isinstance(log_level, str):
+        level_upper = log_level.upper()
+        if hasattr(logging, level_upper):
+            log_level = getattr(logging, level_upper)
+        else:
+            log_level = logging.INFO
+
     # Create the logging manager
-    logging_manager = LoggingManager(
-        log_level=log_level if isinstance(log_level, int) else logging.INFO,
+    _global_logging_manager = LoggingManager(
+        log_level=log_level,
         log_dir=log_dir,
         console_output=console_output,
         file_output=file_output
     )
-    
+
     # Apply configuration if provided
     if config_dict:
-        logging_manager.configure_from_dict(config_dict)
+        _global_logging_manager.configure_from_dict(config_dict)
 
     # Return the logging manager in case it needs to be used elsewhere
-    return logging_manager
+    return _global_logging_manager
 
 def get_logger(name: str) -> logging.Logger:
     """
     Get a logger by name.
-    
+
     Args:
         name: Logger name
-        
+
     Returns:
         logging.Logger: Logger instance
     """
+    global _global_logging_manager
+    if _global_logging_manager:
+        return _global_logging_manager.get_logger(name)
     return logging.getLogger(name)
+
+def get_logging_manager() -> Optional[LoggingManager]:
+    """
+    Get the global logging manager instance.
+
+    Returns:
+        Optional[LoggingManager]: The global logging manager or None if not initialized
+    """
+    global _global_logging_manager
+    return _global_logging_manager

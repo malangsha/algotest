@@ -41,8 +41,11 @@ class TimeInForce(Enum):
     IOC = "IOC"  # Immediate or Cancel
 
 class Exchange(Enum):
-    NSE = "NSE"
-    BSE = "BSE"
+    NSE     = "NSE"   # equity
+    BSE     = "BSE"   # equity
+    NFO     = "NFO"   # NSE futures & options
+    BFO     = "BFO"   # BSE futures & options
+    MCX     = "MCX"   # MCX futures & options
 
 class TradeMode(Enum):
     BACKTEST = "backtest"
@@ -143,6 +146,9 @@ class MarketDataType(Enum):
     IMPLIED_VOLATILITY = "IMPLIED_VOLATILITY"
     OPEN_INTEREST = "OPEN_INTEREST"
     CHANGE_OI = "CHANGE_OI"
+    OPTION = "OPTION"
+    FUTURE = "FUTURE"
+    UNKNOWN = "UNKNOWN"
 
 class InstrumentType(Enum):
     EQUITY = "EQ"
@@ -158,20 +164,19 @@ class OptionType(Enum):
     CALL = "CE"  # Call Option
     PUT = "PE"   # Put Option
 
+class EventPriority(Enum):
+    """Priority levels for events"""
+    HIGH = 0      # Critical system events, immediate execution required
+    NORMAL = 1    # Regular market data and signals
+    LOW = 2       # Background tasks, non-critical updates
+
 # NSE/BSE specific constants
 NSE_INDICES = [
-    "NIFTY 50", "NIFTY NEXT 50", "NIFTY 100", "NIFTY 200",
-    "NIFTY 500", "NIFTY MIDCAP 50", "NIFTY MIDCAP 100", "NIFTY SMALLCAP 100",
-    "NIFTY BANK", "NIFTY AUTO", "NIFTY FIN SERVICE", "NIFTY FMCG",
-    "NIFTY IT", "NIFTY MEDIA", "NIFTY METAL", "NIFTY PHARMA",
-    "NIFTY PSU BANK", "NIFTY REALTY", "INDIA VIX"
+    "NIFTY INDEX", "NIFTY BANK", "INDIA VIX", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"
 ]
 
 BSE_INDICES = [
-    "SENSEX", "BSE 100", "BSE 200", "BSE 500",
-    "BSE MIDCAP", "BSE SMALLCAP", "BSE AUTO", "BSE BANKEX",
-    "BSE METAL", "BSE REALTY", "BSE CAPITAL GOODS", "BSE CONSUMER DURABLES",
-    "BSE FMCG", "BSE HEALTHCARE", "BSE POWER", "BSE PSU"
+    "SENSEX", "BANKEX"
 ]
 
 # Indian market timings

@@ -1,11 +1,12 @@
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, Optional, Union, List
+from typing import Dict, Any, Optional, Union, List, Callable
 from datetime import datetime
 import json
 import uuid
 import logging
+from enum import Enum
 
-from utils.constants import Exchange, EventType, MarketDataType, OrderType, OrderSide, OrderStatus, SignalType
+from utils.constants import Exchange, OrderType, OrderSide, OrderStatus, SignalType, EventType, MarketDataType, EventPriority
 from models.instrument import Instrument
 
 logger = logging.getLogger("models.events")
@@ -17,11 +18,11 @@ class EventValidationError(Exception):
 def validate_event(event, required_fields: List[str]):
     """
     Validate that an event has all required fields.
-    
+
     Args:
         event: The event to validate
         required_fields: List of required field names
-        
+
     Raises:
         EventValidationError: If any required field is missing
     """
@@ -29,12 +30,12 @@ def validate_event(event, required_fields: List[str]):
     for field in required_fields:
         if not hasattr(event, field) or getattr(event, field) is None:
             missing_fields.append(field)
-    
+
     if missing_fields:
         error_msg = f"Missing required fields in {event.__class__.__name__}: {', '.join(missing_fields)}"
         logger.error(error_msg)
         raise EventValidationError(error_msg)
-    
+
     return True
 
 @dataclass
@@ -44,6 +45,7 @@ class Event:
     event_type: EventType
     timestamp: int
     event_id: str = None
+    priority: EventPriority = EventPriority.NORMAL
 
     def __post_init__(self):
         if self.event_id is None:
@@ -56,7 +58,8 @@ class Event:
         return {
             "event_id": self.event_id,
             "event_type": self.event_type.value,
-            "timestamp": self.timestamp      
+            "timestamp": self.timestamp,
+            "priority": self.priority.value
         }
 
     def to_json(self) -> str:
@@ -66,7 +69,7 @@ class Event:
     def validate(self) -> bool:
         """
         Validate that the event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -79,18 +82,25 @@ class Event:
         return cls(
             event_type=EventType(data["event_type"]) if isinstance(data["event_type"], str) else data["event_type"],
             timestamp=data["timestamp"],
-            event_id=data.get("event_id")
+            event_id=data.get("event_id"),
+            priority=EventPriority(data["priority"]) if "priority" in data else EventPriority.NORMAL
         )
+
+    def __lt__(self, other):
+        """Compare events based on priority and timestamp"""
+        if self.priority != other.priority:
+            return self.priority.value < other.priority.value
+        return self.timestamp < other.timestamp
 
 @dataclass
 class MarketDataEvent(Event):
-    """Event for market data updates."""   
+    """Event for market data updates."""
     # Required arguments must come first
     instrument: Instrument = None
     exchange: str = Exchange.NSE
     data_type: MarketDataType = MarketDataType.QUOTE
     data: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         super().__post_init__()
         if self.event_type is None:
@@ -113,7 +123,7 @@ class MarketDataEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the market data event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -125,14 +135,14 @@ class MarketDataEvent(Event):
     def from_dict(cls, data: Dict[str, Any], instrument_registry=None) -> 'MarketDataEvent':
         """
         Create market data event from dictionary.
-        
+
         Args:
             data: Dictionary containing event data
             instrument_registry: Optional registry to look up instrument
         """
         instrument_id = data.get("instrument_id")
         symbol = data.get("symbol")
-        
+
         # Attempt to get instrument from registry
         instrument = None
         if instrument_registry:
@@ -140,15 +150,15 @@ class MarketDataEvent(Event):
                 instrument = instrument_registry.get_by_id(instrument_id)
             elif symbol:
                 instrument = instrument_registry.get_by_symbol(symbol)
-                
+
         if not instrument:
-            # Create a basic instrument if we can't find one            
+            # Create a basic instrument if we can't find one
             instrument = Instrument(
                 instrument_id=instrument_id,
                 symbol=symbol,
                 exchange=data.get("exchange")
             )
-        
+
         return cls(
             event_type=EventType(data["event_type"]),
             timestamp=data["timestamp"],
@@ -158,7 +168,7 @@ class MarketDataEvent(Event):
             data_type=MarketDataType(data["data_type"]),
             data=data["data"]
         )
-        
+
     @property
     def symbol(self) -> str:
         """Get the symbol from the instrument for backward compatibility."""
@@ -176,7 +186,7 @@ class BarEvent(Event):
     close_price: float = 0.0
     volume: float = 0.0
     bar_start_time: Optional[int] = None  # Start time of the bar in milliseconds
-    
+
     def __post_init__(self):
         super().__post_init__()
         if self.event_type is None:
@@ -205,7 +215,7 @@ class BarEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the bar event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -217,7 +227,7 @@ class BarEvent(Event):
     def from_dict(cls, data: Dict[str, Any], instrument_registry=None) -> 'BarEvent':
         """
         Create bar event from dictionary.
-        
+
         Args:
             data: Dictionary containing event data
             instrument_registry: Optional registry to look up instrument
@@ -225,7 +235,7 @@ class BarEvent(Event):
         instrument_id = data.get("instrument_id")
         symbol = data.get("symbol")
         exchange = data.get("exchange")
-        
+
         # Attempt to get instrument from registry
         instrument = None
         if instrument_registry:
@@ -233,7 +243,7 @@ class BarEvent(Event):
                 instrument = instrument_registry.get_by_id(instrument_id)
             elif symbol:
                 instrument = instrument_registry.get_by_symbol(symbol, exchange)
-                
+
         if not instrument:
             # Create a basic instrument if we can't find one
             instrument = Instrument(
@@ -241,7 +251,7 @@ class BarEvent(Event):
                 symbol=symbol,
                 exchange=exchange
             )
-        
+
         return cls(
             event_type=EventType(data["event_type"]),
             timestamp=data["timestamp"],
@@ -255,7 +265,7 @@ class BarEvent(Event):
             volume=data.get("volume", 0.0),
             bar_start_time=data.get("bar_start_time")
         )
-        
+
     @property
     def symbol(self) -> str:
         """Get the symbol from the instrument for backward compatibility."""
@@ -284,7 +294,7 @@ class OrderEvent(Event):
     broker_order_id: Optional[str] = None
     rejection_reason: Optional[str] = None
     # For backward compatibility with systems that use 'action' instead of 'side'
-    action: Optional[str] = None  
+    action: Optional[str] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -292,32 +302,32 @@ class OrderEvent(Event):
             self.event_type = EventType.ORDER
         if self.remaining_quantity is None:
             self.remaining_quantity = self.quantity - self.filled_quantity
-            
+
         # Standardize between side and action (action is deprecated)
         self._standardize_side_and_action()
-            
+
         # Ensure order_id is not None
         if self.order_id is None:
             self.order_id = str(uuid.uuid4())
-        
+
         # Convert order_type if it's a string
         if isinstance(self.order_type, str):
             try:
                 self.order_type = OrderType(self.order_type)
             except (ValueError, TypeError):
                 pass
-        
+
         # Convert status if it's a string
         if isinstance(self.status, str):
             try:
                 self.status = OrderStatus(self.status)
             except (ValueError, TypeError):
                 pass
-        
+
         # Set order_time if not provided
         if self.order_time is None:
             self.order_time = self.timestamp
-            
+
         # Set last_update_time if not provided
         if self.last_update_time is None:
             self.last_update_time = self.timestamp
@@ -336,7 +346,7 @@ class OrderEvent(Event):
                     self.side = self.action
             else:
                 self.side = self.action
-                
+
         # Ensure side is an OrderSide enum when possible
         if isinstance(self.side, str):
             try:
@@ -347,7 +357,7 @@ class OrderEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the order event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -387,10 +397,10 @@ class OrderEvent(Event):
         # Standardize between side and action
         side = data.get("side")
         action = data.get("action")
-        
+
         if side is None and action is not None:
             side = action
-        
+
         return cls(
             event_type=EventType(data["event_type"]),
             timestamp=data["timestamp"],
@@ -420,9 +430,9 @@ class OrderEvent(Event):
 class ExecutionEvent(OrderEvent):
     """
     Event representing an execution update for an order.
-    
+
     ExecutionEvent is an intermediate step between OrderEvent and FillEvent.
-    It represents an execution report from the broker or exchange about the 
+    It represents an execution report from the broker or exchange about the
     status of an order, which may be partially filled, filled, rejected, or
     in some other state.
     """
@@ -437,39 +447,39 @@ class ExecutionEvent(OrderEvent):
     commission: Optional[float] = None
     execution_type: Optional[str] = None  # NEW, PARTIAL, CANCELED, REJECTED, etc.
     text: Optional[str] = None  # Additional execution info or error message
-    
+
     def __post_init__(self):
         super().__post_init__()
         if self.event_type is None:
             self.event_type = EventType.EXECUTION
-            
+
         # Default execution_id if not provided
         if self.execution_id is None:
             self.execution_id = str(uuid.uuid4())
-            
+
         # Default execution_time if not provided
         if self.execution_time is None:
             self.execution_time = self.timestamp
-            
+
         # Calculate leaves_quantity if not provided
         if self.leaves_quantity is None and self.quantity is not None and self.cumulative_filled_quantity is not None:
             self.leaves_quantity = self.quantity - self.cumulative_filled_quantity
-            
+
         # Set cumulative_filled_quantity if not provided
         if self.cumulative_filled_quantity is None:
             self.cumulative_filled_quantity = self.filled_quantity
-            
+
     def validate(self) -> bool:
         """
         Validate that the execution event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
         super().validate()
         required_fields = ["order_id", "symbol", "status", "execution_id"]
         return validate_event(self, required_fields)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert execution event to dictionary."""
         result = super().to_dict()
@@ -486,13 +496,13 @@ class ExecutionEvent(OrderEvent):
             "text": self.text
         })
         return result
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'ExecutionEvent':
         """Create execution event from dictionary."""
         # Create base OrderEvent
         order_event_data = data.copy()
-        
+
         # Extract execution-specific fields
         execution_specific = {
             "execution_id": data.get("execution_id"),
@@ -506,17 +516,17 @@ class ExecutionEvent(OrderEvent):
             "execution_type": data.get("execution_type"),
             "text": data.get("text")
         }
-        
+
         # Create OrderEvent object first
         order_event = OrderEvent.from_dict(order_event_data)
-        
+
         # Convert to dict and update with execution fields
         order_dict = asdict(order_event)
         order_dict.update(execution_specific)
-        
+
         # Set the event type to EXECUTION
         order_dict["event_type"] = EventType.EXECUTION
-        
+
         # Create ExecutionEvent using the combined dictionary
         return cls(**order_dict)
 
@@ -546,7 +556,7 @@ class FillEvent(Event):
             self.fill_id = str(uuid.uuid4())
         if self.fill_time is None:
             self.fill_time = self.timestamp
-            
+
         # Standardize between side and action
         self._standardize_side_and_action()
 
@@ -564,7 +574,7 @@ class FillEvent(Event):
                     self.side = self.action
             else:
                 self.side = self.action
-                
+
         # Ensure side is an OrderSide enum when possible
         if isinstance(self.side, str):
             try:
@@ -575,7 +585,7 @@ class FillEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the fill event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -601,17 +611,17 @@ class FillEvent(Event):
             "broker_order_id": self.broker_order_id
         })
         return result
-        
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'FillEvent':
         """Create fill event from dictionary."""
         # Standardize between side and action
         side = data.get("side")
         action = data.get("action")
-        
+
         if side is None and action is not None:
             side = action
-            
+
         return cls(
             event_type=EventType(data["event_type"]),
             timestamp=data["timestamp"],
@@ -663,7 +673,7 @@ class SignalEvent(Event):
                 self.side = OrderSide(self.side)
             except (ValueError, TypeError):
                 pass
-        
+
         # If price is not set but signal_price is, use signal_price
         if self.price is None and self.signal_price is not None:
             self.price = self.signal_price
@@ -671,7 +681,7 @@ class SignalEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the signal event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -749,7 +759,7 @@ class TradeEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the trade event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -817,7 +827,7 @@ class PositionEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the position event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -881,7 +891,7 @@ class AccountEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the account event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -947,7 +957,7 @@ class StrategyEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the strategy event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -1000,7 +1010,7 @@ class SystemEvent(Event):
     def validate(self) -> bool:
         """
         Validate that the system event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
@@ -1033,9 +1043,71 @@ class SystemEvent(Event):
         )
 
 @dataclass
+class TimerEvent(Event):
+    """Event for timer-based scheduling and timing operations."""
+
+    timer_id: str = None
+    timer_type: str = None
+    interval: float = 0.0  # Interval in seconds
+    callback: Optional[Callable] = None
+    data: Optional[Dict[str, Any]] = None
+    repeat: bool = False
+    next_execution: Optional[int] = None  # Timestamp for next execution
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.event_type is None:
+            self.event_type = EventType.TIMER
+        if self.timer_id is None:
+            self.timer_id = str(uuid.uuid4())
+        if self.data is None:
+            self.data = {}
+        if self.next_execution is None:
+            self.next_execution = self.timestamp
+
+    def validate(self) -> bool:
+        """
+        Validate that the timer event has all required fields.
+
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["timer_id", "timer_type", "interval"]
+        return validate_event(self, required_fields)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert timer event to dictionary."""
+        result = super().to_dict()
+        result.update({
+            "timer_id": self.timer_id,
+            "timer_type": self.timer_type,
+            "interval": self.interval,
+            "repeat": self.repeat,
+            "next_execution": self.next_execution,
+            "data": self.data
+        })
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TimerEvent':
+        """Create timer event from dictionary."""
+        return cls(
+            event_type=EventType(data["event_type"]),
+            timestamp=data["timestamp"],
+            event_id=data.get("event_id"),
+            timer_id=data["timer_id"],
+            timer_type=data["timer_type"],
+            interval=data["interval"],
+            repeat=data.get("repeat", False),
+            next_execution=data.get("next_execution"),
+            data=data.get("data", {})
+        )
+
+@dataclass
 class RiskBreachEvent(Event):
     """Event for risk management breaches."""
-    
+
     risk_type: str = None  # Type of risk breach (e.g., "POSITION_LIMIT", "DRAWDOWN_LIMIT")
     symbol: Optional[str] = None  # Symbol related to the breach, if applicable
     strategy_id: Optional[str] = None  # Strategy related to the breach, if applicable
@@ -1045,25 +1117,25 @@ class RiskBreachEvent(Event):
     current_value: Optional[float] = None  # Current value that triggered the breach
     message: Optional[str] = None  # Human-readable description of the breach
     data: Optional[Dict[str, Any]] = None  # Additional data related to the breach
-    
+
     def __post_init__(self):
         super().__post_init__()
         if self.event_type is None:
             self.event_type = EventType.RISK_BREACH
         if self.data is None:
             self.data = {}
-            
+
     def validate(self) -> bool:
         """
         Validate that the risk breach event has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
         super().validate()
         required_fields = ["risk_type"]
         return validate_event(self, required_fields)
-        
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert risk breach event to dictionary."""
         result = super().to_dict()
@@ -1079,7 +1151,7 @@ class RiskBreachEvent(Event):
             "data": self.data
         })
         return result
-        
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'RiskBreachEvent':
         """Create risk breach event from dictionary."""

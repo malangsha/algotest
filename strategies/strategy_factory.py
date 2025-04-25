@@ -4,7 +4,7 @@ from typing import Dict, Any, Type, List
 
 from models.instrument import Instrument
 from utils.config_loader import ConfigLoader
-from .strategy import Strategy
+from .base_strategy import OptionStrategy
 from .strategy_registry import StrategyRegistry
 
 class StrategyFactory:
@@ -20,7 +20,7 @@ class StrategyFactory:
         config: Dict = None,
         instruments: List = None,
         **kwargs
-    ) -> Strategy:
+    ) -> OptionStrategy:
         """
         Create a strategy instance.
 
@@ -35,7 +35,7 @@ class StrategyFactory:
             **kwargs: Additional parameters
 
         Returns:
-            Strategy: Instantiated strategy
+            OptionStrategy: Instantiated strategy
 
         Raises:
             ValueError: If strategy_type is not registered
@@ -49,7 +49,7 @@ class StrategyFactory:
         name = config.get('name', strategy_id) if config else strategy_id
 
         # Check if strategy type is registered
-        strategy_class = StrategyRegistry.get_strategy(strategy_type)
+        strategy_class = StrategyRegistry.get_strategy_class(strategy_type)
 
         if strategy_class is None:
             # Try to dynamically import the strategy module
@@ -67,11 +67,10 @@ class StrategyFactory:
 
                 if hasattr(module, class_name):
                     strategy_class = getattr(module, class_name)
-                    # create the strategy instance
-                    strategy = StrategyRegistry.create_strategy(strategy_type, config, data_manager, portfolio_manager, event_manager, instruments)
-
-                    # Register the strategy
-                    StrategyRegistry.register_strategy(strategy_type, strategy_class)
+                    
+                    # Register the strategy if needed (the class might already have a decorator)
+                    # This doesn't create an instance, just registers the class
+                    StrategyRegistry.register(strategy_type)(strategy_class)
                     logger.info(f"Successfully loaded {class_name} from {module_name}")
                 else:
                     raise AttributeError(f"Class {class_name} not found in module {module_name}")
@@ -85,22 +84,11 @@ class StrategyFactory:
 
         logger.info(f"Creating strategy instance: {name} of type {strategy_type}")
         
-
-        # Create the strategy instance with all available parameters
-        # Ensure arguments match the expected __init__ signature of the strategy class
-        # Common signature: (self, config, data_manager, portfolio, event_manager)
-        # We pass the full config dict, data_manager, portfolio_manager (assuming it's the portfolio), event_manager
-        # The strategy itself should extract parameters, instruments etc. from the config dict.
-        return strategy_class( 
-            config=config, # Pass the full strategy config dict
-            data_manager=data_manager, 
-            portfolio=portfolio_manager, # Assuming portfolio_manager is the Portfolio instance
-            event_manager=event_manager
-            # Note: Instruments list is not passed directly, strategy should get it from config or engine
-        )
+        # Create the strategy instance using the config
+        return strategy_class(config)
 
     @staticmethod
-    def create_strategies_from_config(config_path: str = "config/strategies.yaml") -> List[Strategy]:
+    def create_strategies_from_config(config_path: str = "config/strategies.yaml") -> List[OptionStrategy]:
         """
         Create multiple strategies from a configuration file.
 
@@ -108,7 +96,7 @@ class StrategyFactory:
             config_path: Path to the strategies configuration file
 
         Returns:
-            List[Strategy]: List of instantiated strategies
+            List[OptionStrategy]: List of instantiated strategies
         """
         logger = logging.getLogger("strategies.strategy_factory")
         logger.info(f"Loading strategies from {config_path}")
@@ -159,7 +147,7 @@ class StrategyFactory:
         return strategies
 
     @staticmethod
-    def create_strategy_from_config(strategy_config: Dict, instruments_dict: Dict) -> Strategy:
+    def create_strategy_from_config(strategy_config: Dict, instruments_dict: Dict) -> OptionStrategy:
         """
         Create a strategy from configuration.
 
@@ -168,7 +156,7 @@ class StrategyFactory:
             instruments_dict: Dictionary of available instruments
 
         Returns:
-            Strategy: Instantiated strategy
+            OptionStrategy: Instantiated strategy
         """
         logger = logging.getLogger("strategies.strategy_factory")
 
@@ -187,10 +175,12 @@ class StrategyFactory:
             else:
                 logger.warning(f"Instrument {instr_id} not found for strategy {strategy_id}")
 
+        # Update config with instruments
+        strategy_config['instruments'] = instruments
+
         # Create strategy instance
         return StrategyFactory.create_strategy(
             strategy_type=strategy_type,
             strategy_id=strategy_id,
-            config=strategy_config,
-            instruments=instruments
+            config=strategy_config
         )

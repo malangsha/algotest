@@ -9,7 +9,6 @@ from models.events import Event, MarketDataEvent, OrderEvent, SignalEvent, FillE
 from models.instrument import Instrument
 from models.market_data import MarketData
 from models.order import Order, OrderStatus
-from utils.config_loader import ConfigLoader
 from brokers.broker_factory import BrokerFactory
 from strategies.strategy_factory import StrategyFactory
 from core.event_manager import EventManager
@@ -23,6 +22,9 @@ from core.execution_handler import ExecutionHandler
 from core.paper_trading_simulator import PaperTradingSimulator
 from utils.constants import InstrumentType
 from utils.exceptions import ConfigError, InitializationError
+from core.option_manager import OptionManager
+from core.strategy_manager import StrategyManager
+from core.logging_manager import get_logger
 
 class UniverseHandler:
     """
@@ -36,7 +38,7 @@ class UniverseHandler:
             data_source: Optional data source for market data
         """
         self.data_source = data_source
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger("core.universe_handler")
 
     def get_instruments(self, universe_config: Dict[str, Any],
                         instruments_dict: Dict[str, Instrument]) -> List[Instrument]:
@@ -144,60 +146,83 @@ class TradingEngine:
         self.strategy_config = strategy_config or {}
 
         # Initialize logging
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger("core.engine")
         self.logger.info("Initializing Trading Engine")
 
-        # Initialize event queue and manager
-        self.event_queue = queue.Queue()
+        # Initialize event manager (sole queue mechanism)
         self.event_manager = EventManager()
 
         # Initialize broker using factory
         self.broker = None
         self._initialize_broker()
 
-        # Initialize queues for different event types
-        self.market_data_queue = queue.Queue(maxsize=config.get('queue_sizes', {}).get('market_data', 10000))
-        self.order_queue = queue.Queue(maxsize=config.get('queue_sizes', {}).get('orders', 1000))
-        self.signal_queue = queue.Queue(maxsize=config.get('queue_sizes', {}).get('signals', 1000))
-        self.execution_queue = queue.Queue(maxsize=config.get('queue_sizes', {}).get('executions', 1000))
-
-        # Initialize components
+        # Initialize core components
         self.data_manager = DataManager(self.config, self.event_manager, self.broker)    
+        
+        # Initialize OptionManager for option trading functionality
+        self.option_manager = OptionManager(self.data_manager, self.event_manager, self.config)
+        self.logger.info("Option Manager initialized")
+        
+        # Configure indices from market config
+        market_config = self.config.get('market', {})
+        underlyings_config = market_config.get('underlyings', [])
+        if underlyings_config:
+            self.logger.info(f"Configuring {len(underlyings_config)} underlyings in Option Manager")
+            self.option_manager.configure_underlyings(underlyings_config)
+        else:
+            self.logger.debug("No underlyings configuration found in config")
+        
+        # Initialize position and portfolio management
         self.position_manager = PositionManager(self.event_manager)
         self.portfolio = Portfolio(self.config, self.position_manager)
         self.risk_manager = RiskManager(self.portfolio, self.config)
         self.order_manager = OrderManager(self.event_manager, self.risk_manager)
+        
+        # Initialize StrategyManager to handle strategy lifecycle
+        self.strategy_manager = StrategyManager(
+            data_manager=self.data_manager,
+            event_manager=self.event_manager,
+            portfolio_manager=self.position_manager,
+            risk_manager=self.risk_manager,
+            broker=self.broker,
+            config=self.config
+        )
+        self.logger.info("Strategy Manager initialized")
+        
+        # Set OptionManager in StrategyManager
+        self.strategy_manager.option_manager = self.option_manager
+        
+        # Load strategy configurations
+        if self.strategy_config:
+            self.strategy_manager.load_config(self.strategy_config, self.config)
+            self.logger.info("Strategy configurations loaded")
+            
         self.performance_tracker = PerformanceTracker(self.portfolio, self.config)
 
-        # For now, assume the broker is the data source for market data
-        self.data_source = self.broker
+        # Assuming broker acts as the primary data source connection point
+        self.data_source = self.broker 
 
-        # Initialize the universe handler with the data source
-        self.universe_handler = UniverseHandler(self.data_source)
+        # Initialize the universe handler if needed (consider refactoring)
+        # self.universe_handler = UniverseHandler(self.data_source)
 
         # Instrument tracking
         self.instruments: Dict[str, Instrument] = {}
-        self.market_data: Dict[str, MarketData] = {}
-        self.orders: Dict[str, Order] = {}
+        self.market_data: Dict[str, MarketData] = {} # Cache for latest data
+        self.orders: Dict[str, Order] = {} # Cache for active orders
         self.active_instruments = set()
 
-        # Initialize strategies
-        self.strategies = {}
+        # Initialize strategies storage
+        self.strategies = {} # Strategies managed by StrategyManager
 
         # Heartbeat interval in seconds
         self.heartbeat = self.config.get("system", {}).get("heartbeat_interval", 1.0)
+        self._timer_thread = None # For periodic events
 
         # Engine state
         self.running = False
         self.paused = False
-        self._main_thread = None
+        self._main_thread = None # Main engine loop thread (for heartbeat/performance)
         self.last_heartbeat_time = None
-
-        # Processing threads
-        self.market_data_thread = None
-        self.order_processing_thread = None
-        self.strategy_thread = None
-        self.event_processing_thread = None
 
         # Initialize Execution Handler (after Broker and EventManager)
         try:
@@ -234,25 +259,29 @@ class TradingEngine:
         """
         self.logger.info("Initializing engine components")
 
-        # Only create the universe handler if it doesn't exist
-        if not hasattr(self, 'universe_handler') or self.universe_handler is None:
-            self.universe_handler = UniverseHandler(self.data_source)
+        # Only create the universe handler if it doesn't exist and is needed
+        # if not hasattr(self, 'universe_handler') or self.universe_handler is None:
+        #     self.universe_handler = UniverseHandler(self.data_source)
 
         # Set the event manager for the broker
         if self.broker:
-            self.broker.set_event_manager(self.event_manager)
-            self.logger.info("Event manager set for the broker")
+            if hasattr(self.broker, 'set_event_manager'):
+                self.broker.set_event_manager(self.event_manager)
+                self.logger.info("Event manager set for the broker")
+            else:
+                 self.logger.warning("Broker does not have 'set_event_manager' method.")
+
 
         # Load instruments
         self._load_instruments()
 
-        # Start the event manager
+        # Start the event manager processing loop
         self.event_manager.start()
 
-        # Set up event handlers
+        # Set up event handlers within this engine
         self._subscribe_to_events()
 
-        # Load strategies
+        # Load strategies (initializes and gets active instruments)
         self._load_strategies()
 
         # Connect to broker
@@ -261,12 +290,13 @@ class TradingEngine:
                 self.broker.connect()
             except Exception as e:
                 self.logger.error(f"Error connecting to broker: {str(e)}")
+                # Consider if initialization should fail here
 
         # Start ExecutionHandler if it has a start method
         if hasattr(self.execution_handler, 'start'):
              self.execution_handler.start()
 
-        # Start PaperTradingSimulator if it exists
+        # Start PaperTradingSimulator if it exists and has start method
         if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'start'):
             self.paper_trading_simulator.start()
 
@@ -295,13 +325,11 @@ class TradingEngine:
             if not broker_type:
                 raise InitializationError(f"Missing 'broker_type' for connection '{active_connection_name}'.")
 
+            # Pass config and specific connection details
             self.broker = BrokerFactory.create_broker(broker_type, config=self.config, **active_broker_config)
-            self.logger.info(f"Broker interface initialized: {broker_type}")
-
-            # Pass the event manager to the broker if it needs it
-            if hasattr(self.broker, 'set_event_manager') and callable(self.broker.set_event_manager):
-                self.broker.set_event_manager(self.event_manager)
-                self.logger.info(f"Passed EventManager to {broker_type} broker.")
+            if not self.broker.is_connected:            
+               raise InitializationError(f"Broker initialized failed: {broker_type}")
+            self.logger.info(f"Broker interface initialized: {broker_type}")            
 
         except ImportError as e:
             raise InitializationError(f"Failed to import broker module: {e}")
@@ -312,31 +340,38 @@ class TradingEngine:
 
     def _load_instruments(self):
         """Load instruments from configuration or data source."""
-        # Try to load from config file
+        # Try to load from config file first
         instruments_config = self.config.get('instruments', [])
 
         for instr_config in instruments_config:
-            instrument = Instrument(
-                instrument_id=instr_config.get('id', instr_config.get('symbol')),
-                instrument_type=instr_config.get('instrument_type', InstrumentType.EQUITY),
-                symbol=instr_config['symbol'],
-                exchange=instr_config.get('exchange', ''),
-                asset_type=instr_config.get('asset_type', ''),
-                currency=instr_config.get('currency', ''),
-                tick_size=instr_config.get('tick_size', 0.01),
-                lot_size=instr_config.get('lot_size', 1.0),
-                margin_requirement=instr_config.get('margin_requirement', 1.0),
-                is_tradable=instr_config.get('is_tradable', True),
-                expiry_date=instr_config.get('expiry_date'),
-                additional_info=instr_config.get('additional_info', {})
-            )
-            self.instruments[instrument.symbol] = instrument
+            try:
+                instrument = Instrument(
+                    instrument_id=instr_config.get('id', instr_config.get('symbol')),
+                    instrument_type=instr_config.get('instrument_type', InstrumentType.EQUITY),
+                    symbol=instr_config['symbol'],
+                    exchange=instr_config.get('exchange', ''),
+                    asset_type=instr_config.get('asset_type', ''),
+                    currency=instr_config.get('currency', ''),
+                    tick_size=instr_config.get('tick_size', 0.01),
+                    lot_size=instr_config.get('lot_size', 1.0),
+                    margin_requirement=instr_config.get('margin_requirement', 1.0),
+                    is_tradable=instr_config.get('is_tradable', True),
+                    expiry_date=instr_config.get('expiry_date'),
+                    additional_info=instr_config.get('additional_info', {})
+                )
+                self.instruments[instrument.symbol] = instrument
 
-            # Also store by ID if it's different from symbol
-            if instrument.instrument_id != instrument.symbol:
-                self.instruments[instrument.instrument_id] = instrument
+                # Also store by ID if it's different from symbol
+                if instrument.instrument_id != instrument.symbol:
+                    self.instruments[instrument.instrument_id] = instrument
+            except KeyError as e:
+                self.logger.error(f"Missing required key {e} in instrument config: {instr_config}")
+            except Exception as e:
+                 self.logger.error(f"Error creating instrument from config {instr_config}: {e}")
+
 
         # If we have a data source, try to load additional instruments
+        # This might be broker-specific
         if self.data_source and hasattr(self.data_source, 'get_instruments'):
             try:
                 additional_instruments = self.data_source.get_instruments()
@@ -351,368 +386,207 @@ class TradingEngine:
         # Add instruments to position manager
         for instrument in self.instruments.values():
             self.position_manager.add_instrument(instrument)
+            
+        self.logger.info(f"Loaded {len(self.instruments)} instruments")
 
     def _load_strategies(self):
-        """Load strategies from configuration."""
-        strategies_config = self.strategy_config.get('strategies', [])
+        """Load strategies using the StrategyManager."""
+        self.logger.info("Loading strategies...")
+        # Initialize strategies using StrategyManager
+        self.strategy_manager.initialize_strategies()
         
-        self.logger.info(f"Initializing {len(strategies_config)} strategies")
-        for strategy_config in strategies_config:
-            strategy_type = strategy_config.get('type', strategy_config.get('name'))  # Fallback to name if type is missing
-            strategy_id = strategy_config.get('id', f"{strategy_config.get('name', strategy_type)}_{int(time.time())}")
+        # Get loaded strategies from the manager
+        self.strategies = self.strategy_manager.strategies # Keep a reference
+        
+        # Track active instruments across all strategies
+        temp_active_instruments = set()
+        for strategy_id, strategy in self.strategies.items():
+            # If the strategy has instruments defined
+            if hasattr(strategy, 'instruments') and strategy.instruments:
+                # Get instrument symbols
+                instrument_symbols = [instr.symbol for instr in strategy.instruments if hasattr(instr, 'symbol')]
+                temp_active_instruments.update(instrument_symbols)
+                
+                # StrategyManager should ideally handle subscriptions needed by strategies
+                # through DataManager or OptionManager
+            else:
+                self.logger.warning(f"Strategy {strategy_id} has no instruments defined.")
 
-            # Get universe for the strategy
-            universe_config = strategy_config.get('universe', {})
-            universe = self.universe_handler.get_instruments(universe_config, self.instruments)
-
-            # Log universe details for debugging
-            self.logger.debug(f"Strategy {strategy_id} universe: {[instr.symbol for instr in universe]}")
-
-            # Track instruments used by this strategy
-            instrument_symbols = [instr.symbol for instr in universe]
-            self.active_instruments.update(instrument_symbols)
-
-            # Create strategy instance
-            try:
-                strategy = StrategyFactory.create_strategy(
-                    strategy_type=strategy_type,
-                    strategy_id=strategy_id,
-                    data_manager=self.data_manager,
-                    event_manager=self.event_manager,
-                    config=strategy_config,
-                    instruments=universe
-                )
-
-                if strategy:
-                    self.strategies[strategy_id] = strategy
-                    self.logger.info(f"Loaded strategy: {strategy_id} of type {strategy_type}")
-
-                    # Subscribe market data feed to instruments in strategy universe
-                    # Check if market_data_feed exists (it's initialized in LiveEngine)
-                    if hasattr(self, 'market_data_feed') and self.market_data_feed:
-                        for symbol in instrument_symbols:
-                            # Find the instrument object
-                            instrument = self.instruments.get(symbol)
-                            if instrument:
-                                self.market_data_feed.subscribe(instrument)
-                            else:
-                                self.logger.warning(f"Instrument '{symbol}' defined in strategy universe not found in main instrument list.")
-
-                    strategy.initialize()
-                else:
-                    self.logger.error(f"Failed to create strategy of type {strategy_type}")
-            except Exception as e:
-                self.logger.error(f"Error creating strategy {strategy_id}: {str(e)}")
+        self.active_instruments = temp_active_instruments
+        self.logger.info(f"Loaded {len(self.strategies)} strategies. Active instruments: {len(self.active_instruments)}")
+        # DataManager should handle subscriptions based on strategy needs or explicit calls
 
     def _subscribe_to_events(self):
-        """Subscribe to relevant events."""
-        # Register with the event_manager
+        """Subscribe internal engine methods to relevant events."""
+        self.logger.debug("Subscribing engine methods to events")
+        
+        # Subscribe to events needed for local cache maintenance
         self.event_manager.subscribe(EventType.MARKET_DATA, self._on_market_data, component_name="TradingEngine")
         self.event_manager.subscribe(EventType.ORDER, self._on_order_event, component_name="TradingEngine")
-        self.event_manager.subscribe(EventType.SIGNAL, self._on_signal_event, component_name="TradingEngine")
         self.event_manager.subscribe(EventType.FILL, self._on_fill_event, component_name="TradingEngine")
+        
+        # Subscribe to system events for engine control
+        self.event_manager.subscribe(EventType.SYSTEM, self._on_system_event, component_name="TradingEngine")
+        
+        # Subscribe to timer events for periodic tasks
+        self.event_manager.subscribe(EventType.TIMER, self._on_timer_event, component_name="TradingEngine")
+        
+        # Subscribe to signal events for order creation
+        self.event_manager.subscribe(EventType.SIGNAL, self._on_signal_event, component_name="TradingEngine")
 
     def _on_market_data(self, event: MarketDataEvent):
         """
-        Handle market data events.
+        Handle market data events to maintain local cache.
+        This cache is used by get_market_data() method.
 
         Args:
             event: Market data event
         """
-        # Put event in queue for asynchronous processing
         try:
-            if not self.market_data_queue.full():
-                self.market_data_queue.put(event, block=False)
-                self.logger.debug(f"Queued market data event: {event}")
-            else:
-                self.logger.warning("Market data queue full, dropping event")
+            self.logger.debug(f"Received MarketDataEvent: {event}")
+            # Basic validation
+            if not isinstance(event, MarketDataEvent) or not hasattr(event, 'instrument') or not hasattr(event.instrument, 'symbol'):
+                self.logger.warning(f"Invalid MarketDataEvent received: {event}")
+                return
+
+            instrument = event.instrument
+            symbol = instrument.symbol
+            
+            # Update local cache only
+            if hasattr(event, 'data'):
+                self.market_data[symbol] = event.data
+            
+            self.logger.debug(f"Updated market data cache for {symbol}: {event.data_type}")
+
         except Exception as e:
-            self.logger.error(f"Error adding market data to queue: {str(e)}")
+            self.logger.error(f"Error updating market data cache for {getattr(event, 'instrument', 'N/A')}: {e}", exc_info=True)
 
     def _on_order_event(self, event: OrderEvent):
         """
-        Handle order events.
+        Handle order events to maintain local order cache.
+        This cache is used by get_order() method and for order status tracking.
 
         Args:
             event: Order event
         """
-        # Put event in queue for asynchronous processing
         try:
-            if not self.order_queue.full():
-                self.order_queue.put(event, block=False)
-                self.logger.debug(f"Queued order event: {event}")
-            else:
-                self.logger.warning("Order queue full, dropping event")
+            if not isinstance(event, OrderEvent) or not hasattr(event, 'data') or not isinstance(event.data, Order):
+                self.logger.warning(f"Invalid OrderEvent received: {event}")
+                return
+
+            order = event.data
+            self.logger.debug(f"Updating order cache for {order.order_id}: Status {order.status}")
+
+            # Update local order cache only
+            self.orders[order.order_id] = order
+
         except Exception as e:
-            self.logger.error(f"Error adding order event to queue: {str(e)}")
+            self.logger.error(f"Error updating order cache for {getattr(event.data, 'order_id', 'N/A')}: {e}", exc_info=True)
 
     def _on_signal_event(self, event: SignalEvent):
         """
-        Handle strategy signal events.
+        Handle strategy signal events directly.
+        Validates signal via RiskManager and converts to an OrderEvent via OrderManager.
 
         Args:
-            event: Signal event
+            event: Signal event generated by a strategy
         """
-        # Put event in queue for asynchronous processing
         try:
-            if not self.signal_queue.full():
-                self.signal_queue.put(event, block=False)
-                self.logger.debug(f"Queued signal event: {event}")
+            if not isinstance(event, SignalEvent):
+                self.logger.warning(f"Invalid SignalEvent received: {event}")
+                return
+                
+            signal_data = event.data # Assuming event.data holds signal details
+            self.logger.debug(f"Processing signal event: {signal_data}")
+
+            # Check risk limits before creating order
+            if self.risk_manager.check_signal(signal_data): # Pass signal data directly
+                # Convert signal to order via OrderManager
+                order_event = self.order_manager.create_order_from_signal(signal_data) # Pass signal data
+                if order_event:
+                    # Publish the new OrderEvent for the ExecutionHandler to pick up
+                    self.event_manager.publish(order_event)
+                    self.logger.info(f"Signal converted to OrderEvent: {order_event.data.order_id}")
+                else:
+                     self.logger.warning(f"Signal could not be converted to order: {signal_data}")
             else:
-                self.logger.warning("Signal queue full, dropping event")
+                self.logger.info(f"Signal rejected by risk manager: {signal_data}")
+
         except Exception as e:
-            self.logger.error(f"Error adding signal event to queue: {str(e)}")
+            self.logger.error(f"Error processing signal event from strategy {getattr(event, 'strategy_id', 'N/A')}: {e}", exc_info=True)
 
     def _on_fill_event(self, event: FillEvent):
         """
-        Handle fill events.
+        Handle fill events to update order status in local cache.
+        This is important for tracking order completion and partial fills.
 
         Args:
             event: Fill event
         """
-        # Put event in queue for asynchronous processing
         try:
-            if not self.execution_queue.full():
-                self.execution_queue.put(event, block=False)
-                self.logger.debug(f"Queued fill event: {event}")
-            else:
-                self.logger.warning("Execution queue full, dropping event")
+            if not isinstance(event, FillEvent) or not hasattr(event, 'data'):
+                self.logger.warning(f"Invalid FillEvent received: {event}")
+                return
+
+            fill_data = event.data
+            self.logger.debug(f"Processing fill event for order cache: {fill_data}")
+
+            # Update local order status cache if applicable
+            order_id = getattr(fill_data, 'order_id', None)
+            if order_id and order_id in self.orders:
+                order = self.orders[order_id]
+                order.status = OrderStatus.FILLED 
+                order.executed_quantity = getattr(fill_data, 'quantity', order.quantity)
+                order.average_price = getattr(fill_data, 'price', order.average_price)
+
         except Exception as e:
-            self.logger.error(f"Error adding fill event to queue: {str(e)}")
+            self.logger.error(f"Error updating order cache for fill {getattr(event.data, 'order_id', 'N/A')}: {e}", exc_info=True)
 
-    def _process_market_data(self):
-        """Process market data from the queue."""
-        self.logger.info("Market data processing thread started")
+    def _on_timer_event(self, event: Event):
+        """Handle timer events for periodic tasks."""
+        if event.event_type == EventType.TIMER:
+            # 1. Update Performance Tracker
+            if hasattr(self.performance_tracker, 'update'):
+                 self.performance_tracker.update()
+                 
+            # 2. Notify Strategy Manager (for strategies needing timer updates)
+            if hasattr(self.strategy_manager, 'on_timer'):
+                 try:
+                    self.strategy_manager.on_timer(event)
+                 except Exception as strat_e:
+                    self.logger.error(f"Error in StrategyManager.on_timer: {strat_e}", exc_info=True)
 
-        while self.running:
-            try:
-                # Get next event with timeout
-                try:
-                    event = self.market_data_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                self.logger.debug(f"Processing market data event: {event}")
-
-                # Update market data manager
-                if hasattr(self.data_manager, 'update'):
-                    self.data_manager.update(event)
-
-                # Update positions with latest prices
-                if hasattr(self.position_manager, 'update_market_prices'):
-                    self.position_manager.update_market_prices(event)
-
-                # Update local market data cache
-                if hasattr(event, 'instrument') and hasattr(event, 'data'):
-                    symbol = event.instrument.symbol
-                    self.market_data[symbol] = event.data
-
-                    # Directly notify strategies about this specific symbol
-                    for strategy in self.strategies.values():
-                        if hasattr(strategy, 'instruments') and symbol in [instr.symbol for instr in strategy.instruments]:
-                            self.logger.debug(f"Notifying strategy {strategy.strategy_id} for {symbol}")
-                            if hasattr(strategy, 'on_market_data'):
-                                strategy.on_market_data(event)
-
-                # Mark as processed
-                self.market_data_queue.task_done()
-
-            except Exception as e:
-                self.logger.error(f"Error processing market data: {str(e)}")
-                time.sleep(0.01)  # Prevent high CPU usage on errors
-
-        self.logger.info("Market data processing thread stopped")
-
-    def _process_orders(self):
-        """Process orders from the queue."""
-        self.logger.info("Order processing thread started")
-
-        while self.running:
-            try:
-                # Get next event with timeout
-                try:
-                    event = self.order_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                self.logger.debug(f"Processing order event: {event}")
-
-                # Update order in local cache
-                if hasattr(event, 'data') and hasattr(event.data, 'order_id'):
-                    order = event.data
-                    self.orders[order.order_id] = order
-
-                # Submit order to broker
-                if self.broker and hasattr(self.broker, 'submit_order'):
-                    self.broker.submit_order(event.data)
-
-                # Notify relevant strategy
-                if hasattr(event.data, 'strategy_id'):
-                    strategy_id = event.data.strategy_id
-                    if strategy_id in self.strategies:
-                        strategy = self.strategies[strategy_id]
-                        if hasattr(strategy, 'on_order_update'):
-                            strategy.on_order_update(event.data)
-
-                # Mark as processed
-                self.order_queue.task_done()
-
-            except Exception as e:
-                self.logger.error(f"Error processing order: {str(e)}")
-                time.sleep(0.01)  # Prevent high CPU usage on errors
-
-        self.logger.info("Order processing thread stopped")
-
-    def _process_signals(self):
-        """Process signals from the queue."""
-        self.logger.info("Signal processing thread started")
-
-        while self.running:
-            try:
-                # Get next event with timeout
-                try:
-                    event = self.signal_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                self.logger.debug(f"Processing signal event: {event}")
-
-                # Check risk limits
-                if self.risk_manager.check_signal(event):
-                    # Convert signal to order
-                    order_event = self.order_manager.create_order_from_signal(event)
-                    if order_event:
-                        # Publish to event manager
-                        self.event_manager.publish(order_event)
-                else:
-                    self.logger.info(f"Signal rejected by risk manager: {event}")
-
-                # Mark as processed
-                self.signal_queue.task_done()
-
-            except Exception as e:
-                self.logger.error(f"Error processing signal: {str(e)}")
-                time.sleep(0.01)  # Prevent high CPU usage on errors
-
-        self.logger.info("Signal processing thread stopped")
-
-    def _process_fills(self):
-        """Process fill events from the queue."""
-        self.logger.info("Fill processing thread started")
-
-        while self.running:
-            try:
-                # Get next event with timeout
-                try:
-                    event = self.execution_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                self.logger.debug(f"Processing fill event: {event}")
-
-                # Update position
-                if hasattr(self.position_manager, 'apply_fill'):
-                    self.position_manager.apply_fill(event)
-
-                # Update portfolio
-                if hasattr(self.portfolio, 'update'):
-                    self.portfolio.update()
-
-                # Update order status
-                if hasattr(event, 'order_id') and event.order_id in self.orders:
-                    order = self.orders[event.order_id]
-                    order.status = OrderStatus.FILLED
-
-                # Notify strategy
-                if hasattr(event, 'strategy_id') and event.strategy_id in self.strategies:
-                    strategy = self.strategies[event.strategy_id]
-                    if hasattr(strategy, 'on_fill'):
-                        strategy.on_fill(event)
-
-                # Mark as processed
-                self.execution_queue.task_done()
-
-            except Exception as e:
-                self.logger.error(f"Error processing fill: {str(e)}")
-                time.sleep(0.01)  # Prevent high CPU usage on errors
-
-        self.logger.info("Fill processing thread stopped")
-
-    def _process_events(self):
-        """Process events from the event queue."""
-        self.logger.info("Event processing thread started")
-
-        while self.running:
-            # Let the event manager process events
-            try:
-                # Process a batch of events
-                processed = self.event_manager.process_events(max_events=100)
-
-                # If no events were processed, sleep briefly
-                if processed == 0:
-                    time.sleep(0.01)
-
-            except Exception as e:
-                self.logger.error(f"Error in event processing: {str(e)}")
-                time.sleep(0.01)  # Prevent high CPU usage on errors
-
-        self.logger.info("Event processing thread stopped")
-
-    def _run_strategies(self):
-        """Run strategy update loop."""
-        self.logger.info("Strategy thread started")
-
-        while self.running and not self.paused:
-            current_time = datetime.now()
-
-            for strategy_id, strategy in self.strategies.items():
-                try:
-                    if hasattr(strategy, 'update'):
-                        strategy.update(current_time)
-                except Exception as e:
-                    self.logger.error(f"Error updating strategy {strategy_id}: {str(e)}")
-
-            # Sleep to avoid excessive CPU usage
-            time.sleep(self.heartbeat)
-
-        self.logger.info("Strategy thread stopped")
+    def _on_system_event(self, event: SystemEvent):
+        """Handle system events."""
+        if event.event_type == EventType.SYSTEM:
+             self.logger.info(f"Processing system event: {getattr(event, 'system_event_type', 'N/A')} - {getattr(event, 'message', '')}")
+             # Add specific handling if needed (e.g., reconfigure on settings change)
 
     def _run_engine(self):
-        """Main engine loop."""
+        """Main engine loop - Simplified for heartbeat/timer events."""
         try:
-            self.logger.info("Main engine thread started")
+            self.logger.info("Main engine thread started (for timer events)")
+            last_timer_publish = time.time()
 
             while self.running:
-                self.last_heartbeat_time = datetime.now()
+                current_time = time.time()
+                
+                # Publish timer event periodically
+                if not self.paused and (current_time - last_timer_publish >= self.heartbeat):
+                    elapsed = current_time - last_timer_publish
+                    self._publish_timer_event(elapsed)
+                    last_timer_publish = current_time
 
-                if not self.paused:
-                    # Update performance metrics
-                    self.performance_tracker.update()
-
-                # Sleep for heartbeat interval
-                time.sleep(self.heartbeat)
+                # Efficiently sleep/wait
+                # Event manager processing happens in its own thread now
+                time.sleep(min(self.heartbeat / 10, 0.1)) # Sleep briefly
 
         except Exception as e:
             self.logger.error(f"Error in main engine loop: {str(e)}", exc_info=True)
-            self.stop()
+            self.stop() # Attempt to stop if the main loop crashes
 
         self.logger.info("Main engine thread stopped")
-
-    def _timer_loop(self):
-        """Run a timer loop for periodic events"""
-        last_time = time.time()
         
-        while self.running and not self.paused:
-            current_time = time.time()
-            elapsed = current_time - last_time
-            
-            if elapsed >= self.heartbeat:
-                # Publish timer event
-                self._publish_timer_event(elapsed)
-                last_time = current_time
-            
-            time.sleep(0.01)  # Small sleep to prevent CPU spinning
-    
     def _publish_timer_event(self, elapsed: float):
         """
         Publish a timer event to notify components of time passing.
@@ -727,7 +601,7 @@ class TradingEngine:
         # Create timer event
         event = Event(
             event_type=EventType.TIMER,
-            timestamp=int(time.time() * 1000)
+            timestamp=int(time.time() * 1000) # Milliseconds
         )
         
         # Add timer details
@@ -738,7 +612,7 @@ class TradingEngine:
         self.event_manager.publish(event)
         self.logger.debug(f"Published timer event: elapsed={elapsed:.2f}s")
         
-        # Update last heartbeat time
+        # Update last heartbeat time (optional, might remove if only using timer)
         self.last_heartbeat_time = time.time()
         
     def _publish_system_event(self, action: str, additional_data: Dict[str, Any] = None):
@@ -757,12 +631,12 @@ class TradingEngine:
             'data': additional_data or {}
         }
         
-        # Add mode information
-        event_data['data']['mode'] = self.config.get('mode', 'unknown')
+        # Add mode information if available in config
+        event_data['data']['mode'] = self.config.get('system', {}).get('mode', 'unknown')
         
         # Create the event
         event = SystemEvent(
-            event_type=EventType.SYSTEM,
+            event_type=EventType.SYSTEM,  # Add the required event_type
             timestamp=int(time.time() * 1000),
             **event_data
         )
@@ -771,56 +645,111 @@ class TradingEngine:
         self.event_manager.publish(event)
         self.logger.info(f"Published system event: {action}")
         
-    def start(self):
-        """Start the trading engine"""
-        if self.running:
-            self.logger.warning("Engine is already running")
-            return False
+    def start(self) -> bool:
+        """
+        Start the trading engine and all its components.
+        
+        Returns:
+            bool: True if engine started successfully
+        """
+        try:
+            self.logger.info("Starting trading engine")
             
-        self.logger.info("Starting trading engine")
-        
-        # Set running state
-        self.running = True
-        self.paused = False
-        
-        # Publish system start event
-        self._publish_system_event('start')
-        
-        # Start the event manager if not already started
-        if hasattr(self.event_manager, 'start'):
-            self.event_manager.start()
-        
-        # Connect to broker if not already connected
-        if self.broker and hasattr(self.broker, 'connect'):
-            self.broker.connect()
-        
-        # Start risk manager
-        if self.risk_manager and hasattr(self.risk_manager, 'start'):
-            self.risk_manager.start()
-            
-        # Start processing threads
-        self.market_data_thread = threading.Thread(target=self._process_market_data, daemon=True)
-        self.market_data_thread.start()
-        
-        self.order_processing_thread = threading.Thread(target=self._process_orders, daemon=True)
-        self.order_processing_thread.start()
-        
-        self.strategy_thread = threading.Thread(target=self._run_strategies, daemon=True)
-        self.strategy_thread.start()
-        
-        # Start the main engine thread
-        self._main_thread = threading.Thread(target=self._run_engine, daemon=True)
-        self._main_thread.start()
-        
-        # Start PaperTradingSimulator if it exists
-        if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'start'):
-            self.paper_trading_simulator.start()
+            # Load instruments
+            self._load_instruments()
 
-        self.logger.info("Trading engine started")
-        return True
+            # Start event manager first
+            if not self.event_manager.start():
+                self.logger.error("Failed to start event manager")
+                return False
+                
+            # Data Manager doesn't need to be started as it's initialized in __init__
+            # Just verify it's properly initialized
+            if not hasattr(self, 'data_manager'):
+                self.logger.error("Data Manager not initialized")
+                self.event_manager.stop()  # Clean up event manager
+                return False
+                
+            # Start strategy manager
+            if not self.strategy_manager.start():
+                self.logger.error("Failed to start strategy manager")
+                self.event_manager.stop()  # Clean up event manager
+                return False
+                
+            # Start option manager tracking
+            if hasattr(self, 'option_manager'):
+                if not self.option_manager.start_tracking():
+                    self.logger.error("Failed to start option manager tracking")
+                    self.strategy_manager.stop()  # Clean up strategy manager
+                    self.event_manager.stop()  # Clean up event manager
+                    return False
+                    
+            # Start risk manager
+            if self.risk_manager and hasattr(self.risk_manager, 'start'):
+                if not self.risk_manager.start():
+                    self.logger.error("Failed to start risk manager")
+                    if hasattr(self, 'option_manager') and hasattr(self.option_manager, 'stop_tracking'):
+                        self.option_manager.stop_tracking()
+                    self.strategy_manager.stop()
+                    self.event_manager.stop()
+                    return False
+                    
+            # Start paper trading simulator if applicable
+            if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'start'):
+                if not self.paper_trading_simulator.start():
+                    self.logger.error("Failed to start paper trading simulator")
+                    if self.risk_manager and hasattr(self.risk_manager, 'stop'):
+                        self.risk_manager.stop()
+                    if hasattr(self, 'option_manager') and hasattr(self.option_manager, 'stop_tracking'):
+                        self.option_manager.stop_tracking()
+                    self.strategy_manager.stop()
+                    self.event_manager.stop()
+                    return False
+                    
+            # Start the main engine thread for timer events
+            self.running = True
+            if self._main_thread is None or not self._main_thread.is_alive():
+                self._main_thread = threading.Thread(target=self._run_engine, daemon=True)
+                self._main_thread.start()
+                if not self._main_thread.is_alive():
+                    self.logger.error("Failed to start main engine thread")
+                    if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'stop'):
+                        self.paper_trading_simulator.stop()
+                    if self.risk_manager and hasattr(self.risk_manager, 'stop'):
+                        self.risk_manager.stop()
+                    if hasattr(self, 'option_manager') and hasattr(self.option_manager, 'stop_tracking'):
+                        self.option_manager.stop_tracking()
+                    self.strategy_manager.stop()
+                    self.event_manager.stop()
+                    return False
+                    
+            # Set up event handlers within this engine
+            self._subscribe_to_events()
+            
+            # Set running state and publish start event
+            self.paused = False
+            self._publish_system_event('start')
+            
+            self.logger.info("Trading engine started successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error starting trading engine: {e}")
+            # Clean up any components that might have started
+            if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'stop'):
+                self.paper_trading_simulator.stop()
+            if self.risk_manager and hasattr(self.risk_manager, 'stop'):
+                self.risk_manager.stop()
+            if hasattr(self, 'option_manager') and hasattr(self.option_manager, 'stop_tracking'):
+                self.option_manager.stop_tracking()
+            if hasattr(self, 'strategy_manager') and hasattr(self.strategy_manager, 'stop'):
+                self.strategy_manager.stop()
+            if hasattr(self, 'event_manager') and hasattr(self.event_manager, 'stop'):
+                self.event_manager.stop()
+            return False
 
     def stop(self):
-        """Stop the trading engine"""
+        """Stop the trading engine and its components gracefully."""
         if not self.running:
             self.logger.warning("Engine is not running")
             return
@@ -829,66 +758,69 @@ class TradingEngine:
         
         # Request shutdown
         self.running = False
-        self.paused = True
+        self.paused = True # Prevent further actions
         
         # Publish system shutdown event
         self._publish_system_event('shutdown')
         
-        # Stop strategies
-        for strategy in self.strategies.values():
-            try:
-                strategy.stop()
-            except Exception as e:
-                self.logger.error(f"Error stopping strategy {strategy.id}: {str(e)}")
+        # Unsubscribe OptionManager (if needed, maybe handled internally)
+        if hasattr(self, 'option_manager') and hasattr(self.option_manager, 'stop_tracking'):
+            self.option_manager.stop_tracking() # Hypothetical method
         
-        # Cancel pending orders
+        # Stop strategy manager first
+        if hasattr(self.strategy_manager, 'stop'):
+            self.strategy_manager.stop()
+            self.logger.info("Strategy Manager stopped")
+            
+        # Cancel pending orders via ExecutionHandler or Broker
         self._cancel_all_pending_orders()
         
-        # Stop components
+        # Stop other components
         if self.risk_manager and hasattr(self.risk_manager, 'stop'):
             self.risk_manager.stop()
             
-        if hasattr(self.portfolio, 'stop'):
+        if hasattr(self.portfolio, 'stop'): # If portfolio needs explicit stopping
             self.portfolio.stop()
+
+        # Stop ExecutionHandler (if it has a stop method)
+        if hasattr(self.execution_handler, 'stop'):
+            self.execution_handler.stop()
+
+        # Stop PaperTradingSimulator (if applicable and has stop method)
+        if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'stop'):
+            self.paper_trading_simulator.stop()
             
         # Disconnect broker
         if self.broker and hasattr(self.broker, 'disconnect'):
             self.broker.disconnect()
         
-        # Wait for threads to stop
+        # Stop the main engine timer thread
+        # Wait for the main thread to finish (it checks self.running)
         if self._main_thread and self._main_thread.is_alive():
-            self._main_thread.join(timeout=10.0)
-            
-        if self.market_data_thread and self.market_data_thread.is_alive():
-            self.market_data_thread.join(timeout=5.0)
-            
-        if self.order_processing_thread and self.order_processing_thread.is_alive():
-            self.order_processing_thread.join(timeout=5.0)
-            
-        if self.strategy_thread and self.strategy_thread.is_alive():
-            self.strategy_thread.join(timeout=5.0)
+             self.logger.debug("Waiting for main engine thread to stop...")
+             self._main_thread.join(timeout=max(self.heartbeat * 2, 2.0)) # Wait a bit longer than heartbeat
+             if self._main_thread.is_alive():
+                  self.logger.warning("Main engine thread did not stop gracefully.")
         
-        # Stop Event Manager last
+        # Stop Event Manager last (allows other components to publish final events)
         self.event_manager.stop()
         self.logger.info("Event Manager stopped")
 
-        # Stop ExecutionHandler if it has a stop method
-        if hasattr(self.execution_handler, 'stop'):
-            self.execution_handler.stop()
-
-        # Stop PaperTradingSimulator if it exists
-        if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'stop'):
-            self.paper_trading_simulator.stop()
 
         self.logger.info("Trading Engine stopped")
 
     def pause(self):
-        """Pause the trading engine."""
+        """Pause the trading engine (stops timer events, signals)."""
         if not self.running:
             self.logger.warning("Trading engine is not running")
             return
+            
+        if self.paused:
+            self.logger.info("Trading engine already paused")
+            return
 
         self.paused = True
+        self._publish_system_event('pause')
         self.logger.info("Trading engine paused")
 
     def resume(self):
@@ -896,59 +828,113 @@ class TradingEngine:
         if not self.running:
             self.logger.warning("Trading engine is not running")
             return
+            
+        if not self.paused:
+             self.logger.info("Trading engine is not paused")
+             return
 
         self.paused = False
+        self._publish_system_event('resume')
         self.logger.info("Trading engine resumed")
 
     def _cancel_all_pending_orders(self):
         """Cancel all pending orders when stopping the engine."""
+        self.logger.info("Cancelling all pending orders...")
         if not self.broker:
+            self.logger.warning("Cannot cancel orders: No broker available.")
             return
+            
+        # Get pending orders (logic might be in OrderManager)
+        pending_orders = []
+        if hasattr(self.order_manager, 'get_pending_orders'):
+            pending_orders = self.order_manager.get_pending_orders()
+        else:
+            # Fallback: check local cache
+            pending_orders = [order for order in self.orders.values()
+                              if order.status in [OrderStatus.PENDING, 
+                                                  OrderStatus.SUBMITTED, 
+                                                  OrderStatus.PARTIAL_FILL]] # Add relevant statuses
 
-        pending_orders = [order for order in self.orders.values()
-                         if order.status in [OrderStatus.PENDING, OrderStatus.PARTIAL_FILL]]
+        if not pending_orders:
+             self.logger.info("No pending orders found to cancel.")
+             return
 
+        cancelled_count = 0
+        failed_count = 0
         for order in pending_orders:
             try:
-                if hasattr(self.broker, 'cancel_order'):
+                # Use ExecutionHandler or direct broker call
+                if hasattr(self.execution_handler, 'cancel_order'):
+                    self.execution_handler.cancel_order(order.order_id)
+                elif hasattr(self.broker, 'cancel_order'):
                     self.broker.cancel_order(order.order_id)
-                    self.logger.info(f"Cancelled order {order.order_id}")
+                else:
+                     self.logger.warning(f"No method found to cancel order {order.order_id}")
+                     continue # Skip if no cancellation method
+                     
+                self.logger.info(f"Cancellation request sent for order {order.order_id}")
+                cancelled_count += 1
             except Exception as e:
-                self.logger.error(f"Error cancelling order {order.order_id}: {str(e)}")
+                self.logger.error(f"Error sending cancellation for order {order.order_id}: {str(e)}")
+                failed_count += 1
+                
+        self.logger.info(f"Requested cancellation for {cancelled_count} orders. Failed requests: {failed_count}")
 
     def place_order(self, order: Order) -> bool:
         """
-        Place an order through the engine.
+        Place an order through the engine by publishing an OrderEvent.
+        The event will be picked up by _on_order_event (if tracking) and ExecutionHandler.
 
         Args:
-            order: The order to place
+            order: The order object to place
 
         Returns:
-            bool: True if the order was successfully queued, False otherwise
+            bool: True if the order event was successfully published, False otherwise
         """
-        if not self.running:
-            self.logger.error("Cannot place order - engine is not running")
+        if not self.running or self.paused:
+            self.logger.error(f"Cannot place order - engine is not running or paused. Running: {self.running}, Paused: {self.paused}")
             return False
 
-        # Create order event and publish
-        event = OrderEvent(EventType.ORDER, order)
-        return self.event_manager.publish(event)
+        # Validate order through RiskManager first
+        if not self.risk_manager.validate_order(order):
+             self.logger.warning(f"Order rejected by Risk Manager: {order}")
+             # Optionally publish a rejected order event
+             return False
+
+        # Create order event
+        # Ensure order has a unique ID before publishing
+        if not order.order_id:
+             order.order_id = self.order_manager.generate_order_id() # Assuming OrderManager can generate IDs
+             
+        event = OrderEvent(order=order) # EventType is set in OrderEvent constructor
+
+        # Publish the event for ExecutionHandler and internal tracking (_on_order_event)
+        published = self.event_manager.publish(event)
+        if published:
+             self.logger.info(f"Published OrderEvent for order {order.order_id}")
+             # Add to local cache immediately? Or wait for broker confirmation via _on_order_event?
+             # Let's add it here for immediate tracking, status will update later.
+             self.orders[order.order_id] = order 
+        else:
+             self.logger.error(f"Failed to publish OrderEvent for order {order.order_id}")
+             
+        return published
 
     def get_market_data(self, symbol: str) -> Optional[MarketData]:
         """
-        Get the latest market data for a symbol.
+        Get the latest market data for a symbol from the internal cache.
 
         Args:
             symbol: The instrument symbol
 
         Returns:
-            Optional[MarketData]: The latest market data or None if not available
+            Optional[MarketData]: The latest market data object or None if not available
         """
         return self.market_data.get(symbol)
 
     def get_instrument(self, symbol_or_id: str) -> Optional[Instrument]:
         """
-        Get instrument by symbol or ID.
+        Get instrument by symbol or ID from the internal cache.
 
         Args:
             symbol_or_id: The instrument symbol or ID
@@ -960,7 +946,7 @@ class TradingEngine:
 
     def get_order(self, order_id: str) -> Optional[Order]:
         """
-        Get order by ID.
+        Get order by ID from the internal cache.
 
         Args:
             order_id: The order ID
@@ -972,50 +958,46 @@ class TradingEngine:
 
     def get_status(self) -> Dict[str, Any]:
         """Get the current status of the trading engine."""
-        return {
+        status = {
             "running": self.running,
             "paused": self.paused,
             "last_heartbeat": self.last_heartbeat_time.isoformat() if self.last_heartbeat_time else None,
-            "active_instruments": list(self.active_instruments),
-            "active_strategies": [s_id for s_id, strategy in self.strategies.items() if hasattr(strategy, 'is_active') and strategy.is_active()],
+            "active_instruments_count": len(self.active_instruments),
+            "loaded_strategies_count": len(self.strategies),
             "portfolio_value": self.portfolio.total_value if hasattr(self.portfolio, 'total_value') else 0,
-            "open_positions": len(self.position_manager.get_open_positions()) if hasattr(self.position_manager, 'get_open_positions') else 0,
-            "pending_orders": len([order for order in self.orders.values() if order.status in [OrderStatus.PENDING, OrderStatus.PARTIAL_FILL]])
+            "open_positions_count": len(self.position_manager.get_open_positions()) if hasattr(self.position_manager, 'get_open_positions') else 0,
+            "pending_orders_count": len([o for o in self.orders.values() if o.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILL]]) # Adjusted statuses
         }
+        
+        # Add component-specific status if available
+        if hasattr(self.event_manager, 'get_status'):
+             status["event_manager"] = self.event_manager.get_status()
+        if hasattr(self.broker, 'get_status'):
+             status["broker"] = self.broker.get_status()
+        if hasattr(self, 'option_manager') and hasattr(self.option_manager, 'get_status'):
+            status["options"] = self.option_manager.get_status()
+        if hasattr(self, 'strategy_manager') and hasattr(self.strategy_manager, 'get_status'):
+            status["strategy_manager"] = self.strategy_manager.get_status()
+            
+        return status
 
     def get_queue_stats(self) -> Dict[str, int]:
         """
-        Get statistics about queue sizes.
+        Get statistics about the main event queue size.
 
         Returns:
-            Dict with queue statistics
+            Dict with event queue statistics
         """
         return {
-            "market_data_queue": self.market_data_queue.qsize(),
-            "order_queue": self.order_queue.qsize(),
-            "signal_queue": self.signal_queue.qsize(),
-            "execution_queue": self.execution_queue.qsize(),
-            "event_queue": self.event_manager.get_queue_size() if hasattr(self.event_manager, 'get_queue_size') else -1
+            "event_queue_size": self.event_manager.get_queue_size() if hasattr(self.event_manager, 'get_queue_size') else -1
         }
 
-# if __name__ == "__main__":
-#     # Configure logging
-#     logging.basicConfig(
-#         level=logging.INFO,
-#         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-#     )
+    # Methods related to specific managers (like OptionManager) might be better accessed
+    # directly via the manager instance (e.g., engine.option_manager.get_option_chain(...))
+    # instead of adding pass-through methods here, unless there's a strong architectural reason.
 
-#     # Create and start the engine
-#     engine = TradingEngine("config/config.yaml", "config/strategies.yaml")
-
-#     try:
-#         engine.initialize()
-#         engine.start()
-
-#         # Keep running until interrupted
-#         while True:
-#             time.sleep(1)
-#     except KeyboardInterrupt:
-#         print("Shutting down...")
-#     finally:
-#         engine.stop()
+    # Example direct access:
+    # engine.option_manager.get_option_chain('NIFTY')
+    # engine.option_manager.get_atm_strike('NIFTY')
+    # engine.strategy_manager.get_strategy('my_strategy_id')
+    # engine.strategy_manager.get_strategy_status('my_strategy_id')

@@ -21,8 +21,8 @@ from core.risk_manager import RiskManager
 from core.event_manager import EventManager
 from core.logging_manager import LoggingManager
 
-from strategies.strategy import Strategy
-from strategies.strategy_factory import StrategyFactory
+from strategies.base_strategy import OptionStrategy
+from strategies.strategy_registry import StrategyRegistry
 
 from .data_loader import DataLoader
 from .data_processor import DataProcessor
@@ -73,7 +73,7 @@ class BacktestingEngine:
         self.performance_tracker = PerformanceTracker()
 
         # Load strategies
-        self.strategy_factory = StrategyFactory()
+        self.strategy_factory = StrategyRegistry()
         self.strategies = self._load_strategies()
 
         # Data storage
@@ -91,7 +91,7 @@ class BacktestingEngine:
 
         self.logger.info(f"Backtesting engine initialized with config from {config_path}")
 
-    def _load_strategies(self) -> List[Strategy]:
+    def _load_strategies(self) -> List[OptionStrategy]:
         """Load strategies specified in the configuration"""
         strategies = []
         strategy_configs = self.config.get('strategies', [])

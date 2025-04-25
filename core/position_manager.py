@@ -67,6 +67,11 @@ class PositionManager:
         Args:
             instrument: Instrument object
         """
+        # Check if this symbol already exists in the dictionary
+        if instrument.symbol in self.instruments_by_symbol:
+            self.logger.debug(f"Instrument with symbol {instrument.symbol} already exists, skipping addition")
+            return
+            
         self.instruments_by_symbol[instrument.symbol] = instrument
         self.logger.debug(f"Added instrument to track: {instrument.symbol}")
 
@@ -91,8 +96,23 @@ class PositionManager:
         Args:
             market_event: Market data event with symbol
         """
-        instrument = market_event.instrument if hasattr(market_event, 'instrument') else None
-
+        instrument = None
+        
+        # Handle the case where the instrument might be a string or an Instrument object
+        if hasattr(market_event, 'instrument'):
+            if isinstance(market_event.instrument, str):
+                # Convert string to instrument if needed
+                symbol = market_event.instrument
+                instrument = self.instruments_by_symbol.get(symbol)
+                if not instrument:
+                    self.logger.warning(f"Creating new instrument for symbol {symbol}")
+                    from models.instrument import Instrument
+                    instrument = Instrument(symbol=symbol)
+                    self.add_instrument(instrument)
+            else:
+                # It's already an Instrument object
+                instrument = market_event.instrument
+        
         if not instrument:
             self.logger.warning("Could not extract instrument from market data event")
             return

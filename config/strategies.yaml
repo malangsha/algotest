@@ -1,70 +1,279 @@
-# Trading Strategies Configuration
-
+# Strategy configurations
 strategies:
-  - name: "moving_average_crossover"
-    type: "moving_average_crossover"
-    active: true
-    universe:
-      type: "explicit"
-      value: ["RELIANCE-EQ", "TCS-EQ", "HDFCBANK-EQ", "INFY-EQ", "ICICIBANK-EQ", "NIFTY23MAR19000CE"]
-      min_market_cap: 10000  # Crores
-      max_stocks: 10
+  # ATM Straddle Strategy
+  atm_straddle:
+    enabled: true
+    type: "atm_straddle_strategy"
+    description: "ATM Straddle strategy that buys CE and PE at ATM strike"
+    
+    # Index and symbol configurations
+    use_options: true
+    underlyings: ["NIFTY INDEX"]
+    expiry_offset: 0  # 0=current expiry, 1=next expiry
+    
+    # Timeframe configurations
+    timeframe: "1m"
+    additional_timeframes: ["5m"]
+    
+    # Entry and exit parameters
     parameters:
-      fast_period: 9
-      slow_period: 21
-      signal_period: 9
+      entry_time: "09:30:00"
+      exit_time: "15:15:00"
+      stop_loss_percent: 30
+      target_percent: 15
+      trail_points: 0.25
+    
+    # Data requirements
+    data:
+      min_history_bars: 5
+      warmup_bars: 2
+    
+    # Execution settings
     execution:
-      order_type: "LIMIT"
-      limit_price_buffer: 0.1  # percentage
-      entry_timing: "next_bar"
-      exit_timing: "immediate"
-      time_in_force: "DAY"  # Options: "DAY", "IOC", "GTC"
+      order_type: "MARKET"
+      quantity: 1
+      slippage_percent: 0.1
+    
+    # Position management
     risk:
-      position_size: 5.0  # percentage of portfolio
-      max_positions: 5
-      stop_loss: 2.0  # percentage
-      trailing_stop: true
-      trailing_stop_distance: 1.0  # percentage
-      take_profit: 5.0  # percentage
-    schedule:
-      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
-      start_time: "09:20:00"
-      end_time: "15:15:00"
-      frequency: "1m"
-    filters:
-      min_volume: 100000
-      max_spread: 0.5  # percentage
-      min_price: 100
-      max_price: 5000
-    fill_handling:
-      adjust_stop_loss: true
-      partial_fills: "accept"
-      timeout: 60  # seconds to wait for fill  
-    lifecycle:
-      warmup_bars: 30  # Number of bars needed before generating signals
-      cooldown_after_stop_loss: 5  # Bars to wait after stop loss before new entry
+      max_positions: 1
+      max_risk_per_trade: 2.0  # percentage of portfolio
 
-  # - name: "mtf_strategy_1"
-  #   type: "multi_timeframe_strategy"
+  # Iron Butterfly Strategy
+  # iron_butterfly:
+  #   enabled: true
+  #   type: "iron_butterfly_strategy"
+  #   description: "Iron Butterfly Options Strategy"
+    
+  #   # Index and symbol configurations
+  #   use_options: true
+  #   indices: ["BANKNIFTY"]
+  #   expiry_offset: 0  # current expiry
+    
+  #   # Timeframe configurations
+  #   timeframe: "5m"
+  #   additional_timeframes: ["15m"]
+    
+  #   # Entry and exit parameters
+  #   parameters:
+  #     entry_time: "09:45:00"
+  #     exit_time: "15:00:00"
+  #     wings_width: 500  # points away from ATM
+  #     stop_loss_percent: 40
+  #     target_percent: 20
+    
+  #   # Data requirements
+  #   data:
+  #     min_history_bars: 10
+  #     warmup_bars: 3
+    
+  #   # Execution settings
+  #   execution:
+  #     order_type: "LIMIT"
+  #     quantity: 1
+  #     slippage_percent: 0.2
+    
+  #   # Position management
+  #   risk:
+  #     max_positions: 1
+  #     max_risk_per_trade: 2.5  # percentage of portfolio
+
+  # Option EMA Crossover Strategy
+  # option_ema_crossover:
+  #   enabled: true
+  #   type: "option_ema_crossover_strategy"
+  #   description: "EMA Crossover Strategy with Option Trading"
+    
+  #   # Index and symbol configurations
+  #   use_options: true
+  #   indices: ["NIFTY", "BANKNIFTY"]
+  #   expiry_offset: 0
+    
+  #   # Timeframe configurations
+  #   timeframe: "5m"
+  #   additional_timeframes: ["15m", "1h"]
+    
+  #   # Entry and exit parameters
+  #   parameters:
+  #     fast_ema: 9
+  #     slow_ema: 21
+  #     signal_ema: 9
+  #     entry_threshold: 0.05
+  #     stop_loss_percent: 25
+  #     target_percent: 50
+  #     use_trailing_stop: true
+  #     trailing_percent: 10
+    
+  #   # Option selection
+  #   option_selection:
+  #     atm_offset: 0  # 0=ATM, 1=ITM, -1=OTM
+  #     option_type: "both"  # "CE", "PE", or "both" 
+  #     min_premium: 50
+  #     max_premium: 500
+    
+  #   # Data requirements
+  #   data:
+  #     min_history_bars: 50
+  #     warmup_bars: 25
+    
+  #   # Execution settings
+  #   execution:
+  #     order_type: "MARKET"
+  #     quantity: 1
+  #     slippage_percent: 0.1
+    
+  #   # Position management
+  #   risk:
+  #     max_positions: 2
+  #     max_risk_per_trade: 1.5  # percentage of portfolio
+      
+  # # Volatility-based Strategy
+  # vix_option_strategy:
+  #   enabled: true
+  #   type: "vix_option_strategy"
+  #   description: "VIX-based option trading strategy"
+    
+  #   # Index and symbol configurations
+  #   use_options: true
+  #   indices: ["NIFTY"]
+  #   additional_symbols: ["INDIA VIX"]
+  #   expiry_offset: 0
+    
+  #   # Timeframe configurations
+  #   timeframe: "5m"
+  #   additional_timeframes: ["15m", "1h"]
+    
+  #   # Entry and exit parameters
+  #   parameters:
+  #     vix_threshold_high: 20
+  #     vix_threshold_low: 15
+  #     premium_capture_percent: 25
+  #     stop_loss_percent: 50
+  #     target_percent: 25
+    
+  #   # Option selection
+  #   option_selection:
+  #     high_vix_option: "PE"  # Buy PE when VIX is high
+  #     low_vix_option: "CE"   # Buy CE when VIX is low
+  #     atm_offset: 0          # ATM options
+    
+  #   # Data requirements
+  #   data:
+  #     min_history_bars: 30
+  #     warmup_bars: 10
+    
+  #   # Execution settings
+  #   execution:
+  #     order_type: "MARKET"
+  #     quantity: 1
+  #     slippage_percent: 0.1
+    
+  #   # Position management
+  #   risk:
+  #     max_positions: 1
+  #     max_risk_per_trade: 2.0  # percentage of portfolio
+
+  # # Nifty ATM Straddle Strategy
+  # nifty_atm_straddle:
+  #   name: "NiftyATMStraddle" 
+  #   type: "atm_option_strategy" 
   #   active: true
   #   universe:
-  #     value: ["RELIANCE-EQ", "TCS-EQ"]
+  #     type: "atm_options"
+  #     underlying_symbol: "NIFTY 50"
+  #     underlying_exchange: "NSE"
+  #     option_exchange: "NFO"
+  #     expiry_offset: 0
+  #     strikes_around_atm: 0
   #   parameters:
-  #     fast_ma_period: 9
-  #     slow_ma_period: 21
+  #     strike_recheck_threshold_pct: 0.4
+  #     option_strike_interval: 50.0
+
+  # # Moving Average Crossover Strategy
+  # moving_average_crossover:
+  #   name: "MovingAverageCrossover"
+  #   type: "moving_average_crossover"
+  #   active: true
+  #   universe:
+  #     type: "explicit"
+  #     value: ["RELIANCE-EQ", "TCS-EQ", "HDFCBANK-EQ", "INFY-EQ", "ICICIBANK-EQ", "NIFTY17APR25C22800"]
+  #     min_market_cap: 10000
+  #     max_stocks: 10
+  #   parameters:
+  #     fast_period: 9
+  #     slow_period: 21
+  #     signal_period: 9
+  #   execution:
+  #     order_type: "LIMIT"
+  #     limit_price_buffer: 0.1
+  #     entry_timing: "next_bar"
+  #     exit_timing: "immediate"
+  #     time_in_force: "DAY"
+  #   risk:
+  #     position_size: 5.0
+  #     max_positions: 5
+  #     stop_loss: 2.0
+  #     trailing_stop: true
+  #     trailing_stop_distance: 1.0
+  #     take_profit: 5.0
+  #   schedule:
+  #     days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+  #     start_time: "09:20:00"
+  #     end_time: "15:15:00"
+  #     frequency: "1m"
+  #   filters:
+  #     min_volume: 100000
+  #     max_spread: 0.5
+  #     min_price: 100
+  #     max_price: 5000
+  #   fill_handling:
+  #     adjust_stop_loss: true
+  #     partial_fills: "accept"
+  #     timeout: 60
+  #   lifecycle:
+  #     warmup_bars: 30
+  #     cooldown_after_stop_loss: 5
+
+  # # ATM Option EMA Crossover Strategy
+  # atm_option_ema_crossover:
+  #   name: "atm_option_ema_crossover"
+  #   type: "atm_option_ema_crossover_strategy"
+  #   active: true
+  #   universe:
+  #     type: "explicit"
+  #     value: ["NIFTY-INDEX", "NIFTY50-INDEX", "BANKNIFTY-INDEX"]
+  #   parameters:
+  #     short_ema_period: 9
+  #     long_ema_period: 21
+  #     volume_lookback_period: 21
+  #     profit_target_percent: 20.0
+  #     stop_loss_percent: 20.0
+  #     retracement_tolerance: 0.01
   #     timeframe: "1m"
   #     additional_timeframes: ["5m"]
-  #   # Other settings...
-
-  # - name: "mtf_strategy_2"
-  #   type: "multi_timeframe_strategy"
-  #   active: true
-  #   universe:
-  #     value: ["HDFCBANK-EQ", "INFY-EQ"]
-  #   parameters:
-  #     fast_ma_period: 5
-  #     slow_ma_period: 15
-  #     timeframe: "3m"
-  #     additional_timeframes: ["15m", "1h"]    
-      
-      
+  #   execution:
+  #     order_type: "MARKET"
+  #     entry_timing: "immediate"
+  #     exit_timing: "immediate"
+  #     time_in_force: "DAY"
+  #   risk:
+  #     position_size: 5.0
+  #     max_positions: 3
+  #     stop_loss: 20.0
+  #     trailing_stop: false
+  #     take_profit: 20.0
+  #   schedule:
+  #     days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+  #     start_time: "09:20:00"
+  #     end_time: "15:15:00"
+  #     frequency: "1m"
+  #   filters:
+  #     min_volume: 100
+  #     max_spread: 1.0
+  #   fill_handling:
+  #     adjust_stop_loss: false
+  #     partial_fills: "accept"
+  #     timeout: 60
+  #   lifecycle:
+  #     warmup_bars: 30
+  #     cooldown_after_stop_loss: 5

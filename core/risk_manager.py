@@ -1,10 +1,10 @@
 from typing import Dict, Any, Optional, List
-import logging
 from datetime import datetime
 
 from models.events import SignalEvent, OrderEvent, EventType
 from models.order import Order
 from .portfolio import Portfolio
+from core.logging_manager import get_logger
 
 class RiskManager:
     """Manages risk and validates trading decisions"""
@@ -13,7 +13,7 @@ class RiskManager:
         self.portfolio = portfolio
         self.config = config
         self.event_manager = event_manager
-        self.logger = logging.getLogger("RiskManager")
+        self.logger = get_logger("core.risk_manager")
 
         # Extract risk configuration
         self.risk_config = config.get("risk", {})

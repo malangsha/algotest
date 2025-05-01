@@ -24,6 +24,8 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.bkp
+*.zip
 MANIFEST
 
 # PyInstaller
@@ -185,3 +187,6 @@ cache/
 data/
 diagrams/
 algotest_deliverables/
+manus/
+gemeni/
+

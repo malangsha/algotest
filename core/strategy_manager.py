@@ -18,6 +18,7 @@ import importlib
 import inspect
 from pathlib import Path
 from datetime import datetime
+import concurrent.futures
 
 from core.option_manager import OptionManager
 from core.event_manager import EventManager
@@ -85,6 +86,9 @@ class StrategyManager:
 
         # Initialize strategy registry
         self.strategy_registry = StrategyRegistry()
+
+        # Thread pool for parallel strategy processing
+        self.strategy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.get('strategy_processing_workers', 4))
 
         self.logger.info("Strategy Manager initialized")
 
@@ -631,5 +635,41 @@ class StrategyManager:
     def on_timer(self, event: Event):
         """Handle timer events for periodic tasks."""
         if event.event_type == EventType.TIMER:
-           self.logger.info("Timer event received")           
-                
+           self.logger.info("Timer event received")
+
+    def _process_bar(self, event: BarEvent):
+        """
+        Process a bar event and distribute it to relevant strategies in parallel.
+
+        Args:
+            event: Bar event
+        """
+        symbol = event.instrument.symbol
+        timeframe = event.timeframe
+        self.logger.debug(f"Processing BarEvent for {symbol}@{timeframe}")
+
+        # Find strategies subscribed to this symbol and timeframe
+        if symbol in self.symbol_strategies and timeframe in self.symbol_strategies[symbol]:
+            subscribed_strategy_ids = self.symbol_strategies[symbol][timeframe]
+            
+            futures = []
+            for strategy_id in subscribed_strategy_ids:
+                if strategy_id in self.strategies:
+                    strategy = self.strategies[strategy_id]
+                    # Submit the strategy's on_bar method to the executor
+                    future = self.strategy_executor.submit(strategy.on_bar, event)
+                    futures.append(future)
+                    self.logger.debug(f"Submitted on_bar for {strategy_id} for {symbol}@{timeframe}")
+                else:
+                    self.logger.warning(f"Strategy {strategy_id} not found while processing bar for {symbol}@{timeframe}")
+            
+            # Optionally, wait for completion or handle results/exceptions
+            # For now, we just launch them in parallel
+            # for future in concurrent.futures.as_completed(futures):
+            #     try:
+            #         future.result() # Check for exceptions
+            #     except Exception as e:
+            #         self.logger.error(f"Error executing strategy on_bar in parallel: {e}")
+        else:
+            self.logger.debug(f"No strategies subscribed to {symbol}@{timeframe}")
+

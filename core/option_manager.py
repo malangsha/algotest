@@ -702,7 +702,9 @@ class OptionManager:
                             instrument_type=InstrumentType.OPTION
                         )
                         
-                        success = self.data_manager.unsubscribe(instrument)
+                        # Do not actually unsubscribe it. we may need the data.
+                        # success = self.data_manager.unsubscribe(instrument)
+                        success = True
                         if success:
                             self.option_subscriptions[underlying_symbol].remove(symbol)
                             self.logger.debug(f"Unsubscribed from out-of-range option {symbol}")
@@ -850,4 +852,3 @@ class OptionManager:
         except Exception as e:
             self.logger.error(f"Error starting underlying tracking: {e}")
             return False 
-

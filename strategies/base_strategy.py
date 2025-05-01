@@ -9,6 +9,7 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Union, Any, Set
 from datetime import datetime
+import pandas as pd
 
 from models.events import Event, EventType, MarketDataEvent, SignalEvent, BarEvent, PositionEvent, FillEvent, OrderEvent, TimerEvent
 from models.order import Order
@@ -349,33 +350,58 @@ class OptionStrategy(ABC):
         
         self.logger.info(f"Generated {signal_type} signal for {symbol} with priority {priority.name}")
 
-    def get_bars(self, symbol: str, timeframe: str = None, limit: int = None) -> List[BarEvent]:
+    def get_bars(self, symbol: str, timeframe: str = None, limit: int = None, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> Optional[pd.DataFrame]:
         """
-        Get historical bars for a symbol.
+        Get historical bars for a symbol, fetching from data_manager if needed.
 
         Args:
             symbol: Symbol to get bars for
             timeframe: Timeframe of the bars (default: strategy's primary timeframe)
-            limit: Maximum number of bars to return (default: all available)
+            limit: Maximum number of bars to return (if start/end not specified)
+            start_time: Optional start datetime for the data range
+            end_time: Optional end datetime for the data range
 
         Returns:
-            List[BarEvent]: List of bar events
+            Optional[pd.DataFrame]: DataFrame of bar data or None if unavailable
         """
         # Use the strategy's primary timeframe if none specified
         if not timeframe:
             timeframe = self.timeframe
-            
-        # Check if we have cached bars for this symbol and timeframe
-        if symbol in self.bar_data and timeframe in self.bar_data[symbol]:
-            bars = self.bar_data[symbol][timeframe]
-            
-            # Apply limit if specified
-            if limit and limit > 0:
-                return bars[-limit:]
-            return bars
-            
-        # No cached bars available
-        return []
+
+        self.logger.debug(f"Requesting bars for {symbol}@{timeframe} (Limit: {limit}, Start: {start_time}, End: {end_time})")
+
+        # Convert start/end times to timestamps (ms) if provided
+        start_ts = int(start_time.timestamp() * 1000) if start_time else None
+        end_ts = int(end_time.timestamp() * 1000) if end_time else None
+
+        # Determine the number of bars to fetch from data_manager
+        # If start/end time provided, fetch that range. Otherwise, use limit or default.
+        fetch_limit = 0 # Fetch all in range if start/end provided
+        if not start_time and not end_time:
+             fetch_limit = limit if limit is not None else self.max_bars_to_keep
+
+        try:
+            # Fetch data from DataManager
+            historical_data = self.data_manager.get_historical_data(
+                symbol=symbol,
+                timeframe=timeframe,
+                n_bars=fetch_limit, # Use 0 if start/end are set
+                start_time=start_ts,
+                end_time=end_ts
+            )
+
+            if historical_data is not None and not historical_data.empty:
+                self.logger.debug(f"Retrieved {len(historical_data)} bars for {symbol}@{timeframe} from DataManager")
+                # Optional: Update local cache (self.bar_data) if needed, though direct use might be better
+                # For simplicity, we return the DataFrame directly from DataManager
+                return historical_data
+            else:
+                self.logger.warning(f"No historical data found for {symbol}@{timeframe} in DataManager for the requested range.")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"Error fetching bars for {symbol}@{timeframe} from DataManager: {e}")
+            return None
 
     def get_position(self, symbol: str) -> Optional[Position]:
         """

@@ -434,70 +434,108 @@ class DataManager:
             self.logger.error(f"Error processing market data for {key}: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
-    
-    def _calculate_option_greeks(self, instrument: Instrument, price: float, timestamp: float) -> Optional[Dict[str, float]]:
+    def _calculate_option_greeks(self, instrument: Instrument, option_price: float, timestamp: float) -> Optional[Tuple[Dict[str, float], float]]:
         """
-        Calculate option Greeks for an option instrument.
+        Calculate option Greeks and implied volatility.
         
         Args:
-            instrument: Option instrument
-            price: Current option price
-            timestamp: Current timestamp
+            instrument: Option instrument object
+            option_price: Current price of the option
+            timestamp: Current timestamp in milliseconds
             
         Returns:
-            Optional[Dict[str, float]]: Dictionary of Greeks or None if calculation failed
+            Optional[Tuple[Dict[str, float], float]]: Tuple containing Greeks dictionary and implied volatility, or None if calculation fails
         """
         if not instrument or instrument.instrument_type != InstrumentType.OPTION:
             return None
             
         try:
             # Get option details
-            option_type = instrument.option_type
+            option_type = instrument.option_type.lower() # Ensure lowercase 'call' or 'put'
             strike_price = instrument.strike
-            expiry_date = instrument.expiry_date
+            expiry_date_str = instrument.expiry_date # Assuming YYYY-MM-DD format
             
             # Get underlying symbol
-            underlying_symbol = getattr(instrument, 'underlying', None)
+            underlying_symbol = getattr(instrument, 'underlying_symbol', None) # Assuming underlying_symbol attribute exists
             if not underlying_symbol:
-                self.logger.debug(f"Underlying symbol not available for {instrument.symbol}")
+                # Attempt to infer from option symbol if needed (complex and provider-specific)
+                self.logger.debug(f"Underlying symbol not directly available for {instrument.symbol}")
+                # Placeholder: Infer underlying logic needed here based on symbol convention
+                # e.g., underlying_symbol = infer_underlying(instrument.symbol)
+                # For now, return None if not explicitly set
                 return None
                 
             # Get underlying price
             underlying_price = self._get_underlying_price(underlying_symbol)
-            if not underlying_price:
-                self.logger.debug(f"Underlying price not available for {underlying_symbol}")
+            if underlying_price is None:
+                self.logger.debug(f"Underlying price not available for {underlying_symbol} needed for {instrument.symbol} greeks")
                 return None
                 
             # Calculate time to expiry
-            expiry_dt = datetime.strptime(expiry_date, '%Y-%m-%d')
+            expiry_dt = datetime.strptime(expiry_date_str, '%Y-%m-%d')
+            # Make expiry timezone-aware (assuming UTC for simplicity, adjust if needed)
+            # expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            # Use end of day for expiry calculation (e.g., 15:30 market close)
+            expiry_dt_eod = expiry_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+            
             current_dt = datetime.fromtimestamp(timestamp / 1000.0)
-            time_diff = expiry_dt - current_dt
-            time_to_expiry = max(0.0, time_diff.total_seconds() / (365 * 24 * 60 * 60))
+            # Make current time timezone-aware
+            # current_dt = current_dt.replace(tzinfo=timezone.utc)
             
-            if time_to_expiry <= 0:
-                return None
-                
-            # Get volatility (could be improved with more accurate IV calculation)
-            implied_volatility = 0.2  # Placeholder
+            time_diff = expiry_dt_eod - current_dt
+            time_to_expiry_years = max(0.0, time_diff.total_seconds() / (365.25 * 24 * 60 * 60)) # Use 365.25 for accuracy
             
-            risk_free_rate = self.greeks_risk_free_rate  # Placeholder
+            if time_to_expiry_years <= 1e-6: # Use a small epsilon instead of 0
+                 self.logger.debug(f"Option {instrument.symbol} expired or too close to expiry for Greeks calculation.")
+                 # Return intrinsic value based greeks for expired options
+                 delta = 0.0
+                 if option_type == 'call':
+                     delta = 1.0 if underlying_price > strike_price else 0.0
+                 elif option_type == 'put':
+                     delta = -1.0 if underlying_price < strike_price else 0.0
+                 return ({'delta': delta, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'rho': 0.0}, 0.0)
+
+            # --- Implied Volatility Calculation (Placeholder/Simple Version) ---
+            # TODO: Implement a proper IV solver (e.g., Newton-Raphson or Brent's method)
+            # This requires an option pricing function (e.g., Black-Scholes)
+            # For now, using a placeholder or potentially fetching from data if available.
+            implied_volatility = instrument.implied_volatility if hasattr(instrument, 'implied_volatility') and instrument.implied_volatility else 0.20 # Default placeholder 20%
+            # If IV calculation is needed:
+            # from utils.implied_volatility import calculate_implied_volatility
+            # implied_volatility = calculate_implied_volatility(
+            #     option_price=option_price,
+            #     underlying_price=underlying_price,
+            #     strike_price=strike_price,
+            #     time_to_expiry=time_to_expiry_years,
+            #     risk_free_rate=self.greeks_risk_free_rate,
+            #     option_type=option_type
+            # )
+            # if implied_volatility is None:
+            #     self.logger.warning(f"Could not calculate IV for {instrument.symbol}, using placeholder.")
+            #     implied_volatility = 0.20 # Fallback placeholder
+            # ------------------------------------------------------------------
+
+            risk_free_rate = self.greeks_risk_free_rate
             
-            # Calculate Greeks
+            # Calculate Greeks using the determined IV
             greeks = OptionsGreeksCalculator.calculate_greeks(
                 option_type=option_type,
                 underlying_price=underlying_price,
                 strike_price=strike_price,
-                time_to_expiry=time_to_expiry,
+                time_to_expiry=time_to_expiry_years,
                 risk_free_rate=risk_free_rate,
-                implied_volatility=implied_volatility
+                volatility=implied_volatility # Use the calculated or fetched IV
             )
             
-            return greeks
+            # Return both Greeks and the volatility used
+            return greeks, implied_volatility
             
         except Exception as e:
-            self.logger.error(f"Error calculating Greeks: {str(e)}")
+            self.logger.error(f"Error calculating Greeks for {instrument.symbol}: {str(e)}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return None
-    
+
     def _get_underlying_price(self, underlying_symbol: str) -> Optional[float]:
         """
         Get the price of an underlying symbol.
@@ -699,38 +737,71 @@ class DataManager:
                 if 'TIMESTAMP' in ohlc:
                     bar['timestamp'] = float(ohlc['TIMESTAMP'])
                     
-                # Calculate Greeks for options if needed
+                # Calculate Greeks and Volatility for options if needed
+                greeks_data = None
+                implied_volatility = None
                 if self.calculate_greeks and instrument and instrument.instrument_type == InstrumentType.OPTION:
-                    greeks = self._calculate_option_greeks(instrument, bar['close'], timestamp)
-                    if greeks:
+                    # _calculate_option_greeks now returns a tuple (greeks_dict, iv)
+                    result = self._calculate_option_greeks(instrument, bar["close"], timestamp)
+                    if result:
+                        greeks_data, implied_volatility = result
                         bar.update({
-                            'delta': greeks.get('delta', 0),
-                            'gamma': greeks.get('gamma', 0),
-                            'theta': greeks.get('theta', 0),
-                            'vega': greeks.get('vega', 0),
-                            'rho': greeks.get('rho', 0)
+                            "delta": greeks_data.get("delta", 0),
+                            "gamma": greeks_data.get("gamma", 0),
+                            "theta": greeks_data.get("theta", 0),
+                            "vega": greeks_data.get("vega", 0),
+                            "rho": greeks_data.get("rho", 0),
+                            "implied_volatility": implied_volatility # Store IV in the bar data
                         })
-    
+                    else:
+                        # Add placeholders if calculation failed
+                         bar.update({
+                            "delta": 0, "gamma": 0, "theta": 0, "vega": 0, "rho": 0, "implied_volatility": 0
+                        })
+                elif instrument and instrument.instrument_type == InstrumentType.OPTION:
+                     # Add placeholders if greeks calculation is disabled but it's an option
+                     bar.update({
+                        "delta": 0, "gamma": 0, "theta": 0, "vega": 0, "rho": 0, "implied_volatility": 0
+                    })
+
                 # Add bar to DataFrame
+                # Ensure the DataFrame columns include 'implied_volatility' if it's an option
+                if timeframe not in self.ohlc_data[symbol]:
+                    columns = ["timestamp", "open", "high", "low", "close", "volume", "open_interest"]
+                    if instrument and instrument.instrument_type == InstrumentType.OPTION:
+                        columns.extend(["delta", "gamma", "theta", "vega", "rho", "implied_volatility"])
+                    self.ohlc_data[symbol][timeframe] = pd.DataFrame(columns=columns)
+                    self.ohlc_data[symbol][timeframe].set_index("timestamp", inplace=True)
+                elif instrument and instrument.instrument_type == InstrumentType.OPTION and "implied_volatility" not in self.ohlc_data[symbol][timeframe].columns:
+                    # Add IV column if missing (e.g., if dataframe was created before this change)
+                    self.ohlc_data[symbol][timeframe]["implied_volatility"] = 0.0 # Add with default value
+
                 new_row = pd.DataFrame([bar])
-                new_row.set_index('timestamp', inplace=True)
-    
+                new_row.set_index("timestamp", inplace=True)
+
                 # Concatenate with existing data
-                self.ohlc_data[symbol][timeframe] = pd.concat(
-                    [self.ohlc_data[symbol][timeframe], new_row]
-                ).iloc[-self.cache_limit:]
-                
+                # Use pd.concat and handle potential column mismatches if IV was added
+                try:
+                    self.ohlc_data[symbol][timeframe] = pd.concat(
+                        [self.ohlc_data[symbol][timeframe], new_row],
+                        ignore_index=False, sort=False # Keep index, don't sort columns
+                    ).iloc[-self.cache_limit:]
+                    # Fill NaN in IV column if introduced by concat
+                    if "implied_volatility" in self.ohlc_data[symbol][timeframe].columns:
+                         self.ohlc_data[symbol][timeframe]["implied_volatility"].fillna(0.0, inplace=True)
+
+                except Exception as concat_err:
+                     self.logger.error(f"Error concatenating OHLC data for {symbol}@{timeframe}: {concat_err}")
+                     # Fallback or recovery logic might be needed here
+
                 # If this is a 1-minute bar, store it specially and consider persistence
-                if timeframe == '1m':
-                    self._store_one_minute_bar(symbol, bar, 
-                                            greeks if 'delta' in bar else None,
-                                            bar.get('open_interest'))
-                
+                if timeframe == "1m":
+                    # Pass greeks_data and implied_volatility separately
+                    self._store_one_minute_bar(symbol, bar, greeks_data, bar.get("open_interest"))
+
                 # Publish a timeframe-specific bar event
-                self._publish_timeframe_bar_event(symbol, timeframe, bar, 
-                                            greeks if 'delta' in bar else None,
-                                            bar.get('open_interest'),
-                                            instrument)
+                # Pass greeks_data and implied_volatility separately
+                self._publish_timeframe_bar_event(symbol, timeframe, bar, greeks_data, bar.get("open_interest"), instrument)
     
         except Exception as e:
             self.logger.error(f"Error updating OHLC data for {symbol}: {str(e)}")

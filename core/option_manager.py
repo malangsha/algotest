@@ -78,43 +78,66 @@ class OptionManager:
             "BANKEX": "BANKEX"
         }
         
+        # Initialize underlyings dictionary
+        self.underlyings = {}
+        
         # Convert list configuration to dictionary if needed
         if isinstance(underlyings_config, list):
-            self.underlyings = {}
             for underlying_config in underlyings_config:
-                symbol = underlying_config['symbol']   
-                exchange = underlying_config.get('exchange', Exchange.NSE.value)
-                derivative_exchange = underlying_config.get('derivative_exchange', Exchange.NFO.value)
-                if not exchange or not derivative_exchange:
+                # Handle both old and new format
+                # New format: {'name': 'NIFTY INDEX', 'spot_exchange': 'NSE', 'option_exchange': 'NFO'}
+                # Old format: {'symbol': 'NIFTY INDEX', 'exchange': 'NSE', 'derivative_exchange': 'NFO'}
+                
+                # Extract symbol/name
+                symbol = underlying_config.get('name', underlying_config.get('symbol'))
+                if not symbol:
+                    self.logger.warning(f"Skipping underlying config without name/symbol: {underlying_config}")
+                    continue
+                
+                # Extract exchanges
+                spot_exchange = underlying_config.get('spot_exchange', underlying_config.get('exchange'))
+                option_exchange = underlying_config.get('option_exchange', underlying_config.get('derivative_exchange'))
+                
+                # Set default exchanges if not provided
+                if not spot_exchange or not option_exchange:
                     if symbol in NSE_INDICES:
-                        exchange = Exchange.NSE.value
-                        derivative_exchange = Exchange.NFO.value
+                        spot_exchange = Exchange.NSE.value
+                        option_exchange = Exchange.NFO.value
                     elif symbol in BSE_INDICES:
-                        exchange = Exchange.BSE.value
-                        derivative_exchange = Exchange.BFO.value                
-
-            self.underlyings[symbol] = underlying_config.copy()
-            self.underlyings[symbol]['exchange'] = exchange            
-            self.underlyings[symbol]['derivative_exchange'] = derivative_exchange
+                        spot_exchange = Exchange.BSE.value
+                        option_exchange = Exchange.BFO.value
+                
+                # Store in our dictionary with unified field names
+                self.underlyings[symbol] = {
+                    'symbol': symbol,
+                    'exchange': spot_exchange,
+                    'derivative_exchange': option_exchange,
+                    # Copy any other fields from the original config
+                    **{k: v for k, v in underlying_config.items() 
+                       if k not in ['name', 'symbol', 'spot_exchange', 'exchange', 'option_exchange', 'derivative_exchange']}
+                }
         else:
+            # If it's already a dictionary (old format)
             self.underlyings = underlyings_config
             
         # Initialize strike intervals
         self.strike_intervals = {}
         for symbol, details in self.underlyings.items():
             self.strike_intervals[symbol] = details.get('strike_interval', 50)
+            
+            # Make sure exchange is set properly
             if symbol in NSE_INDICES:
-                self.underlyings[symbol]['exchange'] = Exchange.NFO.value
+                self.underlyings[symbol]['exchange'] = Exchange.NSE.value
+                self.underlyings[symbol]['derivative_exchange'] = Exchange.NFO.value
             elif symbol in BSE_INDICES:
-                self.underlyings[symbol]['exchange'] = Exchange.BFO.value
-            else:
-                self.underlyings[symbol]['exchange'] = Exchange.NFO.value
-        
+                self.underlyings[symbol]['exchange'] = Exchange.BSE.value
+                self.underlyings[symbol]['derivative_exchange'] = Exchange.BFO.value
+            
         # Track subscribed underlyings
         self._subscribed_underlyings: Set[str] = set()
        
-        # Subscribe to market data events
-        self.event_manager.subscribe(EventType.MARKET_DATA, self._on_market_data)
+        # Commented out for now as we are using the strategy manager to receive market data events
+        # self.event_manager.subscribe(EventType.MARKET_DATA, self._on_market_data)
         
         self.logger.info("Option Manager initialized")
     
@@ -124,38 +147,49 @@ class OptionManager:
         
         Args:
             underlyings_config: List of underlying configurations from the market.underlyings section of config.yaml
+                               Can be in old format with 'symbol' key or new format with 'name' key
         """
         with self.lock:
             for underlying_config in underlyings_config:
-                symbol = underlying_config['symbol']
+                # Extract symbol/name
+                symbol = underlying_config.get('name', underlying_config.get('symbol'))
+                if not symbol:
+                    self.logger.warning(f"Skipping underlying config without name/symbol: {underlying_config}")
+                    continue
+                
                 strike_interval = underlying_config.get('strike_interval', 50)
                 atm_range = underlying_config.get('atm_range', 5)
 
-                exchange = underlying_config.get('exchange', Exchange.NFO.value)
-                derivative_exchange = underlying_config.get('derivative_exchange', Exchange.NFO.value)
-                if not exchange or not derivative_exchange:
+                # Extract exchanges with support for both old and new format
+                spot_exchange = underlying_config.get('spot_exchange', underlying_config.get('exchange'))
+                option_exchange = underlying_config.get('option_exchange', underlying_config.get('derivative_exchange'))
+                
+                # Set default exchanges if not provided
+                if not spot_exchange or not option_exchange:
                     if symbol in NSE_INDICES:
-                        exchange = Exchange.NSE.value
-                        derivative_exchange = Exchange.NFO.value
+                        spot_exchange = Exchange.NSE.value
+                        option_exchange = Exchange.NFO.value
                     elif symbol in BSE_INDICES:
-                        exchange = Exchange.BSE.value
-                        derivative_exchange = Exchange.BFO.value
+                        spot_exchange = Exchange.BSE.value
+                        option_exchange = Exchange.BFO.value
 
                 self.strike_intervals[symbol] = strike_interval
                 self.atm_ranges[symbol] = atm_range
 
-                # Ensure all index parameters are stored in the indices dict
+                # Ensure all index parameters are stored in the underlyings dict
                 if symbol not in self.underlyings:
                     self.underlyings[symbol] = {}
                 
+                # Store with unified field names
                 self.underlyings[symbol].update({
+                    'symbol': symbol,
                     'strike_interval': strike_interval,
                     'atm_range': atm_range,
-                    'exchange': exchange,
-                    'derivative_exchange': derivative_exchange
+                    'exchange': spot_exchange,
+                    'derivative_exchange': option_exchange
                 })
                 
-                self.logger.info(f"Configured underlying {symbol} with strike interval {strike_interval}, ATM range {atm_range}, exchange {exchange}, and derivative exchange {derivative_exchange}")
+                self.logger.info(f"Configured underlying {symbol} with strike interval {strike_interval}, ATM range {atm_range}, exchange {spot_exchange}, and derivative exchange {option_exchange}")
     
     def subscribe_underlying(self, underlying: str) -> bool:
         """
@@ -334,8 +368,6 @@ class OptionManager:
         Returns:
             str: The constructed option symbol
         """
-        self.logger.warning("_get_option_symbol is deprecated, use market_data_feed.get_symbol() instead")       
-
         # Get the correct underlying symbol
         underlying_symbol = self.underlying_mapping.get(underlying, underlying)
 
@@ -347,8 +379,9 @@ class OptionManager:
         
         # Set the instrument type based on whether it's an underlying or stock
         instrument_type = "OPT" if is_underlying else "FUT"
-        derivative_exchange = self.underlyings[underlying].get('derivative_exchange', Exchange.NFO.value)
         
+        # Get derivative exchange from underlyings config
+        derivative_exchange = self.underlyings[underlying].get('derivative_exchange', Exchange.NFO.value)
         
         if hasattr(self.data_manager, 'market_data_feed') and self.data_manager.market_data_feed:
             return self.data_manager.market_data_feed.construct_trading_symbol(
@@ -593,17 +626,29 @@ class OptionManager:
             # Prepare option symbols to subscribe and unsubscribe
             option_instruments_to_add = []
             symbols_to_unsubscribe = []
+
+            is_underlying = (underlying in NSE_INDICES or 
+                            underlying in BSE_INDICES)
+        
+            # Set the instrument type based on whether it's an underlying or stock
+            instrument_type = InstrumentType.OPTION.value if is_underlying else InstrumentType.FUTURE.value
             
+            # Get derivative exchange from underlyings config
+            derivative_exchange = self.underlyings[underlying_symbol].get('derivative_exchange', Exchange.NFO.value)
+
             # First, gather all possible symbols for the new ATM range to detect what's needed
             potential_symbols = []
             for strike in new_strikes:
                 for option_type in ['CE', 'PE']:  # Call and Put options
                     # Get the broker-specific option symbol
-                    option_symbol = market_data_feed.get_symbol(
-                        index_symbol=underlying_symbol,
+                    
+                    option_symbol = market_data_feed.construct_trading_symbol(
+                        index_symbol=str(underlying_symbol),
+                        expiry_date=current_expiry,
+                        instrument_type=instrument_type,
                         strike=strike,
                         option_type=option_type,
-                        expiry_date=current_expiry
+                        exchange=str(derivative_exchange)
                     )
                     
                     if option_symbol:
@@ -631,6 +676,7 @@ class OptionManager:
                 if symbol not in potential_set:
                     # Check if we have open positions before unsubscribing (IMPORTANT)
                     should_unsubscribe = True
+                    
                     
                     # TODO: Check with position_manager if this option has open positions
                     # If hasattr(self, 'position_manager') and self.position_manager:
@@ -804,3 +850,4 @@ class OptionManager:
         except Exception as e:
             self.logger.error(f"Error starting underlying tracking: {e}")
             return False 
+

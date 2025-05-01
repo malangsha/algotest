@@ -124,6 +124,17 @@ class EventType(Enum):
     RISK_BREACH = "risk_breach"
     EXECUTION = "execution"
     BAR = "bar"
+   
+ # New Event Types for specific timeframes
+class TimeframeEventType(Enum):
+    BAR = "bar"
+    BAR_1M = "BAR_1M"
+    BAR_5M = "BAR_5M"
+    BAR_15M = "BAR_15M"
+    BAR_30M = "BAR_30M"
+    BAR_1H = "BAR_1H"
+    BAR_4H = "BAR_4H"
+    BAR_1D = "BAR_1D"   
 
 class MarketDataType(Enum):
     QUOTE = "QUOTE"

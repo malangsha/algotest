@@ -6,7 +6,7 @@ import uuid
 import logging
 from enum import Enum
 
-from utils.constants import Exchange, OrderType, OrderSide, OrderStatus, SignalType, EventType, MarketDataType, EventPriority
+from utils.constants import Exchange, OrderType, OrderSide, OrderStatus, SignalType, EventType, MarketDataType, EventPriority, TimeframeEventType
 from models.instrument import Instrument
 
 logger = logging.getLogger("models.events")
@@ -270,6 +270,162 @@ class BarEvent(Event):
     def symbol(self) -> str:
         """Get the symbol from the instrument for backward compatibility."""
         return self.instrument.symbol if self.instrument else None
+
+@dataclass
+class TimeframeBarEvent(Event):
+    """Event for completed timeframe bars"""
+    instrument: Instrument = None
+    timeframe: str = TimeframeEventType.BAR_1M
+    bar_data: Dict[str, Any] = None
+    greeks: Optional[Dict[str, float]] = None
+    open_interest: Optional[float] = None
+    _event_type: EventType = None  # Use a private field for setting the value
+    
+    def __post_init__(self):
+        # Set the _event_id and _timestamp in parent class
+        if self.event_id is None:
+            self.event_id = str(uuid.uuid4())
+        if self.timestamp is None:
+            self.timestamp = int(datetime.now().timestamp() * 1000)
+        
+        # Always derive the event_type from timeframe
+        self._event_type = self._derive_event_type_from_timeframe()
+    
+    def _derive_event_type_from_timeframe(self) -> EventType:
+        """Derive the event type from the timeframe"""
+        timeframe_map = {
+            '1m': TimeframeEventType.BAR_1M,
+            '5m': TimeframeEventType.BAR_5M,
+            '15m': TimeframeEventType.BAR_15M,
+            '30m': TimeframeEventType.BAR_30M,
+            '1h': TimeframeEventType.BAR_1H,
+            '4h': TimeframeEventType.BAR_4H,
+            '1d': TimeframeEventType.BAR_1D
+        }
+        return timeframe_map.get(self.timeframe, TimeframeEventType.BAR_1M)
+    
+    @property
+    def event_type(self) -> EventType:
+        """Get the event type based on timeframe"""
+        return self._event_type
+    
+    @event_type.setter
+    def event_type(self, value):
+        """Allow setting the event_type, but silently ignore it since we derive from timeframe"""
+        pass  # Silently ignore attempts to set event_type directly
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert timeframe bar event to dictionary."""
+        result = super().to_dict()
+        result.update({
+            "instrument_id": self.instrument.instrument_id if self.instrument else None,
+            "symbol": self.instrument.symbol if self.instrument else None,
+            "exchange": self.instrument.exchange if self.instrument else None,
+            "timeframe": self.timeframe,
+            "bar_data": self.bar_data,
+            "greeks": self.greeks,
+            "open_interest": self.open_interest,
+            "bar_start_time": self.bar_start_time
+        })
+        return result
+    
+    def validate(self) -> bool:
+        """
+        Validate that the bar event has all required fields.
+
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        super().validate()
+        required_fields = ["instrument", "timeframe", "bar_data"]
+        return validate_event(self, required_fields)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], instrument_registry=None) -> 'TimeframeBarEvent':
+        """
+        Create timeframe bar event from dictionary.
+
+        Args:
+            data: Dictionary containing event data
+            instrument_registry: Optional registry to look up instrument
+        """
+        instrument_id = data.get("instrument_id")
+        symbol = data.get("symbol")
+        exchange = data.get("exchange")
+
+        # Attempt to get instrument from registry
+        instrument = None
+        if instrument_registry:
+            if instrument_id:
+                instrument = instrument_registry.get_by_id(instrument_id)
+            elif symbol:
+                instrument = instrument_registry.get_by_symbol(symbol, exchange)
+
+        if not instrument:
+            # Create a basic instrument if we can't find one
+            instrument = Instrument(
+                instrument_id=instrument_id,
+                symbol=symbol,
+                exchange=exchange
+            )
+            
+        # Create bar_data dictionary from OHLCV fields if they exist
+        bar_data = data.get("bar_data", {})
+        if not bar_data and all(key in data for key in ["open_price", "high_price", "low_price", "close_price"]):
+            bar_data = {
+                "open": data["open_price"],
+                "high": data["high_price"],
+                "low": data["low_price"],
+                "close": data["close_price"],
+                "volume": data.get("volume", 0.0),
+                "bar_start_time": data.get("bar_start_time")
+            }
+
+        return cls(
+            event_type=EventType(data["event_type"]) if "event_type" in data else None,
+            timestamp=data["timestamp"],
+            event_id=data.get("event_id"),
+            instrument=instrument,
+            timeframe=data["timeframe"],
+            bar_data=bar_data,
+            greeks=data.get("greeks"),
+            open_interest=data.get("open_interest")
+        )
+
+    @property
+    def symbol(self) -> str:
+        """Get the symbol from the instrument for backward compatibility."""
+        return self.instrument.symbol if self.instrument else None
+        
+    @property
+    def open_price(self) -> float:
+        """Get open price from bar_data."""
+        return self.bar_data.get("open", 0.0)
+    
+    @property
+    def high_price(self) -> float:
+        """Get high price from bar_data."""
+        return self.bar_data.get("high", 0.0)
+    
+    @property
+    def low_price(self) -> float:
+        """Get low price from bar_data."""
+        return self.bar_data.get("low", 0.0)
+    
+    @property
+    def close_price(self) -> float:
+        """Get close price from bar_data."""
+        return self.bar_data.get("close", 0.0)
+    
+    @property
+    def volume(self) -> float:
+        """Get volume from bar_data."""
+        return self.bar_data.get("volume", 0.0)
+    
+    @property
+    def bar_start_time(self) -> Optional[int]:
+        """Get bar start time from bar_data."""
+        return self.bar_data.get("bar_start_time", self.timestamp)
 
 @dataclass
 class OrderEvent(Event):

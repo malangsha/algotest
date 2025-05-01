@@ -5,8 +5,11 @@ import time
 import traceback
 from typing import Dict, List, Callable, Any, Optional, Type, Set
 from datetime import datetime
+from utils.constants import EventType, EventPriority, TimeframeEventType
 from models.events import Event, EventType, EventValidationError, EventPriority, MarketDataEvent, BarEvent, OrderEvent, FillEvent, PositionEvent, SignalEvent, TimerEvent, SystemEvent, AccountEvent, RiskBreachEvent, ExecutionEvent
 from collections import defaultdict
+import uuid
+import sys
 
 class EventFlowMonitor:
     """
@@ -30,6 +33,14 @@ class EventFlowMonitor:
             EventType.FILL: {EventType.POSITION},  # Fills should lead to Position updates
             EventType.POSITION: {EventType.ACCOUNT},  # Position updates should lead to Account updates
             EventType.EXECUTION: {EventType.FILL},  # Executions should lead to Fills
+            EventType.BAR: {EventType.SIGNAL},  # Bars should lead to Signals
+            TimeframeEventType.BAR_1M: {EventType.SIGNAL},  # 1-minute bars should lead to Signals
+            TimeframeEventType.BAR_5M: {EventType.SIGNAL},  # 5-minute bars should lead to Signals
+            TimeframeEventType.BAR_15M: {EventType.SIGNAL},  # 15-minute bars should lead to Signals
+            TimeframeEventType.BAR_30M: {EventType.SIGNAL},  # 30-minute bars should lead to Signals
+            TimeframeEventType.BAR_1H: {EventType.SIGNAL},  # 1-hour bars should lead to Signals
+            TimeframeEventType.BAR_4H: {EventType.SIGNAL},  # 4-hour bars should lead to Signals
+            TimeframeEventType.BAR_1D: {EventType.SIGNAL}  # 1-day bars should lead to Signals
         }
         
         # Track actual events seen
@@ -47,6 +58,14 @@ class EventFlowMonitor:
             EventType.EXECUTION: 10.0,
             EventType.POSITION: 5.0,
             EventType.ACCOUNT: 5.0,
+            EventType.BAR: 5.0,
+            TimeframeEventType.BAR_1M: 5.0,
+            TimeframeEventType.BAR_5M: 5.0,
+            TimeframeEventType.BAR_15M: 5.0,
+            TimeframeEventType.BAR_30M: 5.0,
+            TimeframeEventType.BAR_1H: 5.0,
+            TimeframeEventType.BAR_4H: 5.0,
+            TimeframeEventType.BAR_1D: 5.0
         }
         
         # Statistics
@@ -260,7 +279,14 @@ class EventManager:
         EventType.TIMER: EventPriority.LOW,
         EventType.RISK_BREACH: EventPriority.HIGH,
         EventType.EXECUTION: EventPriority.HIGH,
-        EventType.BAR: EventPriority.NORMAL
+        EventType.BAR: EventPriority.NORMAL,
+        TimeframeEventType.BAR_1M: EventPriority.NORMAL,
+        TimeframeEventType.BAR_5M: EventPriority.NORMAL,
+        TimeframeEventType.BAR_15M: EventPriority.NORMAL,
+        TimeframeEventType.BAR_30M: EventPriority.NORMAL,
+        TimeframeEventType.BAR_1H: EventPriority.NORMAL,
+        TimeframeEventType.BAR_4H: EventPriority.NORMAL,
+        TimeframeEventType.BAR_1D: EventPriority.NORMAL        
     }
     
     def __init__(self, queue_size: int = 5000, process_sleep: float = 0.001, enable_monitoring: bool = True):
@@ -915,123 +941,150 @@ class EventManager:
             include_components: Whether to include component registration details
             include_priorities: Whether to include event priorities
         """
-        # Get subscriber information
-        subscriber_info = self.get_subscriber_info()
-        
-        # Print header
-        print("\n" + "="*80)
-        print("EVENT MANAGER STATISTICS")
-        print("="*80)
-        
-        # Print event priorities
-        if include_priorities:
-            print("\nEvent Priorities:")
-            print("-"*40)
-            print(f"{'Event Type':<20} | {'Priority':<10} | Description")
-            print("-"*40)
-            for event_type, priority in self.EVENT_PRIORITIES.items():
-                priority_name = priority.name if hasattr(priority, 'name') else str(priority)
-                print(f"{event_type.value:<20} | {priority_name:<10} | {self._get_priority_description(priority)}")
-            print("-"*40)
-        
-        # Print component registrations
-        if include_components:
-            print("\nComponent Registrations:")
-            print("-"*40)
+        try:
+            # Get subscriber information
+            subscriber_info = self.get_subscriber_info()
             
-            # First, collect all components and their events
-            component_events = defaultdict(list)
-            for event_type, info in subscriber_info.items():
-                for component in info["components"]:
-                    component_events[component].append(event_type)
+            # Print header
+            print("\n" + "="*80)
+            print("EVENT MANAGER STATISTICS")
+            print("="*80)
             
-            if not component_events:
-                print("No components registered")
-            else:
-                # Print in a nice format
-                for component, events in sorted(component_events.items()):
-                    print(f"\nComponent: {component}")
-                    print("Events:")
-                    for event in sorted(events):
-                        count = subscriber_info[event]["count"]
-                        print(f"  - {event:<20} | Subscribers: {count}")
+            # Print event priorities
+            if include_priorities:
+                print("\nEvent Priorities:")
+                print("-"*40)
+                print(f"{'Event Type':<20} | {'Priority':<10} | Description")
+                print("-"*40)
+                for event_type, priority in self.EVENT_PRIORITIES.items():
+                    priority_name = priority.name if hasattr(priority, 'name') else str(priority)
+                    print(f"{event_type.value:<20} | {priority_name:<10} | {self._get_priority_description(priority)}")
+                print("-"*40)
             
-            print("-"*40)
+            # Print component registrations
+            if include_components:
+                print("\nComponent Registrations:")
+                print("-"*40)
+                
+                # First, collect all components and their events
+                component_events = defaultdict(list)
+                for event_type, info in subscriber_info.items():
+                    for component in info["components"]:
+                        component_events[component].append(event_type)
+                
+                if not component_events:
+                    print("No components registered")
+                else:
+                    # Print in a nice format
+                    for component, events in sorted(component_events.items()):
+                        print(f"\nComponent: {component}")
+                        print("Events:")
+                        for event in sorted(events):
+                            count = subscriber_info[event]["count"]
+                            print(f"  - {event:<20} | Subscribers: {count}")
+                
+                print("-"*40)
 
-            # Print event subscribers
-            print("\nEvent Subscribers:")
-            print("-"*40)
-            
-            # Filter out events with no subscribers
-            events_with_subscribers = {et: info for et, info in subscriber_info.items() if info["components"]}
-            
-            if not events_with_subscribers:
-                print("No event subscribers")
-            else:
-                for event_type, info in sorted(events_with_subscribers.items()):
-                    print(f"\nEvent: {event_type}")
-                    print("Subscribers:")
-                    for component in sorted(info["components"]):
-                        # Get the actual callback functions for this event type
-                        callbacks = [cb for cb in self._subscribers.get(EventType(event_type), []) 
-                                   if hasattr(cb, '__name__') and cb.__name__ != '<lambda>']
-                        callback_names = [cb.__name__ for cb in callbacks]
+                # Print event subscribers
+                print("\nEvent Subscribers:")
+                print("-"*40)
+                
+                # Filter out events with no subscribers
+                events_with_subscribers = {et: info for et, info in subscriber_info.items() if info["components"]}
+                
+                if not events_with_subscribers:
+                    print("No event subscribers")
+                else:
+                    # Create a lookup map for string event_type to enum
+                    event_type_map = {}
+                    for et in EventType:
+                        event_type_map[et.value] = et
                         
-                        if callback_names:
-                            print(f"  - {component:<20} | Callbacks: {', '.join(callback_names)}")
-                        else:
-                            print(f"  - {component:<20} | Callbacks: <anonymous>")
+                    # Also add TimeframeEventType values
+                    try:
+                        from utils.constants import TimeframeEventType
+                        for et in TimeframeEventType:
+                            event_type_map[et.value] = et
+                    except (ImportError, AttributeError):
+                        pass
+                    
+                    for event_type, info in sorted(events_with_subscribers.items()):
+                        print(f"\nEvent: {event_type}")
+                        print("Subscribers:")
+                        for component in sorted(info["components"]):
+                            # Get the actual callback functions for this event type
+                            try:
+                                # Look up the enum by its value in our map
+                                enum_event_type = event_type_map.get(event_type)
+                                if enum_event_type:
+                                    callbacks = [cb for cb in self._subscribers.get(enum_event_type, []) 
+                                            if hasattr(cb, '__name__') and cb.__name__ != '<lambda>']
+                                    callback_names = [cb.__name__ for cb in callbacks]
+                                    
+                                    if callback_names:
+                                        print(f"  - {component:<20} | Callbacks: {', '.join(callback_names)}")
+                                    else:
+                                        print(f"  - {component:<20} | Callbacks: <anonymous>")
+                                else:
+                                    print(f"  - {component:<20} | Callbacks: <no matching event type>")
+                            except Exception as e:
+                                # Handle any errors in callback retrieval
+                                print(f"  - {component:<20} | Callbacks: <error: {str(e)}>")
+                
+                print("-"*40)
             
+            # Print event counts
+            print("\nEvent Counts:")
             print("-"*40)
-        
-        # Print event counts
-        print("\nEvent Counts:")
-        print("-"*40)
-        print(f"{'Event Type':<20} | {'Count':<10} | {'Last Event Time':<20}")
-        print("-"*40)
-        
-        # Filter out events with zero count
-        active_events = {et: count for et, count in self.stats["events_by_type"].items() if count > 0}
-        
-        if not active_events:
-            print("No events processed yet")
-        else:
-            for event_type, count in sorted(active_events.items()):
-                last_time = self.stats.get("last_event_times", {}).get(event_type, "Never")
-                print(f"{event_type:<20} | {count:<10} | {last_time}")
-        
-        # Print queue statistics
-        print("\nQueue Statistics:")
-        print("-"*40)
-        print(f"Current Queue Size: {self.event_queue.qsize()}/{self.event_queue.maxsize}")
-        print(f"Max Queue Size: {self.stats['max_queue_size']}")
-        print(f"Queue Overflows: {self.stats['queue_overflow_count']}")
-        print(f"Retry Queue Size: {self.retry_queue.qsize()}")
-        print(f"Retry Successes: {self.stats['retry_successes']}/{self.stats['retry_attempts']}")
-        
-        # Print error statistics
-        print("\nError Statistics:")
-        print("-"*40)
-        print(f"Total Errors: {self.stats['error_count']}")
-        print(f"Validation Errors: {self.stats['validation_errors']}")
-        print(f"Callback Errors: {self.stats['callback_errors']}")
-        
-        if self.stats['last_error']:
-            print(f"\nLast Error ({self.stats['last_error_time']}):")
-            print(f"  {self.stats['last_error']}")
-        
-        # Print flow monitor statistics if available
-        if self.flow_monitor:
-            flow_stats = self.flow_monitor.get_stats()
-            print("\nEvent Flow Statistics:")
+            print(f"{'Event Type':<20} | {'Count':<10} | {'Last Event Time':<20}")
             print("-"*40)
-            print(f"Broken Chains: {flow_stats['broken_chains']}")
-            print(f"Complete Chains: {flow_stats['complete_chains']}")
-            print(f"Active Chains: {flow_stats['active_chains']}")
-            if 'avg_completion_time' in flow_stats:
-                print(f"Average Chain Completion Time: {flow_stats['avg_completion_time']:.2f}s")
-        
-        print("\n" + "="*80)
+            
+            # Filter out events with zero count
+            active_events = {et: count for et, count in self.stats["events_by_type"].items() if count > 0}
+            
+            if not active_events:
+                print("No events processed yet")
+            else:
+                for event_type, count in sorted(active_events.items()):
+                    last_time = self.stats.get("last_event_times", {}).get(event_type, "Never")
+                    print(f"{event_type:<20} | {count:<10} | {last_time}")
+            
+            # Print queue statistics
+            print("\nQueue Statistics:")
+            print("-"*40)
+            print(f"Current Queue Size: {self.event_queue.qsize()}/{self.event_queue.maxsize}")
+            print(f"Max Queue Size: {self.stats['max_queue_size']}")
+            print(f"Queue Overflows: {self.stats['queue_overflow_count']}")
+            print(f"Retry Queue Size: {self.retry_queue.qsize()}")
+            print(f"Retry Successes: {self.stats['retry_successes']}/{self.stats['retry_attempts']}")
+            
+            # Print error statistics
+            print("\nError Statistics:")
+            print("-"*40)
+            print(f"Total Errors: {self.stats['error_count']}")
+            print(f"Validation Errors: {self.stats['validation_errors']}")
+            print(f"Callback Errors: {self.stats['callback_errors']}")
+            
+            if 'last_error' in self.stats and self.stats['last_error']:
+                print(f"\nLast Error ({self.stats.get('last_error_time', 'Unknown')}):")
+                print(f"  {self.stats['last_error']}")
+            
+            # Print flow monitor statistics if available
+            if self.flow_monitor:
+                flow_stats = self.flow_monitor.get_stats()
+                print("\nEvent Flow Statistics:")
+                print("-"*40)
+                print(f"Broken Chains: {flow_stats.get('broken_chains', 0)}")
+                print(f"Complete Chains: {flow_stats.get('complete_chains', 0)}")
+                print(f"Active Chains: {flow_stats.get('active_chains', 0)}")
+                if 'avg_completion_time' in flow_stats:
+                    print(f"Average Chain Completion Time: {flow_stats['avg_completion_time']:.2f}s")
+            
+            print("\n" + "="*80)
+        except Exception as e:
+            self.logger.error(f"Error printing event statistics: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _get_priority_description(self, priority):
         """Get a human-readable description of the priority level."""

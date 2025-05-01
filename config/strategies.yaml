@@ -8,7 +8,14 @@ strategies:
     
     # Index and symbol configurations
     use_options: true
-    underlyings: ["NIFTY INDEX"]
+    underlyings:
+    - name: "NIFTY INDEX"
+      spot_exchange: NSE
+      option_exchange: NFO
+    - name: "SENSEX"
+      spot_exchange: BSE
+      option_exchange: BFO
+    
     expiry_offset: 0  # 0=current expiry, 1=next expiry
     
     # Timeframe configurations

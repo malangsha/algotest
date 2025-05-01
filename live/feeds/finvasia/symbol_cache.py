@@ -302,7 +302,7 @@ class SymbolCache:
                 # Clean up temporary directory
                 if temp_dir.exists():
                     try:
-                        shutil.rmtree(temp_dir)
+                        #shutil.rmtree(temp_dir)
                         self.logger.debug(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         self.logger.error(f"Error cleaning up temp directory {temp_dir}: {e}")
@@ -1191,7 +1191,8 @@ class SymbolCache:
         expiry_date_str: str, # Expects YYYY-MM-DD
         instrument_type: str, # FUT, OPT
         option_type: Optional[str] = None, # P, C
-        strike: Optional[Union[int, float, str]] = None
+        strike: Optional[Union[int, float, str]] = None,
+        exchange: str = ""
     ) -> Optional[str]:
         """Construct trading symbol based on Finvasia's naming convention."""
         name = name.upper()
@@ -1212,6 +1213,43 @@ class SymbolCache:
                  return None
 
             option_type = option_type.upper()
+
+            # --- BFO Exchange Specific Format ---
+            if exchange == 'BFO':
+                # Format: NAME<YY><Month><DD><Strike><CE/PE>
+                # Example: SENSEX2561073400CE (SENSEX, 2025 June 10th, Strike 73400, Call)
+                try:
+                    dt_obj = datetime.strptime(expiry_date_str, '%Y-%m-%d')
+                    yy = dt_obj.strftime('%y') # Year as 2 digits (e.g., 25)
+                    month = str(dt_obj.month) # Month as number (e.g., 6)
+                    dd = dt_obj.strftime('%d') # Day as 2 digits (e.g., 10)
+                except ValueError:
+                    self.logger.error(f"Invalid expiry date format for BFO: {expiry_date_str}. Expected YYYY-MM-DD.")
+                    return None
+                except Exception as e:
+                     self.logger.error(f"Error parsing expiry date {expiry_date_str} for BFO: {e}")
+                     return None
+
+                # Validate and format option type to CE/PE
+                option_type_bfo = option_type.upper()
+                if option_type_bfo == 'C':
+                    option_type_bfo = 'CE'
+                elif option_type_bfo == 'P':
+                    option_type_bfo = 'PE'
+                elif option_type_bfo not in ['CE', 'PE']:
+                    self.logger.error(f"Invalid option type for BFO: {option_type}. Expected P/PE or C/CE.")
+                    return None
+
+                # Validate and format strike price (BFO expects integer)
+                try:
+                    strike_int = int(float(strike)) # Convert potential float/str to int
+                    strike_str_int = str(strike_int)
+                except (ValueError, TypeError):
+                    self.logger.error(f"Invalid strike price format for BFO: {strike}. Expected number convertible to integer.")
+                    return None
+
+                return f"{name}{yy}{month}{dd}{strike_str_int}{option_type_bfo}"
+
             # Finvasia uses P or C (not PE/CE) in the symbol examples provided
             if option_type not in ['P', 'C']:
                  # Accept PE/CE as input but convert to P/C for symbol
@@ -1245,8 +1283,6 @@ class SymbolCache:
 
             self.logger.error(f"Invalid or unhandled instrument type: {instrument_type}. Expected FUT, OPT, or EQ.")
             return None
-
-    # --- End Update 2 ---
 
     def is_expiry_data_available(self) -> bool:
         """Check if expiry data is available for any tracked index."""
@@ -1408,9 +1444,9 @@ if __name__ == "__main__":
         print(f"\nUsing SENSEX expiry {test_expiry_date_bfo} for BFO construction tests...")
         sensex_fut_symbol = cache.construct_trading_symbol("SENSEX", test_expiry_date_bfo, "FUT")
         print(f"Constructed SENSEX Future symbol: {sensex_fut_symbol}") # Expect SENSEXDDMMMYYF
-        sensex_call_symbol = cache.construct_trading_symbol("SENSEX", test_expiry_date_bfo, "OPT", "C", 74000)
+        sensex_call_symbol = cache.construct_trading_symbol("SENSEX", test_expiry_date_bfo, "OPT", "C", 74000, "BFO")
         print(f"Constructed SENSEX Call symbol (Strike 74000): {sensex_call_symbol}") # Expect SENSEXDDMMMYYC74000
-        sensex_put_symbol = cache.construct_trading_symbol("SENSEX", test_expiry_date_bfo, "OPT", "PE", 73500)
+        sensex_put_symbol = cache.construct_trading_symbol("SENSEX", test_expiry_date_bfo, "OPT", "PE", 73500, "BFO")
         print(f"Constructed SENSEX Put symbol (Strike 73500): {sensex_put_symbol}") # Expect SENSEXDDMMMYYP73500
     else:
         print("\nSkipping BFO construction tests (nearest SENSEX expiry not found).")

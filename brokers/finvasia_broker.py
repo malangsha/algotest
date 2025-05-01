@@ -124,6 +124,14 @@ class FinvasiaBroker(BrokerInterface):
         # Initialize the event manager
         self.event_manager = None
 
+        # Initialize market data processing components
+        self._market_data_buffer = queue.Queue()
+        self._market_data_thread = None
+        self._token_symbol_map = {}
+        self.market_data_callbacks = {}
+        self._subscriptions = {}
+        self._depth_subscriptions = {}
+
         # Initialize paper trading attributes
         self.simulated_orders = {}
         self.next_sim_fill_id = 1

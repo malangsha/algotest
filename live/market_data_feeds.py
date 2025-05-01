@@ -731,9 +731,12 @@ class FinvasiaFeed(MarketDataFeedBase):
                     self.logger.error(f"Instrument not found for {symbol}")
                     return
                 
-                market_data = self._convert_tick_to_market_data(tick)
+                market_data = self._convert_tick_to_market_data(tick)             
+                if not market_data:
+                    return
+                
                 self.logger.debug(f"market_data: {market_data}")
-            
+                
                 # Create market data event
                 event = MarketDataEvent(
                     instrument=instrument,
@@ -770,15 +773,15 @@ class FinvasiaFeed(MarketDataFeedBase):
         market_data = {}
         try:
             # --- Symbol and Exchange Info ---
-            if 't' in tick: market_data['symbol'] = tick['t']
+            # if 't' in tick: market_data['symbol'] = tick['t']
             if 'e' in tick: market_data['exchange'] = tick['e']
             if 'tk' in tick: market_data['token'] = tick['tk']
-            if 'ts' in tick: market_data['timestamp'] = tick['ts']
+            if 'ts' in tick: market_data['symbol'] = tick['ts']
 
             # --- Price/Quote Data ---
             if 'lp' in tick: market_data[MarketDataType.LAST_PRICE.value] = float(tick['lp'])
-            if 'pc' in tick: market_data['previous_close'] = float(tick['pc'])
-            if 'c' in tick: market_data['change'] = float(tick['c'])
+            if 'pc' in tick: market_data['percent_change'] = float(tick['pc'])
+            if 'ch' in tick: market_data['change'] = float(tick['c'])
             if 'ft' in tick: market_data['feed_time'] = tick['ft']
             
             # Finvasia uses bp1/sp1 for best bid/ask
@@ -1139,7 +1142,8 @@ class MarketDataFeed:
                     expiry_date_str=expiry_date,
                     instrument_type=instrument_type,
                     option_type=option_type,
-                    strike=strike)
+                    strike=strike,
+                    exchange=exchange)
                 
                 if option_symbol:
                     self.logger.info(f"Constructed option symbol: {option_symbol}")

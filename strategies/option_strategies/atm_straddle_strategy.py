@@ -45,8 +45,19 @@ class AtmStraddleStrategy(OptionStrategy):
         self.entry_time = self._parse_time(self.entry_time_str)
         self.exit_time = self._parse_time(self.exit_time_str)
         
-        # Underlying and option tracking
-        self.underlyings = config.get('underlyings', [])
+        # Parse underlyings (handle both old and new formats)
+        underlyings_config = config.get('underlyings', [])
+        self.underlyings = []
+        
+        if isinstance(underlyings_config, list):
+            for underlying in underlyings_config:
+                if isinstance(underlying, str):
+                    # Old format: just the symbol name
+                    self.underlyings.append(underlying)
+                elif isinstance(underlying, dict) and 'name' in underlying:
+                    # New format: dict with name and exchanges
+                    self.underlyings.append(underlying['name'])
+        
         self.expiry_offset = config.get('expiry_offset', 0)
         
         # Position tracking
@@ -59,7 +70,7 @@ class AtmStraddleStrategy(OptionStrategy):
         self.entry_pending = False
         self.exit_triggered = False
         
-        self.logger.info(f"ATM Straddle Strategy initialized with SL: {self.stop_loss_percent}%, Target: {self.target_percent}%")
+        self.logger.info(f"ATM Straddle Strategy initialized with SL: {self.stop_loss_percent}%, Target: {self.target_percent}%, Underlyings: {self.underlyings}")
     
     def _parse_time(self, time_str: str) -> dt_time:
         """Parse time string to time object"""
@@ -122,6 +133,7 @@ class AtmStraddleStrategy(OptionStrategy):
         """
         symbol = event.instrument.symbol
         current_time = datetime.now().time()
+        self.logger.info(f"Received BarEvent: {event}")
         
         # Check if this is the primary timeframe
         if event.timeframe != self.timeframe:

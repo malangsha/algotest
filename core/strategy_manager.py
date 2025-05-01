@@ -130,7 +130,7 @@ class StrategyManager:
         symbol = instrument.symbol
 
         if symbol in self.option_manager.underlying_subscriptions:
-            price = event.data.get('close') or event.data.get('last') or event.data.get('price')
+            price = event.data.get('CLOSE') or event.data.get('LAST_PRICE')
             if price:
                 self.option_manager.update_underlying_price(symbol, price)
 
@@ -386,7 +386,7 @@ class StrategyManager:
                             instrument = Instrument(symbol=symbol, exchange=exchange)
 
                             # Subscribe to the instrument
-                            self.data_manager.subscribe_to_timeframe(strategy_id, instrument, timeframe)
+                            self.data_manager.subscribe_to_timeframe(instrument, timeframe, strategy_id)
                             subscribed[timeframe].add(symbol)
                             self.logger.debug(f"Subscribed to {symbol}@{timeframe} for strategy {strategy_id}")
                         except Exception as e:
@@ -398,12 +398,21 @@ class StrategyManager:
         """
         self.logger.info("Unsubscribing from strategy symbols")
 
-        for strategy_id in self.strategies:
-            try:
-                self.data_manager.unsubscribe_from_timeframe(strategy_id)
-                self.logger.debug(f"Unsubscribed all symbols for strategy {strategy_id}")
-            except Exception as e:
-                self.logger.error(f"Error unsubscribing symbols for strategy {strategy_id}: {str(e)}")
+        for strategy_id, symbols_by_timeframe in self.strategy_symbols.items():
+            for timeframe, symbols in symbols_by_timeframe.items():
+                for symbol in symbols:
+                    try:
+                        # Get exchange from config or use default
+                        exchange = self.config.get('market', {}).get('default_exchange', 'NSE')
+                        
+                        # Create an instrument object for the symbol
+                        instrument = Instrument(symbol=symbol, exchange=exchange)
+                        
+                        # Unsubscribe from the timeframe
+                        self.data_manager.unsubscribe_from_timeframe(instrument, timeframe, strategy_id)
+                        self.logger.debug(f"Unsubscribed from {symbol}@{timeframe} for strategy {strategy_id}")
+                    except Exception as e:
+                        self.logger.error(f"Error unsubscribing from {symbol}@{timeframe} for strategy {strategy_id}: {str(e)}")
 
     def start(self):
         """
@@ -540,6 +549,12 @@ class StrategyManager:
             timeframe = strategy.timeframe
 
         try:
+            # Get exchange from config or use default
+            exchange = self.config.get('market', {}).get('default_exchange', 'NSE')
+            
+            # Create an instrument object for the symbol
+            instrument = Instrument(symbol=symbol, exchange=exchange)
+            
             # Subscribe to the symbol
             self.data_manager.subscribe_to_timeframe(strategy_id, symbol, timeframe)
 

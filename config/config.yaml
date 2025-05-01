@@ -10,8 +10,9 @@ system:
   data_dir: "data"
   output_dir: "output"
   max_threads: 20
-  heartbeat_interval: 5  # seconds
+  heartbeat_interval: 5
   max_strategy_interval: 300
+  max_market_data_staleness: 60
 
 # Logging configuration
 logging:  
@@ -53,7 +54,6 @@ logging:
   syslog_facility: 1  # LOG_USER
 
 # --- Broker Connection Configuration --- 
-# Defines how to connect to the execution broker (used by ExecutionHandler)
 broker_connections:
   # Primary connection to use for live/paper trading
   active_connection: "finvasia_live" # Name matching one of the connections below
@@ -77,13 +77,34 @@ broker_connections:
         retry_delay: 0
 
 # --- Market Data Configuration --- 
-market_data:
-  live_feed_type: "finvasia_ws" # Options: "finvasia_ws", "simulated", "zerodha_ws", etc.
-                                
-  # Source type for backtesting (used by BacktestingEngine)
-  backtest_data_source: "csv" # Options: "csv", "database", "api"
-
-  # Settings for specific feed types
+market_data:  
+  persistence:
+    enabled: true
+    path: "./data/processed"
+    interval: 60
+  
+  # Performance optimizations
+  use_cache: true
+  cache_limit: 10000
+  use_redis: false
+  thread_pool_size: 4
+  processing_queue_size: 10000
+  batch_processing: true
+  batch_size: 100
+  
+  # Greek calculation
+  calculate_greeks: true
+  greeks_risk_free_rate: 0.05
+  
+  # Timeframe configuration
+  timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "1d"
+  
+  live_feed_type: "finvasia_ws" # Options: "finvasia_ws", "simulated", "zerodha_ws", etc.  
   feed_settings:
     finvasia_ws:
       reconnect_interval: 5
@@ -104,17 +125,15 @@ market_data:
       max_price_jump: 0.02
       risk_free_rate: 0.05
 
-  # Settings for backtest data sources
-  backtest_sources:
-    csv:
-      dir: "data/historical"
-      format: "OHLCV" # Open, High, Low, Close, Volume
-    database:
-      type: "sqlite"
-      path: "data/market_data.db"
-      # Add host, port, user, pass, db_name if not sqlite
+# Redis configuration (used if market_data.use_redis is true)
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null
+  key_prefix: "market_data:"
+  ttl: 86400
 
-# --- General Market Info --- 
 market:
   default_exchange: "NSE"
   exchanges:
@@ -141,58 +160,49 @@ market:
       derivative_exchange: "NFO"
       strike_interval: 100
       expiry: "weekly"
-      atm_range: 3  # Number of strikes above and below ATM
-    - symbol: "NIFTY BANK"
-      exchange: "NSE"
-      derivative_exchange: "NFO"
+      atm_range: 1  # Number of strikes above and below ATM
+    - symbol: "SENSEX"
+      exchange: "BSE"
+      derivative_exchange: "BFO"
       strike_interval: 100
       expiry: "weekly"
-      atm_range: 3
+      atm_range: 1
 
-# --- Component Configurations --- 
-data_manager:
-  use_cache: true
-  cache_limit: 10000 # Max items per symbol in memory
-  use_redis: true
-  redis:
-    host: "localhost"
-    port: 6379
-    db: 0
-  persistence: # Settings for DataManager's own persistence (e.g., aggregated data)
-    enabled: true
-    path: "./data/processed"
-    interval: 300
-
-portfolio:
-  initial_capital: 1000000.0
-  max_leverage: 1.0 # Not strictly enforced yet, more for risk checks
-  # Max position constraints moved to risk section for centralization
-
-risk:
-  # Position Sizing Limits
-  max_position_size_pct: 0.20 # Max size as % of portfolio equity for a single position
-  max_position_value_abs: 200000 # Max absolute value (INR) for a single position
-  max_open_positions: 10
+# Option manager configuration
+option_manager:
+  cache_size: 1000
+  strike_range_count: 5
+  otm_levels: 3
+  update_interval: 60
   
-  # Exposure Limits
-  max_total_exposure_pct: 0.8 # Max total positions value / equity
+# Event manager configuration
+event_manager:
+  queue_size: 5000
+  process_sleep: 0.001
+  enable_monitoring: true
+  diagnostic_interval: 5
 
-  # Drawdown Limit
-  max_drawdown_pct: 0.10 # 10% max drawdown from peak equity
+# Portfolio configuration
+portfolio:
+  initial_capital: 1000000
+  base_currency: "INR"
+  risk_free_rate: 0.04
+  benchmark: "NIFTY"
+  reporting:
+    daily_email: false
+    recipient: "malangshah@gmail.com"
 
-  # Position Sizing Model (used by RiskManager to suggest size, might be overridden by strategy)
-  position_sizing_model: "percent_risk" # Options: "fixed_fraction", "percent_risk", "fixed_risk", "kelly"
-  sizing_params:
-    fixed_fraction: 0.05 # e.g., 5% of portfolio value per trade
-    percent_risk: 0.01 # e.g., Risk 1% of portfolio value per trade (needs stop-loss)
-    fixed_risk_amount: 1000 # e.g., Risk $1000 per trade (needs stop-loss)
-    kelly_fraction: 0.5 # e.g., Use half-Kelly sizing (needs win_rate, win_loss_ratio)
-    # Volatility adjusted sizing might need more params
-
-  # Strategy Level Limits (Optional: Can be overridden in strategy config)
-  strategy_defaults:
-    max_daily_trades: 50
-    max_daily_loss_pct: 0.02 # 2% max loss per day for a strategy
+# Risk management configuration
+risk_management:
+  max_drawdown: 0.05
+  max_daily_loss: 0.03
+  max_position_size: 0.1
+  max_open_orders: 10
+  max_leverage: 2.0
+  position_sizing:
+    default: "fixed"
+    fixed_size: 1
+    percent_capital: 0.02
 
 performance:
   benchmark: "NIFTY 50"
@@ -223,21 +233,23 @@ backtest:
     model: "percentage"
     value: 0.001 # 0.1%
 
-live: # Specific settings for live mode
-  paper_trading: true # Set to true to enable paper trading simulation in FinvasiaBroker
-  allow_shorting: false
+# Live trading specific configuration
+live:
   emergency_stop_on_broker_failure: false
-  notifications:
-    enable: false
-    # ... notification settings ...
+  reconnect_interval: 30
+  recovery_mode: "conservative"
+  paper_trading_settings:
+    slippage: 0.0001  # 1 basis point of slippage
+    commission: 0.0005  # 5 basis points of commission
 
+# Event manager configuration
 event_manager:
-  max_queue_size: 10000
-  # workers: 10 # Removed, using single processing thread for simplicity now
+  queue_size: 5000
+  process_sleep: 0.001
+  enable_monitoring: true
+  diagnostic_interval: 5
 
 # --- Instruments --- 
-# Define available instruments here. Strategies will select from this list.
-# More detailed definitions might be loaded dynamically from broker/files.
 # instruments:
 #   - symbol: "RELIANCE-EQ"
 #     id: "RELIANCE" # Unique ID if needed, otherwise symbol is used
@@ -247,15 +259,5 @@ event_manager:
 #     currency: "INR"
 #     tick_size: 0.05
 #     lot_size: 1
-#     is_tradable: true
-
-#   - symbol: "NIFTY17APR25C22800"
-#     id: "NIFTY17APR25C22800"
-#     instrument_type: "OPT"
-#     exchange: "NFO"
-#     asset_type: "options"
-#     currency: "INR"
-#     tick_size: 0.05
-#     lot_size: 75
 #     is_tradable: true
 

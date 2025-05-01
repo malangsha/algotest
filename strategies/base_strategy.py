@@ -437,9 +437,23 @@ class OptionStrategy(ABC):
         # For now, we'll just use the data manager directly
         success = self.data_manager.subscribe(symbol)
         
+        # Subscribe to all timeframes for this symbol
         if success:
             self.active_subscriptions.add(symbol)
-            self.logger.info(f"Subscribed to {symbol}")
+            
+            # Subscribe to all required timeframes for the symbol directly
+            for timeframe in self.all_timeframes:
+                # Pass the symbol string directly to subscribe_to_timeframe
+                # which will handle the instrument creation internally
+                success = self.data_manager.subscribe_to_timeframe(
+                    symbol,  # Pass the string directly
+                    timeframe, 
+                    self.id
+                )
+                if not success:
+                    self.logger.warning(f"Failed to subscribe to timeframe {timeframe} for {symbol}")
+            
+            self.logger.info(f"Subscribed to {symbol} with timeframes {self.all_timeframes}")
         else:
             self.logger.error(f"Failed to subscribe to {symbol}")
             
@@ -483,6 +497,7 @@ class OptionStrategy(ABC):
             data: Option data
         """
         self.option_data[symbol] = data
+        self.logger.info(f"Updated option data for {symbol}: option_data = {self.option_data[symbol]}")
 
     def get_status(self) -> Dict[str, Any]:
         """

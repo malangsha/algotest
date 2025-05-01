@@ -7,6 +7,7 @@ import argparse
 import logging
 import signal
 import atexit
+import warnings
 from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
 
@@ -17,6 +18,8 @@ from live.live_engine import LiveEngine
 from utils.constants import MODES
 from utils.exceptions import ConfigError
 from core.logging_manager import setup_logging, get_logger
+
+warnings.simplefilter("ignore", FutureWarning)
 
 # Global variables for engine management
 current_engine = None

@@ -63,9 +63,9 @@ class StrategyManager:
         self.strategy_configs = {}  # strategy_id -> config
 
         # Symbol tracking
-        self.strategy_symbols = {}  # strategy_id -> {timeframe -> set(symbols)}
+        self.strategy_symbols = {}   # strategy_id -> {timeframe -> set(symbols)}
         self.symbol_strategies = {}  # symbol -> {timeframe -> set(strategy_ids)}
-        self.strategy_options = {}  # strategy_id -> {index -> list(option_reqs)}
+        self.strategy_options = {}   # strategy_id -> {index -> list(option_reqs)}
 
         # Initialize strategy factory
         self.strategy_factory = StrategyFactory()

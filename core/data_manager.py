@@ -434,107 +434,6 @@ class DataManager:
             self.logger.error(f"Error processing market data for {key}: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
-    def _calculate_option_greeks(self, instrument: Instrument, option_price: float, timestamp: float) -> Optional[Tuple[Dict[str, float], float]]:
-        """
-        Calculate option Greeks and implied volatility.
-        
-        Args:
-            instrument: Option instrument object
-            option_price: Current price of the option
-            timestamp: Current timestamp in milliseconds
-            
-        Returns:
-            Optional[Tuple[Dict[str, float], float]]: Tuple containing Greeks dictionary and implied volatility, or None if calculation fails
-        """
-        if not instrument or instrument.instrument_type != InstrumentType.OPTION:
-            return None
-            
-        try:
-            # Get option details
-            option_type = instrument.option_type.lower() # Ensure lowercase 'call' or 'put'
-            strike_price = instrument.strike
-            expiry_date_str = instrument.expiry_date # Assuming YYYY-MM-DD format
-            
-            # Get underlying symbol
-            underlying_symbol = getattr(instrument, 'underlying_symbol', None) # Assuming underlying_symbol attribute exists
-            if not underlying_symbol:
-                # Attempt to infer from option symbol if needed (complex and provider-specific)
-                self.logger.debug(f"Underlying symbol not directly available for {instrument.symbol}")
-                # Placeholder: Infer underlying logic needed here based on symbol convention
-                # e.g., underlying_symbol = infer_underlying(instrument.symbol)
-                # For now, return None if not explicitly set
-                return None
-                
-            # Get underlying price
-            underlying_price = self._get_underlying_price(underlying_symbol)
-            if underlying_price is None:
-                self.logger.debug(f"Underlying price not available for {underlying_symbol} needed for {instrument.symbol} greeks")
-                return None
-                
-            # Calculate time to expiry
-            expiry_dt = datetime.strptime(expiry_date_str, '%Y-%m-%d')
-            # Make expiry timezone-aware (assuming UTC for simplicity, adjust if needed)
-            # expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-            # Use end of day for expiry calculation (e.g., 15:30 market close)
-            expiry_dt_eod = expiry_dt.replace(hour=15, minute=30, second=0, microsecond=0)
-            
-            current_dt = datetime.fromtimestamp(timestamp / 1000.0)
-            # Make current time timezone-aware
-            # current_dt = current_dt.replace(tzinfo=timezone.utc)
-            
-            time_diff = expiry_dt_eod - current_dt
-            time_to_expiry_years = max(0.0, time_diff.total_seconds() / (365.25 * 24 * 60 * 60)) # Use 365.25 for accuracy
-            
-            if time_to_expiry_years <= 1e-6: # Use a small epsilon instead of 0
-                 self.logger.debug(f"Option {instrument.symbol} expired or too close to expiry for Greeks calculation.")
-                 # Return intrinsic value based greeks for expired options
-                 delta = 0.0
-                 if option_type == 'call':
-                     delta = 1.0 if underlying_price > strike_price else 0.0
-                 elif option_type == 'put':
-                     delta = -1.0 if underlying_price < strike_price else 0.0
-                 return ({'delta': delta, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'rho': 0.0}, 0.0)
-
-            # --- Implied Volatility Calculation (Placeholder/Simple Version) ---
-            # TODO: Implement a proper IV solver (e.g., Newton-Raphson or Brent's method)
-            # This requires an option pricing function (e.g., Black-Scholes)
-            # For now, using a placeholder or potentially fetching from data if available.
-            implied_volatility = instrument.implied_volatility if hasattr(instrument, 'implied_volatility') and instrument.implied_volatility else 0.20 # Default placeholder 20%
-            # If IV calculation is needed:
-            # from utils.implied_volatility import calculate_implied_volatility
-            # implied_volatility = calculate_implied_volatility(
-            #     option_price=option_price,
-            #     underlying_price=underlying_price,
-            #     strike_price=strike_price,
-            #     time_to_expiry=time_to_expiry_years,
-            #     risk_free_rate=self.greeks_risk_free_rate,
-            #     option_type=option_type
-            # )
-            # if implied_volatility is None:
-            #     self.logger.warning(f"Could not calculate IV for {instrument.symbol}, using placeholder.")
-            #     implied_volatility = 0.20 # Fallback placeholder
-            # ------------------------------------------------------------------
-
-            risk_free_rate = self.greeks_risk_free_rate
-            
-            # Calculate Greeks using the determined IV
-            greeks = OptionsGreeksCalculator.calculate_greeks(
-                option_type=option_type,
-                underlying_price=underlying_price,
-                strike_price=strike_price,
-                time_to_expiry=time_to_expiry_years,
-                risk_free_rate=risk_free_rate,
-                volatility=implied_volatility # Use the calculated or fetched IV
-            )
-            
-            # Return both Greeks and the volatility used
-            return greeks, implied_volatility
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating Greeks for {instrument.symbol}: {str(e)}")
-            import traceback
-            self.logger.debug(traceback.format_exc())
-            return None
 
     def _get_underlying_price(self, underlying_symbol: str) -> Optional[float]:
         """
@@ -634,7 +533,7 @@ class DataManager:
             new_row.set_index('timestamp', inplace=True)
             
             # Concatenate with existing data
-            self.one_minute_data[key] = pd.concat([self.one_minute_data[key], new_row])
+            self.one_minute_data[key] = pd.concat([self.one_minute_data[key], new_row], ignore_index=False, sort=False)
             
             # Check if we need to persist this 1-minute data
             # If it's been more than the persistence interval since the last persistence for this symbol
@@ -956,9 +855,9 @@ class DataManager:
                     existing_df = pd.read_parquet(file_path)
                     
                     # Combine and deduplicate
-                    date_df.set_index('timestamp', inplace=True)
-                    combined_df = pd.concat([existing_df, date_df])
-                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                    date_df.set_index("timestamp", inplace=True)
+                    combined_df = pd.concat([existing_df, date_df], ignore_index=False, sort=False)
+                    combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
                     
                     # Sort by timestamp
                     combined_df.sort_index(inplace=True)

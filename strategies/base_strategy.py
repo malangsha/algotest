@@ -445,46 +445,96 @@ class OptionStrategy(ABC):
             
         return 'long' if position.quantity > 0 else 'short'
 
-    def request_symbol(self, symbol: str) -> bool:
+    def request_symbol(self, symbol: str, exchange: str = None) -> bool:
         """
-        Request subscription to a symbol.
+        Request subscription to a symbol, optionally specifying the exchange.
 
         Args:
             symbol: Symbol to subscribe to
+            exchange: (Optional) Exchange for the symbol (e.g., "NSE", "BSE")
 
         Returns:
             bool: True if subscription was successful, False otherwise
         """
         # Add to used symbols
         self.used_symbols.add(symbol)
+
+        # Determine the exchange to use
+        target_exchange = exchange
+        if not target_exchange:
+            # Try to find exchange info from config if not provided
+            main_underlyings = self.config.get("main_config", {}).get("market", {}).get("underlyings", [])
+            found_conf = next((uc for uc in main_underlyings if uc.get("symbol") == symbol), None)
+            if found_conf:
+                target_exchange = found_conf.get("exchange")
+            else:
+                # Fallback to default exchange from main config if still not found
+                target_exchange = self.config.get("main_config", {}).get("market", {}).get("default_exchange", "NSE")
+                self.logger.warning(f"Exchange not specified for {symbol} and not found in config, defaulting to {target_exchange}")
+
+        # Create Instrument object
+        # We need to determine AssetClass and InstrumentType, this might require more info
+        # For now, assume EQUITY or INDEX based on symbol? This is fragile.
+        # Let DataManager handle instrument creation/lookup based on symbol and exchange.
+        # For now, we pass symbol and exchange to a potential new DataManager method.
+
+        # --- Modification needed in DataManager --- 
+        # Assuming DataManager will have a method like subscribe_instrument_by_symbol
+        # success = self.data_manager.subscribe_instrument_by_symbol(symbol, target_exchange)
         
-        # Request subscription through the strategy manager
-        # This would typically be done through a strategy manager instance
-        # For now, we'll just use the data manager directly
-        success = self.data_manager.subscribe(symbol)
-        
-        # Subscribe to all timeframes for this symbol
+        # --- Temporary approach: Pass symbol and exchange to existing subscribe_to_timeframe --- 
+        # This assumes subscribe_to_timeframe can handle instrument lookup/creation
+        success = False
+        instrument = None
+        try:
+            # Attempt to get/create instrument via DataManager
+            instrument = self.data_manager.get_instrument(symbol, exchange=target_exchange)
+            if not instrument:
+                 self.logger.error(f"Could not get or create instrument for {symbol} on {target_exchange}")
+                 return False
+                 
+            # Use a potential subscribe_instrument method in DataManager
+            if hasattr(self.data_manager, "subscribe_instrument"):
+                 success = self.data_manager.subscribe_instrument(instrument)
+            else:
+                 # Fallback: Try subscribing via market_data_feed if accessible (not ideal)
+                 if hasattr(self.data_manager, "market_data_feed") and self.data_manager.market_data_feed:
+                     results = self.data_manager.market_data_feed.subscribe_symbols([instrument])
+                     success = results.get(instrument.symbol, False)
+                 else:
+                     self.logger.error("DataManager has no subscribe_instrument method or market_data_feed")
+                     return False
+
+        except Exception as e:
+            self.logger.error(f"Error during instrument creation/subscription for {symbol} on {target_exchange}: {e}")
+            return False
+
+        # Subscribe to all timeframes for this symbol if underlying subscription was successful
         if success:
-            self.active_subscriptions.add(symbol)
+            self.active_subscriptions.add(symbol) # Should perhaps store instrument key?
             
             # Subscribe to all required timeframes for the symbol directly
+            timeframe_success = True
             for timeframe in self.all_timeframes:
-                # Pass the symbol string directly to subscribe_to_timeframe
-                # which will handle the instrument creation internally
-                success = self.data_manager.subscribe_to_timeframe(
-                    symbol,  # Pass the string directly
+                # Pass the instrument object to subscribe_to_timeframe
+                tf_sub_success = self.data_manager.subscribe_to_timeframe(
+                    instrument, # Pass the Instrument object
                     timeframe, 
                     self.id
                 )
-                if not success:
-                    self.logger.warning(f"Failed to subscribe to timeframe {timeframe} for {symbol}")
+                if not tf_sub_success:
+                    self.logger.warning(f"Failed to subscribe to timeframe {timeframe} for {instrument.symbol}")
+                    timeframe_success = False
             
-            self.logger.info(f"Subscribed to {symbol} with timeframes {self.all_timeframes}")
+            if timeframe_success:
+                self.logger.info(f"Subscribed to {instrument.symbol} ({target_exchange}) with timeframes {self.all_timeframes}")
+            else:
+                 self.logger.warning(f"Subscribed to {instrument.symbol} ({target_exchange}), but failed for some timeframes.")
+
         else:
-            self.logger.error(f"Failed to subscribe to {symbol}")
+            self.logger.error(f"Failed to subscribe to {symbol} on {target_exchange}")
             
         return success
-
     def request_option(self, index_symbol: str, strike: float, option_type: str) -> bool:
         """
         Request subscription to a specific option.

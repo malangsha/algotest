@@ -46,17 +46,31 @@ class AtmStraddleStrategy(OptionStrategy):
         self.exit_time = self._parse_time(self.exit_time_str)
         
         # Parse underlyings (handle both old and new formats)
-        underlyings_config = config.get('underlyings', [])
-        self.underlyings = []
-        
+        underlyings_config = config.get("underlyings", [])
+        self.underlyings_info = [] # Store dicts: {'symbol': 'SENSEX', 'exchange': 'BSE', ...}
+        self.underlyings = [] # Keep list of symbols for backward compatibility/simplicity in some places
+
         if isinstance(underlyings_config, list):
-            for underlying in underlyings_config:
-                if isinstance(underlying, str):
-                    # Old format: just the symbol name
-                    self.underlyings.append(underlying)
-                elif isinstance(underlying, dict) and 'name' in underlying:
-                    # New format: dict with name and exchanges
-                    self.underlyings.append(underlying['name'])
+            for underlying_conf in underlyings_config:
+                if isinstance(underlying_conf, str):
+                    # Old format: just the symbol name - try to find exchange in main config
+                    # This requires access to the main config, which might not be ideal here.
+                    # For now, assume default exchange or handle later if needed.
+                    # Let's log a warning.
+                    self.logger.warning(f"Underlying '{underlying_conf}' specified as string. Exchange info missing. Assuming default.")
+                    # Attempt to find it in the main config's underlyings section
+                    main_underlyings = self.config.get('main_config', {}).get('market', {}).get('underlyings', [])
+                    found_conf = next((uc for uc in main_underlyings if uc.get('symbol') == underlying_conf), None)
+                    if found_conf:
+                        self.underlyings_info.append(found_conf)
+                        self.underlyings.append(underlying_conf)
+                    else:
+                         self.logger.error(f"Could not find exchange info for underlying '{underlying_conf}' in main config.")
+
+                elif isinstance(underlying_conf, dict) and 'symbol' in underlying_conf and 'exchange' in underlying_conf:
+                    # New format: dict with symbol and exchange
+                    self.underlyings_info.append(underlying_conf)
+                    self.underlyings.append(underlying_conf['symbol']) # Keep symbol list
         
         self.expiry_offset = config.get('expiry_offset', 0)
         
@@ -88,9 +102,16 @@ class AtmStraddleStrategy(OptionStrategy):
         self.exit_triggered = False
         self.position_opened = False
         
-        # Subscribe to all required underlyings
-        for underlying in self.underlyings:
-            self.request_symbol(underlying)
+        # Subscribe to all required underlyings using the stored info
+        for underlying_info in self.underlyings_info:
+            symbol = underlying_info.get("symbol")
+            exchange = underlying_info.get("exchange")
+            if symbol and exchange:
+                self.request_symbol(symbol, exchange=exchange)
+            elif symbol:
+                # Fallback if exchange info is missing (should have been handled in __init__)
+                self.logger.warning(f"Requesting symbol {symbol} without explicit exchange.")
+                self.request_symbol(symbol)
         
         self.logger.info(f"ATM Straddle Strategy started, waiting for entry time: {self.entry_time_str}")
     

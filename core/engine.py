@@ -159,9 +159,18 @@ class TradingEngine:
         # Initialize core components
         self.data_manager = DataManager(self.config, self.event_manager, self.broker)    
         
+        # # Initialize position and portfolio management        
+        self.position_manager = PositionManager(self.event_manager)        
+        self.portfolio = Portfolio(self.config, self.position_manager)
+        self.risk_manager = RiskManager(self.portfolio, self.config)
+        self.order_manager = OrderManager(self.event_manager, self.risk_manager)
+
         # Initialize OptionManager for option trading functionality
-        self.option_manager = OptionManager(self.data_manager, self.event_manager, self.config)
-        self.logger.info("Option Manager initialized")
+        self.option_manager = OptionManager(self.data_manager, 
+                                            self.event_manager, 
+                                            self.position_manager, 
+                                            self.config)
+        self.logger.info("Option manager initialized")
         
         # Configure indices from market config
         market_config = self.config.get('market', {})
@@ -172,12 +181,6 @@ class TradingEngine:
         else:
             self.logger.debug("No underlyings configuration found in config")
         
-        # Initialize position and portfolio management
-        self.position_manager = PositionManager(self.event_manager)
-        self.portfolio = Portfolio(self.config, self.position_manager)
-        self.risk_manager = RiskManager(self.portfolio, self.config)
-        self.order_manager = OrderManager(self.event_manager, self.risk_manager)
-        
         # Initialize StrategyManager to handle strategy lifecycle
         self.strategy_manager = StrategyManager(
             data_manager=self.data_manager,
@@ -187,7 +190,7 @@ class TradingEngine:
             broker=self.broker,
             config=self.config
         )
-        self.logger.info("Strategy Manager initialized")
+        self.logger.info("Strategy manager initialized")
         
         # Set OptionManager in StrategyManager
         self.strategy_manager.option_manager = self.option_manager

@@ -29,19 +29,21 @@ class OptionManager:
     Optimized for low-latency and high-throughput option data processing.
     """
     
-    def __init__(self, data_manager, event_manager, config: Dict[str, Any], cache_size=1000):
+    def __init__(self, data_manager, event_manager, position_manager, config: Dict[str, Any], cache_size=1000):
         """
         Initialize the Option Manager.
         
         Args:
             data_manager: Data manager instance for market data operations
             event_manager: Event manager for publishing/subscribing to events
+            position_manager: Position manager instance for checking open positions
             config: Configuration dictionary
             cache_size: Size of LRU cache for option calculations
         """
         self.logger = get_logger("core.option_manager")
         self.data_manager = data_manager
         self.event_manager = event_manager
+        self.position_manager = position_manager # Store position manager
         self.config = config
         
         # Dictionaries to store option data and subscriptions
@@ -424,7 +426,7 @@ class OptionManager:
             
         Returns:
             List[str]: List of subscribed option symbols
-        """
+        """       
         with self.lock:
             if underlying_symbol not in self.underlying_prices:
                 self.logger.warning(f"Cannot subscribe to ATM options for {underlying_symbol}: price not available")
@@ -676,13 +678,18 @@ class OptionManager:
                 if symbol not in potential_set:
                     # Check if we have open positions before unsubscribing (IMPORTANT)
                     should_unsubscribe = True
-                    
-                    
-                    # TODO: Check with position_manager if this option has open positions
-                    # If hasattr(self, 'position_manager') and self.position_manager:
-                    #    if self.position_manager.has_open_position(symbol):
-                    #        should_unsubscribe = False
-                    #        self.logger.info(f"Keeping subscription to {symbol} because it has open positions")
+                    if hasattr(self, 'position_manager') and self.position_manager:
+                        # Construct the symbol key expected by position manager (e.g., EXCHANGE:SYMBOL)
+                        # Assuming the 'symbol' here is the broker-specific trading symbol
+                        # We might need to parse it or get the instrument object first
+                        # For now, let's assume position_manager can handle the raw symbol
+                        # or we need a helper to get the standard key
+                        # Example: instrument = self.data_manager.get_instrument(symbol) # Get instrument if needed
+                        # symbol_key = instrument.instrument_id if instrument else symbol
+                        symbol_key = symbol # Assuming symbol is sufficient for now
+                        if self.position_manager.has_open_position(symbol_key):
+                            should_unsubscribe = False
+                            self.logger.info(f"Keeping subscription to {symbol} because it has open positions")
                     
                     if should_unsubscribe:
                         symbols_to_unsubscribe.append(symbol)
@@ -843,6 +850,8 @@ class OptionManager:
                     self.logger.error(f"Failed to subscribe to underlying {underlying_symbol}")
                     continue
                     
+                self.underlying_subscriptions.add(underlying_symbol)
+                
                 # Subscribe to initial ATM options
                 self.subscribe_atm_options(underlying_symbol)
                 

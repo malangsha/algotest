@@ -1,3 +1,0 @@
-Exchange,Token,LotSize,Symbol,TradingSymbol,Instrument,TickSize
-BSE,1,1,SENSEX,SENSEX,UNDIND,0.05
-BSE,12,1,BANKEX,BANKEX,UNDIND,0.05

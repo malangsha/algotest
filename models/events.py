@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import uuid
 import logging
+import time
 from enum import Enum
 
 from utils.constants import Exchange, OrderType, OrderSide, OrderStatus, SignalType, EventType, MarketDataType, EventPriority, TimeframeEventType
@@ -1325,3 +1326,18 @@ class RiskBreachEvent(Event):
             message=data.get("message"),
             data=data.get("data", {})
         )
+
+# --- Define OptionsSubscribedEvent if not available ---
+# Create a placeholder if the actual event class is not accessible
+# In a real scenario, this should be in models/events.py
+class OptionsSubscribedEvent(Event):
+    """Event published when new option symbols have been subscribed."""
+    def __init__(self, underlying_symbol: str, instruments: List[Instrument]):
+        super().__init__(event_type=EventType.CUSTOM, # Or a dedicated EventType.OPTIONS_SUBSCRIBED
+                         timestamp=time.time())
+        self.underlying_symbol = underlying_symbol
+        self.instruments = instruments # List of Instrument objects subscribed
+        # Add a specific sub-type if using EventType.CUSTOM
+        self.custom_event_type = "OPTIONS_SUBSCRIBED"
+
+# ------------------------------------------------------

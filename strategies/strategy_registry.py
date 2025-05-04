@@ -49,13 +49,20 @@ class StrategyRegistry:
             Strategy class if found, None otherwise
         """
         if strategy_type not in cls._strategies:
-            # Try to dynamically import the module
+            # First try to import from strategies.{strategy_type}
             try:
                 module_name = f"strategies.{strategy_type}"
                 importlib.import_module(module_name)
             except ImportError:
-                logger.error(f"Could not import strategy module: {module_name}")
-                return None
+                logger.info(f"Could not import strategy module: {module_name}")
+                
+                # If first import fails, try strategies.option_strategies.{strategy_type}
+                try:
+                    module_name = f"strategies.option_strategies.{strategy_type}"
+                    importlib.import_module(module_name)
+                except ImportError:
+                    logger.error(f"Could not import strategy module: {module_name}")
+                    return None
                 
         return cls._strategies.get(strategy_type)
     

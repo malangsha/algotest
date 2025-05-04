@@ -164,6 +164,7 @@ class TradingEngine:
         self.portfolio = Portfolio(self.config, self.position_manager)
         self.risk_manager = RiskManager(self.portfolio, self.config)
         self.order_manager = OrderManager(self.event_manager, self.risk_manager)
+        self.performance_tracker = PerformanceTracker(self.portfolio, self.config)
 
         # Initialize OptionManager for option trading functionality
         self.option_manager = OptionManager(self.data_manager, 
@@ -172,14 +173,14 @@ class TradingEngine:
                                             self.config)
         self.logger.info("Option manager initialized")
         
-        # Configure indices from market config
-        market_config = self.config.get('market', {})
-        underlyings_config = market_config.get('underlyings', [])
-        if underlyings_config:
-            self.logger.info(f"Configuring {len(underlyings_config)} underlyings in Option Manager")
-            self.option_manager.configure_underlyings(underlyings_config)
-        else:
-            self.logger.debug("No underlyings configuration found in config")
+        # # Configure indices from market config
+        # market_config = self.config.get('market', {})
+        # underlyings_config = market_config.get('underlyings', [])
+        # if underlyings_config:
+        #     self.logger.info(f"Configuring {len(underlyings_config)} underlyings in Option Manager")
+        #     self.option_manager.configure_underlyings(underlyings_config)
+        # else:
+        #     self.logger.debug("No underlyings configuration found in config")
         
         # Initialize StrategyManager to handle strategy lifecycle
         self.strategy_manager = StrategyManager(
@@ -199,8 +200,6 @@ class TradingEngine:
         if self.strategy_config:
             self.strategy_manager.load_config(self.strategy_config, self.config)
             self.logger.info("Strategy configurations loaded")
-            
-        self.performance_tracker = PerformanceTracker(self.portfolio, self.config)
 
         # Assuming broker acts as the primary data source connection point
         self.data_source = self.broker 
@@ -256,54 +255,55 @@ class TradingEngine:
 
         self.logger.info("Trading Engine initialized")
 
-    def initialize(self):
-        """
-        Initialize the trading engine components.
-        """
-        self.logger.info("Initializing engine components")
+    # NOT USED
+    # def initialize(self):
+    #     """
+    #     Initialize the trading engine components.
+    #     """
+    #     self.logger.info("Initializing engine components")
 
-        # Only create the universe handler if it doesn't exist and is needed
-        # if not hasattr(self, 'universe_handler') or self.universe_handler is None:
-        #     self.universe_handler = UniverseHandler(self.data_source)
+    #     # Only create the universe handler if it doesn't exist and is needed
+    #     # if not hasattr(self, 'universe_handler') or self.universe_handler is None:
+    #     #     self.universe_handler = UniverseHandler(self.data_source)
 
-        # Set the event manager for the broker
-        if self.broker:
-            if hasattr(self.broker, 'set_event_manager'):
-                self.broker.set_event_manager(self.event_manager)
-                self.logger.info("Event manager set for the broker")
-            else:
-                 self.logger.warning("Broker does not have 'set_event_manager' method.")
+    #     # Set the event manager for the broker
+    #     if self.broker:
+    #         if hasattr(self.broker, 'set_event_manager'):
+    #             self.broker.set_event_manager(self.event_manager)
+    #             self.logger.info("Event manager set for the broker")
+    #         else:
+    #              self.logger.warning("Broker does not have 'set_event_manager' method.")
 
 
-        # Load instruments
-        self._load_instruments()
+    #     # Load instruments
+    #     self._load_instruments()
 
-        # Start the event manager processing loop
-        self.event_manager.start()
+    #     # Start the event manager processing loop
+    #     self.event_manager.start()
 
-        # Set up event handlers within this engine
-        self._subscribe_to_events()
+    #     # Set up event handlers within this engine
+    #     self._subscribe_to_events()
 
-        # Load strategies (initializes and gets active instruments)
-        self._load_strategies()
+    #     # Load strategies (initializes and gets active instruments)
+    #     self._load_strategies()
 
-        # Connect to broker
-        if self.broker and hasattr(self.broker, 'connect'):
-            try:
-                self.broker.connect()
-            except Exception as e:
-                self.logger.error(f"Error connecting to broker: {str(e)}")
-                # Consider if initialization should fail here
+    #     # Connect to broker
+    #     if self.broker and hasattr(self.broker, 'connect'):
+    #         try:
+    #             self.broker.connect()
+    #         except Exception as e:
+    #             self.logger.error(f"Error connecting to broker: {str(e)}")
+    #             # Consider if initialization should fail here
 
-        # Start ExecutionHandler if it has a start method
-        if hasattr(self.execution_handler, 'start'):
-             self.execution_handler.start()
+    #     # Start ExecutionHandler if it has a start method
+    #     if hasattr(self.execution_handler, 'start'):
+    #          self.execution_handler.start()
 
-        # Start PaperTradingSimulator if it exists and has start method
-        if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'start'):
-            self.paper_trading_simulator.start()
+    #     # Start PaperTradingSimulator if it exists and has start method
+    #     if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'start'):
+    #         self.paper_trading_simulator.start()
 
-        self.logger.info("Engine initialization complete")
+    #     self.logger.info("Engine initialization complete")
 
     def _initialize_broker(self):
         """Initialize the broker based on configuration."""
@@ -446,7 +446,7 @@ class TradingEngine:
             event: Market data event
         """
         try:
-            self.logger.debug(f"Received MarketDataEvent: {event}")
+            # self.logger.debug(f"Received MarketDataEvent: {event}")
             # Basic validation
             if not isinstance(event, MarketDataEvent) or not hasattr(event, 'instrument') or not hasattr(event.instrument, 'symbol'):
                 self.logger.warning(f"Invalid MarketDataEvent received: {event}")
@@ -459,7 +459,7 @@ class TradingEngine:
             if hasattr(event, 'data'):
                 self.market_data[symbol] = event.data
             
-            self.logger.debug(f"Updated market data cache for {symbol}: {event.data_type}")
+            # self.logger.debug(f"Updated market data cache for {symbol}: {event.data_type}")
 
         except Exception as e:
             self.logger.error(f"Error updating market data cache for {getattr(event, 'instrument', 'N/A')}: {e}", exc_info=True)

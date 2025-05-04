@@ -150,13 +150,13 @@ class LiveEngine(TradingEngine):
         Args:
             event: Market data event
         """
-        self.logger.debug(f"Received MarketDataEvent: {event}")
+        # self.logger.debug(f"Received MarketDataEvent: {event}")
         # Update last tick time
         self.metrics["last_tick_time"] = datetime.now()
         self.metrics["tick_count"] += 1
 
         # forward to the normal event processing mechanism
-        self.logger.info(f"forwarding market data event to parent engine for futher processing")
+        # self.logger.info(f"forwarding market data event to parent engine for futher processing")
         super()._on_market_data(event)
 
     def _on_trade_event(self, event: TradeEvent):

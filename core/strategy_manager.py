@@ -8,7 +8,6 @@ This module provides the central component for strategy management including:
 - Data distribution to strategies
 """
 
-import logging
 import threading
 import time
 import yaml
@@ -19,18 +18,19 @@ import inspect
 from pathlib import Path
 from datetime import datetime
 import concurrent.futures
+from collections import defaultdict
 
 from core.option_manager import OptionManager
 from core.event_manager import EventManager
-from models.events import Event, EventType, MarketDataEvent, SignalEvent, BarEvent, SignalType
+from models.events import Event, EventType, MarketDataEvent, SignalEvent, BarEvent, OptionsSubscribedEvent
 from strategies.base_strategy import OptionStrategy
-from utils.config_loader import load_config
+# from utils.config_loader import load_config
 from core.logging_manager import get_logger
 from strategies.strategy_factory import StrategyFactory
 from strategies.strategy_registry import StrategyRegistry
-from models.instrument import Instrument
+from models.instrument import Instrument, AssetClass
 from models.position import Position
-from utils.constants import EventPriority
+from utils.constants import EventPriority, Exchange, SignalType
 
 class StrategyManager:
     """
@@ -41,14 +41,6 @@ class StrategyManager:
     def __init__(self, data_manager, event_manager, portfolio_manager, risk_manager, broker, config=None):
         """
         Initialize the StrategyManager.
-
-        Args:
-            data_manager: DataManager instance for market data
-            event_manager: EventManager for event handling
-            portfolio_manager: PortfolioManager for position tracking
-            risk_manager: RiskManager for risk checks
-            broker: Broker for trading operations
-            config: Configuration dictionary
         """
         self.logger = get_logger("core.strategy_manager")
         self.data_manager = data_manager
@@ -56,87 +48,142 @@ class StrategyManager:
         self.portfolio_manager = portfolio_manager
         self.risk_manager = risk_manager
         self.broker = broker
-        self.config = config
+        self.config = config # Main config dictionary
 
         # Strategy storage
-        self.strategies = {}  # strategy_id -> Strategy instance
-        self.strategy_configs = {}  # strategy_id -> config
+        self.strategies: Dict[str, OptionStrategy] = {}  # strategy_id -> Strategy instance
+        self.strategy_configs: Dict[str, Dict] = {}  # strategy_id -> config dict from strategies.yaml
 
-        # Symbol tracking
-        self.strategy_symbols = {}   # strategy_id -> {timeframe -> set(symbols)}
-        self.symbol_strategies = {}  # symbol -> {timeframe -> set(strategy_ids)}
-        self.strategy_options = {}   # strategy_id -> {index -> list(option_reqs)}
+        # Symbol tracking (using symbol_key like "NSE:RELIANCE" or "NFO:NIFTY...")
+        # Stores symbols explicitly defined by strategy OR dynamically added options
+        self.strategy_symbols: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set)) # strategy_id -> {timeframe -> set(symbol_keys)}
+        # Reverse mapping for efficient event distribution
+        self.symbol_strategies: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set)) # symbol_key -> {timeframe -> set(strategy_ids)}
 
-        # Initialize strategy factory
-        self.strategy_factory = StrategyFactory()
+        # Store which strategies need dynamic options for which underlying
+        self.strategy_dynamic_underlyings: Dict[str, Set[str]] = defaultdict(set) # strategy_id -> set(underlying_symbols)
 
-        # Use the OptionManager instance passed from TradingEngine
-        self.option_manager = None  # Will be set by TradingEngine
+        # OptionManager instance - MUST be set after initialization
+        self.option_manager: Optional[OptionManager] = None
 
-        # Configuration
-        self.underlyings_config = None
-        self.main_config = None
-
-        # Underlying price updates
-        self._register_event_handlers()
+        # Configuration storage
+        self.underlyings_config: List[Dict] = [] # From main config.yaml market.underlyings
+        self.strategies_yaml_config: Dict = {} # From strategies.yaml
 
         # Background threads
         self.monitoring_thread = None
         self.stop_event = threading.Event()
 
-        # Initialize strategy registry
+        # Initialize strategy registry and factory
         self.strategy_registry = StrategyRegistry()
+        self.strategy_factory = StrategyFactory() # May not be needed if using registry directly
 
         # Thread pool for parallel strategy processing
-        self.strategy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.get('strategy_processing_workers', 4))
+        strategy_workers = self.config.get('system', {}).get('strategy_processing_workers', 4)
+        self.strategy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=strategy_workers, thread_name_prefix='StrategyWorker')
 
-        self.logger.info("Strategy Manager initialized")
+        # Lock for thread safety when modifying shared structures
+        self.lock = threading.RLock()
+
+        self._register_event_handlers()
+        self.logger.info("Strategy manager initialized")
+
+    def set_option_manager(self, option_manager: OptionManager):
+        """Set the OptionManager instance after initialization."""
+        self.option_manager = option_manager
+        self.logger.info("OptionManager instance set in StrategyManager.")
+
 
     def _register_event_handlers(self):
         """Register event handlers with the event manager."""
-        # Market data events
-        self.event_manager.subscribe(
-            EventType.MARKET_DATA,
-            self._handle_market_data,
-            component_name="StrategyManager"
-        )
-        
-        # Signal events
-        self.event_manager.subscribe(
-            EventType.SIGNAL,
-            self._handle_strategy_signal,
-            component_name="StrategyManager"
-        )
-        
-        # Bar events
-        self.event_manager.subscribe(
-            EventType.BAR,
-            self._on_bar,
-            component_name="StrategyManager"
-        )
-        
+        # Market data events (primarily for underlying price updates if needed here)
+        # OptionManager handles underlying price updates internally now.
+        # self.event_manager.subscribe(EventType.MARKET_DATA, self._handle_market_data, component_name="StrategyManager")
+
+        # Signal events from strategies
+        self.event_manager.subscribe(EventType.SIGNAL, self._handle_strategy_signal, component_name="StrategyManager")
+
+        # Bar events to distribute to strategies
+        self.event_manager.subscribe(EventType.BAR, self._on_bar, component_name="StrategyManager")
+
+        # Custom event from OptionManager when new options are subscribed
+        self.event_manager.subscribe(EventType.CUSTOM, self._handle_custom_event, component_name="StrategyManager")
+
         self.logger.info("StrategyManager event handlers registered")
 
-    def _handle_market_data(self, event: Event):
-        """
-        Handle market data events.
+    def _handle_custom_event(self, event: Event):
+        """Handles custom events, specifically looking for OPTIONS_SUBSCRIBED."""
+        if hasattr(event, 'custom_event_type') and event.custom_event_type == "OPTIONS_SUBSCRIBED":
+             # Type hint for clarity
+             options_event: OptionsSubscribedEvent = event
+             self._handle_options_subscribed(options_event)
 
-        Args:
-            event: Market data event
+    def _handle_options_subscribed(self, event: OptionsSubscribedEvent):
         """
-        if not isinstance(event, MarketDataEvent):
+        Handles the event published by OptionManager when new options are subscribed.
+        Subscribes relevant strategies to the new option symbols via DataManager.
+        """
+        underlying_symbol = event.underlying_symbol # e.g., "NIFTY INDEX"
+        new_option_instruments = event.instruments # List[Instrument]
+
+        if not new_option_instruments:
             return
 
-        self.logger.debug(f"Received MarketDataEvent: {event}")
-        
-        # Check if this is a configured underlying
-        instrument = event.instrument
-        symbol = instrument.symbol
+        self.logger.info(f"Received OptionsSubscribedEvent for underlying '{underlying_symbol}' with {len(new_option_instruments)} new options.")
 
-        if symbol in self.option_manager.underlying_subscriptions:
-            price = event.data.get('CLOSE') or event.data.get('LAST_PRICE')
-            if price:
-                self.option_manager.update_underlying_price(symbol, price)
+        with self.lock:
+            strategies_to_update = []
+            # Find strategies that depend on this underlying for dynamic options
+            for strategy_id, dependent_underlyings in self.strategy_dynamic_underlyings.items():
+                if underlying_symbol in dependent_underlyings:
+                    if strategy_id in self.strategies:
+                        strategies_to_update.append(strategy_id)
+                    else:
+                         self.logger.warning(f"Strategy {strategy_id} depends on {underlying_symbol} but is not loaded.")
+
+            if not strategies_to_update:
+                self.logger.debug(f"No strategies found needing dynamic options for {underlying_symbol}.")
+                return
+
+            self.logger.debug(f"Strategies needing updates for {underlying_symbol}: {strategies_to_update}")
+
+            # For each new option and each relevant strategy, subscribe via DataManager
+            for instrument in new_option_instruments:
+                symbol_key = instrument.instrument_id # e.g., NFO:NIFTY...
+                if not symbol_key:
+                    self.logger.warning(f"Option instrument {instrument.symbol} missing instrument_id. Skipping subscription.")
+                    continue
+
+                for strategy_id in strategies_to_update:
+                    strategy = self.strategies[strategy_id]
+                    # Get all timeframes this strategy uses
+                    required_timeframes = set(self.strategy_symbols.get(strategy_id, {}).keys())
+                    if not required_timeframes: # If strategy_symbols wasn't populated yet, use config
+                         required_timeframes = {strategy.timeframe} | strategy.additional_timeframes
+
+                    if not required_timeframes:
+                         self.logger.warning(f"Strategy {strategy_id} has no timeframes defined. Cannot subscribe {symbol_key}.")
+                         continue
+
+                    # Subscribe the strategy to this option for all its required timeframes
+                    for timeframe in required_timeframes:
+                         # Check if already subscribed (though DataManager might handle duplicates)
+                         if symbol_key not in self.strategy_symbols[strategy_id][timeframe]:
+                             self.logger.debug(f"Subscribing strategy '{strategy_id}' to option '{symbol_key}' on timeframe '{timeframe}'")
+                             success = self.data_manager.subscribe_to_timeframe(
+                                 instrument=instrument, # Pass the full Instrument object
+                                 timeframe=timeframe,
+                                 strategy_id=strategy_id
+                             )
+                             if success:
+                                 # Update tracking structures
+                                 self.strategy_symbols[strategy_id][timeframe].add(symbol_key)
+                                 self.symbol_strategies[symbol_key][timeframe].add(strategy_id)
+                                 # self.logger.debug(f"Successfully updated tracking for {strategy_id} -> {symbol_key}@{timeframe}")
+                             else:
+                                 self.logger.error(f"DataManager failed to subscribe {strategy_id} to {symbol_key}@{timeframe}")
+                         # else:
+                             # self.logger.debug(f"Strategy {strategy_id} already subscribed to {symbol_key}@{timeframe}")
 
     def _handle_strategy_signal(self, event: Event):
         """
@@ -157,519 +204,501 @@ class StrategyManager:
         self._process_signal(event)
 
     def _on_bar(self, event: BarEvent):
-        """
-        Handle bar events.
-
-        Args:
-            event: Bar event
-        """
-        if not isinstance(event, BarEvent):
+        """Distribute bar events to relevant strategies."""
+        if not isinstance(event, BarEvent) or not event.instrument:
             return
 
-        # Process the bar event
-        self._process_bar(event)
+        symbol_key = event.instrument.instrument_id # Use the unique ID
+        timeframe = event.timeframe
 
-    def load_config(self, strategy_config_path='config/strategies.yml', main_config_path='config/config.yaml'):
-        """
-        Load strategy and main configuration.
+        if not symbol_key:
+             # Should not happen if DataManager populates instrument correctly
+             self.logger.warning(f"BarEvent missing instrument_id. Symbol: {event.instrument.symbol}")
+             return
 
-        Args:
-            strategy_config_path: Path to the strategy configuration file
-            main_config_path: Path to the main configuration file
-        """
+        # self.logger.debug(f"Received BarEvent for {symbol_key}@{timeframe}")
+
+        # Find strategies subscribed to this symbol_key and timeframe
+        # Use .get() to avoid defaultdict creating empty entries unnecessarily
+        strategies_for_symbol = self.symbol_strategies.get(symbol_key)
+        if strategies_for_symbol:
+            subscribed_strategy_ids = strategies_for_symbol.get(timeframe)
+            if subscribed_strategy_ids:
+                # Use list comprehension for potentially faster creation
+                futures = [
+                    self.strategy_executor.submit(self.strategies[strategy_id].on_bar, event)
+                    for strategy_id in subscribed_strategy_ids if strategy_id in self.strategies
+                ]
+                # Log if any strategy ID was not found (should indicate an issue)
+                for strategy_id in subscribed_strategy_ids:
+                     if strategy_id not in self.strategies:
+                          self.logger.warning(f"Strategy {strategy_id} subscribed to {symbol_key}@{timeframe} but not found in loaded strategies.")
+
+                # Optional: Handle futures if needed (e.g., logging exceptions)
+                # for future in concurrent.futures.as_completed(futures):
+                #     try: future.result(timeout=1.0) # Check for exceptions
+                #     except Exception as e: self.logger.error(f"Error in parallel on_bar execution: {e}")
+
+            # else: self.logger.debug(f"No strategies subscribed to timeframe {timeframe} for {symbol_key}")
+        # else: self.logger.debug(f"No strategies subscribed to symbol {symbol_key}")
+
+    def load_config(self, strategy_config_path='config/strategies.yaml', main_config_path='config/config.yaml'):
+        """Load strategy and main configuration."""
+        if not self.option_manager:
+             self.logger.critical("OptionManager must be set before loading config!")
+             return False
         try:
             # Load strategy configuration
             if isinstance(strategy_config_path, dict):
-                self.config = strategy_config_path
+                self.strategies_yaml_config = strategy_config_path
             else:
                 with open(strategy_config_path, 'r') as f:
-                    self.config = yaml.safe_load(f)
+                    self.strategies_yaml_config = yaml.safe_load(f)
 
-            # Load main configuration to get indices
+            # Load main configuration to get market underlyings
             if isinstance(main_config_path, dict):
-                self.main_config = main_config_path
+                # If main config is already passed in __init__, use it
+                if not self.config: self.config = main_config_path
             else:
                 try:
                     with open(main_config_path, 'r') as f:
-                        self.main_config = yaml.safe_load(f)
+                         # Store main config if not already set
+                         if not self.config: self.config = yaml.safe_load(f)
                 except Exception as e:
-                    self.logger.error(f"Failed to load main configuration: {e}")
-                    self.main_config = {}
+                    self.logger.error(f"Failed to load main configuration from {main_config_path}: {e}")
+                    if not self.config: self.config = {} # Ensure self.config is a dict
 
             # Extract underlyings configuration from main config
-            self.underlyings_config = self.main_config.get('market', {}).get('underlyings', {})
+            self.underlyings_config = self.config.get('market', {}).get('underlyings', [])
+            if not isinstance(self.underlyings_config, list):
+                 self.logger.error("market.underlyings in config.yaml should be a list.")
+                 self.underlyings_config = []
 
             # Configure option manager with underlyings
             self.option_manager.configure_underlyings(self.underlyings_config)
 
-            self.logger.info(f"Loaded strategy configuration with {len(self.config.get('strategies', {}))} strategies")
-            self.logger.info(f"Loaded underlyings configuration with {len(self.underlyings_config)} underlyings")
+            num_strategies = len(self.strategies_yaml_config.get('strategies', {}))
+            num_underlyings = len(self.underlyings_config)
+            self.logger.info(f"Loaded strategy configuration with {num_strategies} strategies")
+            self.logger.info(f"Loaded underlyings configuration with {num_underlyings} underlyings")
             return True
+
         except Exception as e:
-            self.logger.error(f"Failed to load configuration: {e}")
+            self.logger.error(f"Failed to load configuration: {e}", exc_info=True)
             return False
 
     def initialize_strategies(self):
         """
         Initialize all strategies based on the loaded configuration.
+        Identifies strategies needing dynamic options.
         """
-        if not self.config:
-            self.logger.error("Cannot initialize strategies: configuration not loaded")
+        if not self.strategies_yaml_config:
+            self.logger.error("Cannot initialize strategies: strategy configuration not loaded")
             return False
+        if not self.option_manager:
+             self.logger.critical("OptionManager not set. Cannot initialize strategies.")
+             return False
 
-        strategy_configs = self.config.get('strategies', {})
+        strategy_configs = self.strategies_yaml_config.get('strategies', {})
+        initialized_count = 0
 
-        for strategy_id, config in strategy_configs.items():
-            if not config.get('enabled', True):
-                self.logger.info(f"Strategy {strategy_id} is disabled, skipping")
-                continue
+        with self.lock: # Protect access to shared strategy dicts
+            self.strategies.clear()
+            self.strategy_configs.clear()
+            self.strategy_symbols.clear()
+            self.symbol_strategies.clear()
+            self.strategy_dynamic_underlyings.clear()
 
-            try:
-                # Load strategy class
-                strategy_class = self._get_strategy_class(config.get('type', strategy_id))
-
-                if not strategy_class:
-                    self.logger.error(f"Could not find strategy class for {strategy_id}")
+            for strategy_id, config in strategy_configs.items():
+                if not config.get('enabled', True):
+                    self.logger.info(f"Strategy '{strategy_id}' is disabled, skipping.")
                     continue
-
-                # Create strategy instance
-                strategy = strategy_class(
-                    strategy_id=strategy_id,
-                    config=config,
-                    data_manager=self.data_manager,
-                    option_manager=self.option_manager,
-                    portfolio_manager=self.portfolio_manager,
-                    event_manager=self.event_manager
-                )
-
-                # Store the strategy
-                self.strategies[strategy_id] = strategy
-                self.strategy_configs[strategy_id] = config
-
-                # Get required symbols and options
-                self.strategy_symbols[strategy_id] = strategy.get_required_symbols()
-                self.strategy_options[strategy_id] = strategy.get_required_options()
-
-                # Update symbol-strategy mapping
-                for timeframe, symbols in self.strategy_symbols[strategy_id].items():
-                    for symbol in symbols:
-                        if symbol not in self.symbol_strategies:
-                            self.symbol_strategies[symbol] = {}
-                        if timeframe not in self.symbol_strategies[symbol]:
-                            self.symbol_strategies[symbol][timeframe] = set()
-                        self.symbol_strategies[symbol][timeframe].add(strategy_id)
-
-                # Subscribe to indices if needed
-                if hasattr(strategy, 'underlyings'):
-                    for underlying in strategy.underlyings:
-                        if not self.option_manager.subscribe_underlying(underlying):
-                            self.logger.error(f"Failed to subscribe to underlying {underlying} for strategy {strategy_id}")
-                            continue
-
-                self.logger.info(f"Initialized strategy {strategy_id}")
-            except Exception as e:
-                self.logger.error(f"Failed to initialize strategy {strategy_id}: {e}")
-
-        self.logger.info(f"Initialized {len(self.strategies)} strategies")
-        return len(self.strategies) > 0
-
-    @lru_cache(maxsize=100)
-    def _get_strategy_class(self, strategy_type: str) -> Optional[Type[OptionStrategy]]:
-        """
-        Get the strategy class by type name.
-
-        Args:
-            strategy_type: Type name of the strategy
-
-        Returns:
-            Type[OptionStrategy]: The strategy class if found, None otherwise
-        """
-        # First try direct import
-        try:
-            module_path = f"strategies.{strategy_type}"
-            module = importlib.import_module(module_path)
-
-            # Find the strategy class in the module
-            for name, obj in inspect.getmembers(module):
-                if (inspect.isclass(obj) and issubclass(obj, OptionStrategy) and
-                    obj != OptionStrategy and name.lower() == strategy_type.lower()):
-                    return obj
-        except ImportError:
-            pass
-
-        # Try with option_strategies subdirectory
-        try:
-            module_path = f"strategies.option_strategies.{strategy_type}"
-            module = importlib.import_module(module_path)
-
-            # Find the strategy class in the module
-            for name, obj in inspect.getmembers(module):
-                if (inspect.isclass(obj) and issubclass(obj, OptionStrategy) and
-                    obj != OptionStrategy and name.lower() == strategy_type.lower()):
-                    return obj
-        except ImportError:
-            pass
-
-        # Try directory search
-        strategies_dir = Path("strategies")
-        for py_file in strategies_dir.glob("**/*.py"):
-            if py_file.stem.lower() == strategy_type.lower():
-                module_path = f"strategies.{py_file.stem}"
-                if py_file.parent.name != "strategies":
-                    module_path = f"strategies.{py_file.parent.name}.{py_file.stem}"
 
                 try:
-                    module = importlib.import_module(module_path)
+                    strategy_type = config.get('type')
+                    if not strategy_type:
+                         self.logger.error(f"Strategy '{strategy_id}' missing 'type' definition.")
+                         continue
 
-                    # Find the strategy class in the module
-                    for name, obj in inspect.getmembers(module):
-                        if (inspect.isclass(obj) and issubclass(obj, OptionStrategy) and
-                            obj != OptionStrategy):
-                            return obj
-                except ImportError:
-                    continue
+                    # Get strategy class from registry
+                    strategy_class = self.strategy_registry.get_strategy_class(strategy_type)
+                    if not strategy_class:
+                        self.logger.error(f"Could not find strategy class for type '{strategy_type}' (ID: {strategy_id})")
+                        continue
 
-        self.logger.error(f"Strategy type {strategy_type} not found")
-        return None
+                    # Create strategy instance
+                    # Pass main config for context if needed by strategy (e.g., default exchange)
+                    strategy = strategy_class(
+                        strategy_id=strategy_id,
+                        config=config, # Strategy-specific config from strategies.yaml
+                        data_manager=self.data_manager,
+                        option_manager=self.option_manager,
+                        portfolio_manager=self.portfolio_manager,
+                        event_manager=self.event_manager,
+                        # main_config=self.config # Optionally pass main config
+                    )
+
+                    # Store the strategy and its config
+                    self.strategies[strategy_id] = strategy
+                    self.strategy_configs[strategy_id] = config
+
+                    # --- Determine Symbol Requirements ---
+                    # 1. Explicit symbols (e.g., specific stocks, futures, or *maybe* specific options)
+                    #    These should be returned by get_required_symbols() as symbol strings.
+                    # 2. Underlyings for dynamic options (e.g., "NIFTY INDEX" for ATM straddle)
+                    #    These should be identified, perhaps via a new method or attribute.
+
+                    # Get explicitly required symbols (like underlyings for option strategies)
+                    required_symbols_map = strategy.get_required_symbols() # timeframe -> list[symbol_str]
+                    explicit_symbol_keys = set()
+
+                    for timeframe, symbols in required_symbols_map.items():
+                        for symbol_str in symbols:
+                            # Convert symbol string (e.g., "NIFTY INDEX") to Instrument and then symbol_key
+                            # Need exchange info - try strategy config, then main config
+                            exchange_str = config.get('exchange') # Check strategy config first
+                            
+                            if not exchange_str:
+                                 # Find underlying config in main list
+                                 u_conf = next((uc for uc in self.underlyings_config if uc.get('symbol') == symbol_str or uc.get('name') == symbol_str), None)
+                                 if u_conf:
+                                      exchange_str = u_conf.get('spot_exchange', u_conf.get('exchange'))
+                                 else:
+                                      exchange_str = self.config.get('market', {}).get('default_exchange', 'NSE') # Fallback
+
+                            # Get/Create Instrument using DataManager helper
+                            instrument = self.data_manager.get_or_create_instrument(f"{exchange_str}:{symbol_str}")
+                            if instrument and instrument.instrument_id:
+                                symbol_key = instrument.instrument_id
+                                self.strategy_symbols[strategy_id][timeframe].add(symbol_key)
+                                self.symbol_strategies[symbol_key][timeframe].add(strategy_id)
+                                explicit_symbol_keys.add(symbol_key)
+                            else:
+                                 self.logger.error(f"Could not get/create instrument for explicit symbol '{symbol_str}' for strategy '{strategy_id}'")
+
+
+                    # Check if the strategy needs dynamic options (e.g., based on config or attribute)
+                    if config.get('use_options', False) and hasattr(strategy, 'underlyings'):
+                         # Store the underlyings this strategy depends on for dynamic options
+                         strategy_underlyings = getattr(strategy, 'underlyings', [])
+                         if strategy_underlyings:
+                              # Process underlyings to ensure they're all strings
+                              underlying_symbols = set()
+                              for underlying in strategy_underlyings:
+                                   if isinstance(underlying, str):
+                                        underlying_symbols.add(underlying)
+                                   elif isinstance(underlying, dict) and 'symbol' in underlying:
+                                        underlying_symbols.add(underlying['symbol'])
+                                   else:
+                                        self.logger.warning(f"Strategy '{strategy_id}' has invalid underlying format: {underlying}")
+                              
+                              self.strategy_dynamic_underlyings[strategy_id].update(underlying_symbols)
+                              self.logger.debug(f"Strategy '{strategy_id}' registered for dynamic options on underlyings: {underlying_symbols}")
+                              
+                              # Also ensure the underlying itself is subscribed if not already explicit
+                              for underlying_symbol in underlying_symbols:
+                                   u_conf = next((uc for uc in self.underlyings_config if uc.get('symbol') == underlying_symbol or uc.get('name') == underlying_symbol), None)
+                                   if u_conf:
+                                        exchange = u_conf.get('exchange') # Should be Enum from OptionManager config                                        
+                                        underlying_key = f"{exchange}:{underlying_symbol}"
+                                        if underlying_key not in explicit_symbol_keys:
+                                             # Add underlying subscription for all its timeframes
+                                             instrument = self.data_manager.get_or_create_instrument(underlying_key)
+                                             if instrument:
+                                                  for tf in strategy.all_timeframes: # Use strategy's timeframes
+                                                       self.strategy_symbols[strategy_id][tf].add(underlying_key)
+                                                       self.symbol_strategies[underlying_key][tf].add(strategy_id)
+                                                       explicit_symbol_keys.add(underlying_key) # Mark as handled
+                                             else: self.logger.error(f"Could not get instrument for underlying {underlying_key}")                                        
+                                   else: self.logger.error(f"Config not found for dynamic underlying {underlying_symbol}")
+
+
+                    self.logger.info(f"Initialized strategy '{strategy_id}' (Type: {strategy_type}). Explicit symbols: {len(explicit_symbol_keys)}. Dynamic Underlyings: {self.strategy_dynamic_underlyings.get(strategy_id, 'None')}")
+                    initialized_count += 1
+
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize strategy '{strategy_id}': {e}", exc_info=True)
+
+        self.logger.info(f"Initialized {initialized_count} strategies.")
+        return initialized_count > 0
 
     def start_strategies(self):
-        """
-        Start all initialized strategies.
-        """
-        self.logger.info("Starting strategies")
+        """Start all initialized strategies."""
+        self.logger.info("Starting strategies...")
+        if not self.strategies:
+             self.logger.warning("No strategies initialized to start.")
+             return
 
-        # Subscribe to required symbols first
-        self.subscribe_symbols()
+        # Subscribe to initial symbols (underlyings, explicitly defined symbols)
+        # Option symbols will be subscribed later via event from OptionManager
+        self._subscribe_initial_symbols()
 
-        # Start each strategy
+        # Start each strategy's internal logic (e.g., setting state)
+        start_count = 0
         for strategy_id, strategy in self.strategies.items():
             try:
-                strategy.on_start()
-                self.logger.info(f"Started strategy {strategy_id}")
+                strategy.start() # Calls strategy's on_start and potentially starts threads
+                self.logger.info(f"Started strategy '{strategy_id}'")
+                start_count += 1
             except Exception as e:
-                self.logger.error(f"Error starting strategy {strategy_id}: {str(e)}", exc_info=True)
+                self.logger.error(f"Error starting strategy '{strategy_id}': {e}", exc_info=True)
+        self.logger.info(f"Attempted to start {start_count} strategies.")
 
     def stop_strategies(self):
-        """
-        Stop all running strategies.
-        """
-        self.logger.info("Stopping strategies")
+        """Stop all running strategies."""
+        self.logger.info("Stopping strategies...")
 
-        # Stop each strategy
+        # Stop each strategy's internal logic
+        stop_count = 0
         for strategy_id, strategy in self.strategies.items():
             try:
-                strategy.on_stop()
-                self.logger.info(f"Stopped strategy {strategy_id}")
+                strategy.stop() # Calls strategy's on_stop and potentially stops threads
+                self.logger.info(f"Stopped strategy '{strategy_id}'")
+                stop_count += 1
             except Exception as e:
-                self.logger.error(f"Error stopping strategy {strategy_id}: {str(e)}", exc_info=True)
+                self.logger.error(f"Error stopping strategy '{strategy_id}': {e}", exc_info=True)
 
-        # Unsubscribe from all symbols
-        self.unsubscribe_symbols()
+        # Unsubscribe from all symbols via DataManager
+        self._unsubscribe_all_symbols()
+        self.logger.info(f"Attempted to stop {stop_count} strategies and unsubscribed symbols.")
 
-    def subscribe_symbols(self):
-        """
-        Subscribe to all symbols required by the strategies.
-        """
-        self.logger.info("Subscribing to strategy symbols")
+    def _subscribe_initial_symbols(self):
+        """Subscribe only to the initially known symbols (not dynamic options)."""
+        self.logger.info("Subscribing to initial strategy symbols (excluding dynamic options)...")
+        subscribed_count = 0
+        total_subscriptions = 0
 
-        # Track which symbols we've already subscribed to for each timeframe
-        subscribed = {}  # timeframe -> set(symbols)
+        with self.lock:
+            all_initial_subscriptions = defaultdict(set) # symbol_key -> set(timeframes)
+            # Gather all unique symbol_key/timeframe pairs needed initially
+            for strategy_id, tf_map in self.strategy_symbols.items():
+                 # Check if this strategy requires dynamic options
+                 requires_dynamic = strategy_id in self.strategy_dynamic_underlyings
 
-        for strategy_id, symbols_by_timeframe in self.strategy_symbols.items():
-            for timeframe, symbols in symbols_by_timeframe.items():
-                if timeframe not in subscribed:
-                    subscribed[timeframe] = set()
+                 for timeframe, symbol_keys in tf_map.items():
+                      for symbol_key in symbol_keys:
+                           # If strategy requires dynamic options, only subscribe the underlying initially
+                           is_option = ":NFO" in symbol_key or ":BFO" in symbol_key # Basic check
+                           if requires_dynamic and is_option:
+                                continue # Skip options for dynamic strategies initially
 
-                for symbol in symbols:
-                    if symbol not in subscribed[timeframe]:
-                        try:
-                            # Get exchange from config or use default
-                            exchange = self.config.get('market', {}).get('default_exchange', 'NSE')
+                           all_initial_subscriptions[symbol_key].add(timeframe)
+                           total_subscriptions += 1
 
-                            # Create an instrument object for the symbol
-                            instrument = Instrument(symbol=symbol, exchange=exchange)
+            # Subscribe via DataManager
+            for symbol_key, timeframes in all_initial_subscriptions.items():
+                 instrument = self.data_manager.get_or_create_instrument(symbol_key)
+                 if not instrument:
+                      self.logger.error(f"Could not get instrument for initial subscription: {symbol_key}")
+                      continue
 
-                            # Subscribe to the instrument
-                            self.data_manager.subscribe_to_timeframe(instrument, timeframe, strategy_id)
-                            subscribed[timeframe].add(symbol)
-                            self.logger.debug(f"Subscribed to {symbol}@{timeframe} for strategy {strategy_id}")
-                        except Exception as e:
-                            self.logger.error(f"Error subscribing to {symbol}@{timeframe}: {str(e)}")
+                 for timeframe in timeframes:
+                      # Find one strategy ID that needs this combo for the call
+                      strategy_id = next((sid for sid, tf_map in self.strategy_symbols.items()
+                                          if timeframe in tf_map and symbol_key in tf_map[timeframe]), None)
+                      if strategy_id:
+                           success = self.data_manager.subscribe_to_timeframe(instrument, timeframe, strategy_id)
+                           if success:
+                                subscribed_count += 1
+                           # else: # Error logged by subscribe_to_timeframe
+                           #      pass
+                      else: # Should not happen if logic is correct
+                           self.logger.error(f"Internal error: No strategy found for initial subscription {symbol_key}@{timeframe}")
 
-    def unsubscribe_symbols(self):
-        """
-        Unsubscribe from all symbols.
-        """
-        self.logger.info("Unsubscribing from strategy symbols")
 
-        for strategy_id, symbols_by_timeframe in self.strategy_symbols.items():
-            for timeframe, symbols in symbols_by_timeframe.items():
-                for symbol in symbols:
-                    try:
-                        # Get exchange from config or use default
-                        exchange = self.config.get('market', {}).get('default_exchange', 'NSE')
-                        
-                        # Create an instrument object for the symbol
-                        instrument = Instrument(symbol=symbol, exchange=exchange)
-                        
-                        # Unsubscribe from the timeframe
-                        self.data_manager.unsubscribe_from_timeframe(instrument, timeframe, strategy_id)
-                        self.logger.debug(f"Unsubscribed from {symbol}@{timeframe} for strategy {strategy_id}")
-                    except Exception as e:
-                        self.logger.error(f"Error unsubscribing from {symbol}@{timeframe} for strategy {strategy_id}: {str(e)}")
+        self.logger.info(f"Attempted {subscribed_count}/{total_subscriptions} initial symbol/timeframe subscriptions via DataManager.")
+
+    def _unsubscribe_all_symbols(self):
+        """Unsubscribe all strategies from all symbols they were subscribed to."""
+        self.logger.info("Unsubscribing strategies from all symbols...")
+        unsubscribed_count = 0
+        total_unsubscriptions = 0
+
+        with self.lock:
+            # Iterate through the reverse map to find all symbol/timeframe pairs
+            all_symbol_tf_pairs = []
+            for symbol_key, tf_map in self.symbol_strategies.items():
+                 instrument = self.data_manager.get_or_create_instrument(symbol_key)
+                 if not instrument:
+                      self.logger.error(f"Could not get instrument for unsubscription: {symbol_key}")
+                      continue
+                 for timeframe, strategy_ids in tf_map.items():
+                      if strategy_ids:
+                           # Need one strategy ID for the unsubscribe call
+                           strategy_id = next(iter(strategy_ids))
+                           all_symbol_tf_pairs.append((instrument, timeframe, strategy_id))
+                           total_unsubscriptions += 1
+
+            # Unsubscribe via DataManager
+            for instrument, timeframe, strategy_id in all_symbol_tf_pairs:
+                 success = self.data_manager.unsubscribe_from_timeframe(instrument, timeframe, strategy_id)
+                 if success:
+                      unsubscribed_count += 1
+                 # else: # Error logged by unsubscribe_from_timeframe
+                 #      pass
+
+            # Clear tracking structures
+            self.strategy_symbols.clear()
+            self.symbol_strategies.clear()
+
+        self.logger.info(f"Attempted {unsubscribed_count}/{total_unsubscriptions} symbol/timeframe unsubscriptions via DataManager.")
 
     def start(self):
-        """
-        Start the strategy manager and all strategies.
-        """
+        """Start the strategy manager: initialize and start strategies, start monitoring."""
         try:
-            # Initialize strategies if not already initialized
+            self.logger.info("Starting Strategy Manager...")
+            if not self.option_manager:
+                 self.logger.critical("OptionManager not set. Aborting start.")
+                 return False
+
+            # Initialize strategies first
             if not self.strategies:
                 if not self.initialize_strategies():
-                    self.logger.error("Failed to initialize strategies")
+                    self.logger.error("Strategy initialization failed. Aborting start.")
                     return False
 
             # Start the monitoring thread
             self.stop_event.clear()
             self.monitoring_thread = threading.Thread(
-                target=self._monitoring_thread,
+                target=self._monitoring_thread_func,
                 name="StrategyManagerMonitor"
             )
             self.monitoring_thread.daemon = True
             self.monitoring_thread.start()
 
-            # Start all strategies
+            # Start all strategies (subscribes initial symbols)
             self.start_strategies()
 
-            self.logger.info("Strategy Manager started successfully")
+            # Start OptionManager tracking (subscribes underlyings, triggers option events)
+            if not self.option_manager.start_tracking():
+                 self.logger.error("OptionManager failed to start tracking underlyings.")
+                 # Decide if this is critical - maybe continue?
+                 # For now, log error and continue. Strategies might fail if options don't arrive.
+
+            self.logger.info("Strategy Manager started successfully.")
             return True
 
         except Exception as e:
-            self.logger.error(f"Error starting Strategy Manager: {e}")
+            self.logger.error(f"Error starting Strategy Manager: {e}", exc_info=True)
             return False
 
     def stop(self):
-        """
-        Stop the strategy manager and all strategies.
-        """
-        # Stop the monitoring thread
+        """Stop the strategy manager: stop monitoring, stop strategies, unsubscribe."""
+        self.logger.info("Stopping Strategy Manager...")
+        # Stop the monitoring thread first
         self.stop_event.set()
         if self.monitoring_thread and self.monitoring_thread.is_alive():
             self.monitoring_thread.join(timeout=5.0)
+            if self.monitoring_thread.is_alive():
+                 self.logger.warning("Monitoring thread did not stop gracefully.")
 
-        # Stop all strategies
+        # Stop all strategies (includes unsubscribing symbols)
         self.stop_strategies()
 
-        self.logger.info("Strategy Manager stopped")
+        # Shutdown the executor
+        self.strategy_executor.shutdown(wait=True)
 
-    def _monitoring_thread(self):
-        """
-        Monitoring thread function.
-        Periodically checks strategy health and performance.
-        """
-        self.logger.info("Strategy monitoring thread started")
+        # Clear strategies
+        with self.lock:
+            self.strategies.clear()
+            self.strategy_configs.clear()
+            self.strategy_dynamic_underlyings.clear()
 
-        while not self.stop_event.is_set():
+        self.logger.info("Strategy Manager stopped.")
+
+    def _monitoring_thread_func(self):
+        """Monitoring thread function."""
+        self.logger.info("Strategy monitoring thread started.")
+        while not self.stop_event.wait(10.0): # Check every 10 seconds
             try:
-                # Check all strategies
-                for strategy_id, strategy in self.strategies.items():
-                    # Check if strategy is responsive
-                    if hasattr(strategy, 'last_heartbeat'):
-                        last_heartbeat = getattr(strategy, 'last_heartbeat', 0)
-                        if time.time() - last_heartbeat > 60:  # 1 minute timeout
-                            self.logger.warning(f"Strategy {strategy_id} has not sent a heartbeat in over 1 minute")
-
-                    # Check other health metrics
-                    # ...
+                with self.lock: # Access strategies safely
+                    for strategy_id, strategy in self.strategies.items():
+                        # Check heartbeat
+                        if hasattr(strategy, 'last_heartbeat'):
+                            if time.time() - strategy.last_heartbeat > 60: # 1 min timeout
+                                self.logger.warning(f"Strategy '{strategy_id}' heartbeat timeout (> 60s).")
+                        # Add other checks (memory, PnL limits, etc.) if needed
             except Exception as e:
-                self.logger.error(f"Error in strategy monitoring: {e}")
-
-            # Sleep for a bit
-            time.sleep(10)
-
-        self.logger.info("Strategy monitoring thread stopped")
+                self.logger.error(f"Error in strategy monitoring loop: {e}", exc_info=True)
+        self.logger.info("Strategy monitoring thread stopped.")
 
     def get_strategy(self, strategy_id: str) -> Optional[OptionStrategy]:
-        """
-        Get a strategy by ID.
-
-        Args:
-            strategy_id: Strategy ID
-
-        Returns:
-            Optional[OptionStrategy]: The strategy instance if found, None otherwise
-        """
-        return self.strategies.get(strategy_id)
+        """Get a strategy instance by ID."""
+        with self.lock:
+            return self.strategies.get(strategy_id)
 
     def get_strategy_status(self, strategy_id: str) -> Dict[str, Any]:
-        """
-        Get the status of a strategy.
-
-        Args:
-            strategy_id: Strategy ID
-
-        Returns:
-            Dict[str, Any]: Dictionary with strategy status information
-        """
-        strategy = self.get_strategy(strategy_id)
-
+        """Get the status of a specific strategy."""
+        strategy = self.get_strategy(strategy_id) # Handles locking
         if not strategy:
-            return {'error': 'Strategy not found'}
-
-        return strategy.get_status()
-
-    def get_options_for_index(self, index_symbol: str) -> List[str]:
-        """
-        Get the list of option symbols for an index.
-
-        Args:
-            index_symbol: Index symbol
-
-        Returns:
-            List[str]: List of option symbols
-        """
-        return self.option_manager.get_active_option_symbols(index_symbol)
-
-    def request_symbol_subscription(self, strategy_id: str, symbol: str, timeframe: str = None):
-        """
-        Request subscription to a symbol for a strategy.
-
-        Args:
-            strategy_id: ID of the strategy requesting the subscription
-            symbol: Symbol to subscribe to
-            timeframe: Timeframe to subscribe to (uses strategy default if None)
-
-        Returns:
-            bool: True if subscription was successful
-        """
-        if strategy_id not in self.strategies:
-            self.logger.error(f"Strategy {strategy_id} not found")
-            return False
-
-        strategy = self.strategies[strategy_id]
-
-        # Use strategy's default timeframe if none specified
-        if timeframe is None:
-            timeframe = strategy.timeframe
-
+            return {'error': f"Strategy '{strategy_id}' not found."}
         try:
-            # Get exchange from config or use default
-            exchange = self.config.get('market', {}).get('default_exchange', 'NSE')
-            
-            # Create an instrument object for the symbol
-            instrument = Instrument(symbol=symbol, exchange=exchange)
-            
-            # Subscribe to the symbol
-            self.data_manager.subscribe_to_timeframe(strategy_id, symbol, timeframe)
-
-            # Update tracking
-            if strategy_id not in self.strategy_symbols:
-                self.strategy_symbols[strategy_id] = {}
-            if timeframe not in self.strategy_symbols[strategy_id]:
-                self.strategy_symbols[strategy_id][timeframe] = set()
-            self.strategy_symbols[strategy_id][timeframe].add(symbol)
-
-            if symbol not in self.symbol_strategies:
-                self.symbol_strategies[symbol] = {}
-            if timeframe not in self.symbol_strategies[symbol]:
-                self.symbol_strategies[symbol][timeframe] = set()
-            self.symbol_strategies[symbol][timeframe].add(strategy_id)
-
-            self.logger.info(f"Subscribed to {symbol}@{timeframe} for strategy {strategy_id}")
-            return True
-
+            return strategy.get_status()
         except Exception as e:
-            self.logger.error(f"Error subscribing to {symbol}@{timeframe}: {str(e)}")
+            self.logger.error(f"Error getting status for strategy '{strategy_id}': {e}")
+            return {'error': f"Could not retrieve status for {strategy_id}."}
+
+    def get_all_strategies_status(self) -> Dict[str, Dict[str, Any]]:
+         """Get the status of all loaded strategies."""
+         statuses = {}
+         with self.lock:
+              strategy_ids = list(self.strategies.keys()) # Get keys under lock
+         for strategy_id in strategy_ids:
+              statuses[strategy_id] = self.get_strategy_status(strategy_id)
+         return statuses
+    
+    # --- Signal Processing ---
+    def _process_signal(self, signal: SignalEvent):
+        """Process a signal event generated by a strategy."""
+        # TODO: Implement signal processing logic
+        # - Forward to OrderManager/Broker
+        # - Log signal details
+        self.logger.info(f"Processing signal from {signal.strategy_id}: {signal.signal_type} {signal.instrument.symbol}")
+        # Example: self.order_manager.create_order_from_signal(signal)
+
+    # --- Methods below might be less relevant with the new event flow ---
+    # --- but kept for potential direct interaction/debugging ---
+
+    def request_symbol_subscription(self, strategy_id: str, symbol_key: str, timeframe: str):
+        """Manually request subscription for a strategy (use with caution)."""
+        if strategy_id not in self.strategies:
+            self.logger.error(f"Strategy '{strategy_id}' not found for manual subscription.")
+            return False
+        instrument = self.data_manager.get_or_create_instrument(symbol_key)
+        if not instrument:
+            self.logger.error(f"Could not get instrument for manual subscription: {symbol_key}")
             return False
 
-    def request_option_subscription(self, strategy_id: str, index_symbol: str, strike: float, option_type: str) -> bool:
-        """
-        Request subscription to a specific option.
+        self.logger.info(f"Manual subscription request: {strategy_id} -> {symbol_key}@{timeframe}")
+        success = self.data_manager.subscribe_to_timeframe(instrument, timeframe, strategy_id)
+        if success:
+             with self.lock:
+                  self.strategy_symbols[strategy_id][timeframe].add(symbol_key)
+                  self.symbol_strategies[symbol_key][timeframe].add(strategy_id)
+        return success
 
-        Args:
-            strategy_id: Strategy ID
-            index_symbol: Index symbol
-            strike: Strike price
-            option_type: Option type ('CE' or 'PE')
+    def request_symbol_unsubscription(self, strategy_id: str, symbol_key: str, timeframe: str):
+         """Manually request unsubscription for a strategy (use with caution)."""
+         if strategy_id not in self.strategies:
+              self.logger.error(f"Strategy '{strategy_id}' not found for manual unsubscription.")
+              return False
+         instrument = self.data_manager.get_or_create_instrument(symbol_key)
+         if not instrument:
+              self.logger.error(f"Could not get instrument for manual unsubscription: {symbol_key}")
+              return False
 
-        Returns:
-            bool: True if subscription was successful, False otherwise
-        """
-        # Ensure this is implemented in option_manager
-        pass
-
-    def generate_signal(self, symbol: str, signal_type: SignalType, data: Dict[str, Any] = None, priority: EventPriority = EventPriority.NORMAL):
-        """
-        Generate a trading signal with specified priority.
-
-        Args:
-            symbol: Symbol to trade
-            signal_type: Type of signal (BUY, SELL, etc.)
-            data: Additional signal data
-            priority: Priority level of the signal
-        """
-        # Create signal data
-        signal_data = {
-            'symbol': symbol,
-            'signal_type': signal_type,
-            'strategy_id': self.id,
-            'timestamp': datetime.now(),
-            'data': data or {}
-        }
-        
-        # Create a signal event with specified priority
-        signal_event = SignalEvent(
-            timestamp=datetime.now(),
-            instrument=self.data_manager.get_instrument(symbol),
-            signal_type=signal_type,
-            strategy_id=self.id,
-            data=signal_data,
-            priority=priority
-        )
-        
-        # Publish the signal event
-        self.event_manager.publish(signal_event)
-        
-        self.logger.info(f"Generated {signal_type} signal for {symbol} with priority {priority.name}")
-
-    def on_timer(self, event: Event):
-        """Handle timer events for periodic tasks."""
-        if event.event_type == EventType.TIMER:
-           self.logger.info("Timer event received")
-
-    def _process_bar(self, event: BarEvent):
-        """
-        Process a bar event and distribute it to relevant strategies in parallel.
-
-        Args:
-            event: Bar event
-        """
-        symbol = event.instrument.symbol
-        timeframe = event.timeframe
-        self.logger.debug(f"Processing BarEvent for {symbol}@{timeframe}")
-
-        # Find strategies subscribed to this symbol and timeframe
-        if symbol in self.symbol_strategies and timeframe in self.symbol_strategies[symbol]:
-            subscribed_strategy_ids = self.symbol_strategies[symbol][timeframe]
-            
-            futures = []
-            for strategy_id in subscribed_strategy_ids:
-                if strategy_id in self.strategies:
-                    strategy = self.strategies[strategy_id]
-                    # Submit the strategy's on_bar method to the executor
-                    future = self.strategy_executor.submit(strategy.on_bar, event)
-                    futures.append(future)
-                    self.logger.debug(f"Submitted on_bar for {strategy_id} for {symbol}@{timeframe}")
-                else:
-                    self.logger.warning(f"Strategy {strategy_id} not found while processing bar for {symbol}@{timeframe}")
-            
-            # Optionally, wait for completion or handle results/exceptions
-            # For now, we just launch them in parallel
-            # for future in concurrent.futures.as_completed(futures):
-            #     try:
-            #         future.result() # Check for exceptions
-            #     except Exception as e:
-            #         self.logger.error(f"Error executing strategy on_bar in parallel: {e}")
-        else:
-            self.logger.debug(f"No strategies subscribed to {symbol}@{timeframe}")
-
+         self.logger.info(f"Manual unsubscription request: {strategy_id} -> {symbol_key}@{timeframe}")
+         success = self.data_manager.unsubscribe_from_timeframe(instrument, timeframe, strategy_id)
+         if success:
+              with self.lock:
+                   if strategy_id in self.strategy_symbols and timeframe in self.strategy_symbols[strategy_id]:
+                        self.strategy_symbols[strategy_id][timeframe].discard(symbol_key)
+                   if symbol_key in self.symbol_strategies and timeframe in self.symbol_strategies[symbol_key]:
+                        self.symbol_strategies[symbol_key][timeframe].discard(strategy_id)
+                        # Clean up if set becomes empty
+                        if not self.symbol_strategies[symbol_key][timeframe]:
+                             del self.symbol_strategies[symbol_key][timeframe]
+                        if not self.symbol_strategies[symbol_key]:
+                             del self.symbol_strategies[symbol_key]
+         return success
+ 

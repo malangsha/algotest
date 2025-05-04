@@ -482,7 +482,7 @@ class FinvasiaFeed(MarketDataFeedBase):
     ):
         super().__init__(instruments, callback)
         
-        self.logger = get_logger("live.finvasiafeed")
+        self.logger = get_logger("live.finvasia_feed")
         if debug:
             self.logger.setLevel(logging.DEBUG)
             

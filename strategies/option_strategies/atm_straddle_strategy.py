@@ -3,6 +3,7 @@ ATM Straddle Option Strategy
 
 This strategy buys both Call and Put options at the ATM strike price
 and aims to profit from large price movements in either direction.
+Relies on StrategyManager and OptionManager for option subscriptions.
 """
 
 import logging
@@ -13,419 +14,392 @@ from typing import Dict, List, Any, Optional, Set
 import numpy as np
 
 from strategies.base_strategy import OptionStrategy
-from models.events import MarketDataEvent, BarEvent
+from models.events import MarketDataEvent, BarEvent, FillEvent # Added FillEvent
 from models.position import Position
-from utils.constants import SignalType
+from utils.constants import SignalType, MarketDataType 
 from utils.time_utils import is_market_open, time_in_range
 from strategies.strategy_registry import StrategyRegistry
+from models.instrument import Instrument # Import Instrument
 
 @StrategyRegistry.register('atm_straddle_strategy')
 class AtmStraddleStrategy(OptionStrategy):
     """
     ATM Straddle Option Strategy
-    
+
     Buys both CE and PE options at the ATM strike and profits from large price movements
     in either direction. Implements stop-loss and target-based exits.
+    Relies on dynamic option subscription handled by StrategyManager/OptionManager.
     """
-    
-    def __init__(self, strategy_id: str, config: Dict[str, Any], 
+
+    def __init__(self, strategy_id: str, config: Dict[str, Any],
                  data_manager, option_manager, portfolio_manager, event_manager):
-        super().__init__(strategy_id, config, data_manager, 
+        super().__init__(strategy_id, config, data_manager,
                         option_manager, portfolio_manager, event_manager)
-        
+
         # Extract strategy-specific parameters
         self.params = config.get('parameters', {})
         self.entry_time_str = self.params.get('entry_time', '09:30:00')
         self.exit_time_str = self.params.get('exit_time', '15:15:00')
         self.stop_loss_percent = self.params.get('stop_loss_percent', 30)
         self.target_percent = self.params.get('target_percent', 15)
-        self.trail_points = self.params.get('trail_points', 0.25)
-        
+        self.trail_percent = self.params.get('trail_percent', 0) # Use percentage for trailing SL
+        self.quantity = config.get('execution', {}).get('quantity', 1) # Get quantity from config
+
         # Parse time strings to time objects
         self.entry_time = self._parse_time(self.entry_time_str)
         self.exit_time = self._parse_time(self.exit_time_str)
-        
-        # Parse underlyings (handle both old and new formats)
-        underlyings_config = config.get("underlyings", [])
-        self.underlyings_info = [] # Store dicts: {'symbol': 'SENSEX', 'exchange': 'BSE', ...}
-        self.underlyings = [] # Keep list of symbols for backward compatibility/simplicity in some places
 
-        if isinstance(underlyings_config, list):
-            for underlying_conf in underlyings_config:
-                if isinstance(underlying_conf, str):
-                    # Old format: just the symbol name - try to find exchange in main config
-                    # This requires access to the main config, which might not be ideal here.
-                    # For now, assume default exchange or handle later if needed.
-                    # Let's log a warning.
-                    self.logger.warning(f"Underlying '{underlying_conf}' specified as string. Exchange info missing. Assuming default.")
-                    # Attempt to find it in the main config's underlyings section
-                    main_underlyings = self.config.get('main_config', {}).get('market', {}).get('underlyings', [])
-                    found_conf = next((uc for uc in main_underlyings if uc.get('symbol') == underlying_conf), None)
-                    if found_conf:
-                        self.underlyings_info.append(found_conf)
-                        self.underlyings.append(underlying_conf)
-                    else:
-                         self.logger.error(f"Could not find exchange info for underlying '{underlying_conf}' in main config.")
+        # Parse underlyings (expects list of strings, e.g., ["NIFTY INDEX", "SENSEX"])
+        # The StrategyManager will use this list to know which underlyings trigger option updates for this strategy.
+        raw = config.get("underlyings", [])
+        self.underlyings = []
+        for u in raw:
+            try:
+                self.underlyings.append(u["name"])
+            except (TypeError, KeyError):
+                self.logger.error(
+                    f"Strategy {strategy_id}: invalid underlying entry {u!r}; expected dict with 'name'."
+                )
 
-                elif isinstance(underlying_conf, dict) and 'symbol' in underlying_conf and 'exchange' in underlying_conf:
-                    # New format: dict with symbol and exchange
-                    self.underlyings_info.append(underlying_conf)
-                    self.underlyings.append(underlying_conf['symbol']) # Keep symbol list
-        
         self.expiry_offset = config.get('expiry_offset', 0)
-        
-        # Position tracking
-        self.ce_positions = {}  # underlying -> {symbol, entry_price, high_price, stop_loss, target}
-        self.pe_positions = {}  # underlying -> {symbol, entry_price, high_price, stop_loss, target}
-        self.position_opened = False
-        self.entry_atm_prices = {}  # underlying -> atm_price at entry
-        
-        # State
-        self.entry_pending = False
-        self.exit_triggered = False
-        
-        self.logger.info(f"ATM Straddle Strategy initialized with SL: {self.stop_loss_percent}%, Target: {self.target_percent}%, Underlyings: {self.underlyings}")
-    
-    def _parse_time(self, time_str: str) -> dt_time:
-        """Parse time string to time object"""
-        try:
-            hour, minute, second = map(int, time_str.split(':'))
-            return dt_time(hour, minute, second)
-        except (ValueError, TypeError):
-            self.logger.error(f"Invalid time format: {time_str}, using default")
-            return dt_time(9, 30, 0) if 'entry' in time_str else dt_time(15, 15, 0)
-    
-    def on_start(self):
-        """Called when the strategy is started"""
-        # Initialize state
-        self.entry_pending = True
-        self.exit_triggered = False
-        self.position_opened = False
-        
-        # Subscribe to all required underlyings using the stored info
-        for underlying_info in self.underlyings_info:
-            symbol = underlying_info.get("symbol")
-            exchange = underlying_info.get("exchange")
-            if symbol and exchange:
-                self.request_symbol(symbol, exchange=exchange)
-            elif symbol:
-                # Fallback if exchange info is missing (should have been handled in __init__)
-                self.logger.warning(f"Requesting symbol {symbol} without explicit exchange.")
-                self.request_symbol(symbol)
-        
-        self.logger.info(f"ATM Straddle Strategy started, waiting for entry time: {self.entry_time_str}")
-    
-    def on_market_data(self, event: MarketDataEvent):
-        """
-        Process market data events
-        
-        Args:
-            event: Market data event
-        """
-        symbol = event.instrument.symbol
-        current_time = datetime.now().time()
 
-        self.logger.debug(f"Received MarketDataEvent: {event}")
-        
-        # Check if this is an underlying update
-        if symbol in self.underlyings:
-            # Update ATM options if price changed significantly
-            price = event.data.get('CLOSE') or event.data.get('LAST_PRICE')
-            if price:
-                # Store current underlying price
-                self.option_manager.update_underlying_price(symbol, price)
-                
-                # If positions are open, check for exit conditions
-                if self.position_opened and not self.exit_triggered:
-                    self._check_exit_conditions(symbol, price, event.timestamp)
-        
-        # Check if this is an option update and we have positions
-        elif self.position_opened and self._is_option_symbol(symbol):
-            if symbol in self.ce_positions.values() or symbol in self.pe_positions.values():
-                # Update position tracking and check for stop loss/target
-                self._update_option_position(symbol, event)
-    
-    def on_bar(self, event: BarEvent):
+        # Position tracking (using option symbol key, e.g., "NFO:NIFTY...")
+        self.active_straddles: Dict[str, Dict[str, Any]] = {} # underlying_symbol -> {'ce': pos_dict, 'pe': pos_dict, 'atm': atm_strike}
+                                                              # pos_dict = {symbol_key, entry_price, high_price, stop_loss, target}
+
+        # State
+        self.entry_triggered_today = False # Ensure entry happens only once per day per underlying
+        self.exit_triggered_today = False # Ensure exit happens only once per day
+
+        self.logger.info(f"ATM Straddle Strategy '{self.id}' initialized. Underlyings: {self.underlyings}, Entry: {self.entry_time_str}, Exit: {self.exit_time_str}, SL: {self.stop_loss_percent}%, Target: {self.target_percent}%")
+
+    def _parse_time(self, time_str: str) -> dt_time:
+        """Parse time string HH:MM:SS to time object"""
+        try:
+            return dt_time.fromisoformat(time_str)
+        except (ValueError, TypeError):
+            self.logger.error(f"Invalid time format '{time_str}', using default 09:30 or 15:15.")
+            # Provide context-aware defaults
+            if 'entry' in time_str.lower(): return dt_time(9, 30, 0)
+            elif 'exit' in time_str.lower(): return dt_time(15, 15, 0)
+            else: return dt_time(15, 15, 0) # Default exit
+
+    def get_required_symbols(self) -> Dict[str, List[str]]:
         """
-        Process bar events
-        
-        Args:
-            event: Bar event
+        Return the list of underlying symbols required by this strategy.
+        StrategyManager uses this to subscribe to the underlyings initially.
+        Option symbols are subscribed dynamically later.
         """
-        symbol = event.instrument.symbol
-        current_time = datetime.now().time()
-        self.logger.info(f"Received BarEvent: {event}")
-        
-        # Check if this is the primary timeframe
-        if event.timeframe != self.timeframe:
-            return
-        
-        # Check entry conditions at the right time
-        if (self.entry_pending and not self.position_opened and 
-            time_in_range(self.entry_time, current_time, self.exit_time) and
-            is_market_open()):
-            
-            # Try to enter positions
-            self._try_enter_positions()
-        
-        # Check time-based exit
-        if (self.position_opened and not self.exit_triggered and 
-            current_time >= self.exit_time):
-            
-            self._exit_all_positions("Time-based exit")
-    
-    def _try_enter_positions(self):
-        """Try to enter straddle positions for all configured underlyings"""
-        for underlying in self.underlyings:
-            # Check if we already have positions for this underlying
-            if underlying in self.ce_positions or underlying in self.pe_positions:
-                continue
-                
-            # Get current ATM strike
-            atm_strike = self.option_manager.current_atm_strikes.get(underlying)
-            underlying_price = self.option_manager.underlying_prices.get(underlying)
-            
-            if not atm_strike or not underlying_price:
-                self.logger.warning(f"Cannot enter positions for {underlying}: ATM strike or underlying price not available")
-                continue
-                
-            self.logger.info(f"Entering straddle for {underlying} at strike {atm_strike} (underlying price: {underlying_price})")
-            
-            # Store ATM price at entry for later reference
-            self.entry_atm_prices[underlying] = underlying_price
-            
-            # Subscribe to ATM options
-            ce_symbol = self._get_option_symbol(underlying, atm_strike, "CE")
-            pe_symbol = self._get_option_symbol(underlying, atm_strike, "PE")
-            
-            # Request option subscription
-            self.request_symbol(ce_symbol)
-            self.request_symbol(pe_symbol)
-            
-            # Wait a bit for data to arrive
-            time.sleep(1)
-            
-            # Get option prices
-            ce_data = self.option_data.get(ce_symbol)
-            pe_data = self.option_data.get(pe_symbol)
-            
-            if not ce_data or not pe_data:
-                self.logger.warning(f"Option data not available for {underlying} ATM options")
-                continue
-                
-            # Extract prices
-            ce_price = ce_data.get('last') or ce_data.get('close') or ce_data.get('price')
-            pe_price = pe_data.get('last') or pe_data.get('close') or pe_data.get('price')
-            
-            if not ce_price or not pe_price:
-                self.logger.warning(f"Option prices not available for {underlying} ATM options")
-                continue
-            
-            # Generate buy signals
-            self.generate_signal(ce_symbol, SignalType.BUY, {
-                'price': ce_price,
-                'quantity': 1,
-                'strategy': 'atm_straddle',
-                'underlying': underlying,
-                'type': 'CE'
-            })
-            
-            self.generate_signal(pe_symbol, SignalType.BUY, {
-                'price': pe_price,
-                'quantity': 1,
-                'strategy': 'atm_straddle',
-                'underlying': underlying,
-                'type': 'PE'
-            })
-            
-            # Update position tracking
-            self.ce_positions[underlying] = {
-                'symbol': ce_symbol,
-                'entry_price': ce_price,
-                'current_price': ce_price,
-                'high_price': ce_price,
-                'stop_loss': ce_price * (1 - self.stop_loss_percent / 100),
-                'target': ce_price * (1 + self.target_percent / 100)
-            }
-            
-            self.pe_positions[underlying] = {
-                'symbol': pe_symbol,
-                'entry_price': pe_price,
-                'current_price': pe_price,
-                'high_price': pe_price,
-                'stop_loss': pe_price * (1 - self.stop_loss_percent / 100),
-                'target': pe_price * (1 + self.target_percent / 100)
-            }
-            
-            self.logger.info(f"Entered {underlying} straddle - CE: {ce_symbol} @ {ce_price}, PE: {pe_symbol} @ {pe_price}")
-        
-        # Update state if we entered any positions
-        if self.ce_positions or self.pe_positions:
-            self.position_opened = True
-            self.entry_pending = False
-    
-    def _get_option_symbol(self, underlying: str, strike: float, option_type: str) -> str:
-        """Get option symbol based on underlying, strike and option type"""
-        # This is a simplified example, in reality you would use your option symbol construction logic
-        # or the option_manager to get the actual symbol
-        from datetime import date
-        from utils.expiry_utils import get_next_expiry
-        
-        expiry_date = get_next_expiry(underlying, offset=self.expiry_offset)
-        expiry_str = expiry_date.strftime("%d%b%y").upper()
-        
-        return f"{underlying}{expiry_str}{strike}{option_type}"
-    
-    def _update_option_position(self, symbol: str, event: MarketDataEvent):
-        """Update option position tracking and check for exit conditions"""
-        price = event.data.get('last') or event.data.get('close') or event.data.get('price')
-        if not price:
-            return
-            
-        # Find the position this symbol belongs to
-        position_info = None
-        position_type = None
-        underlying = None
-        
-        for idx, pos in self.ce_positions.items():
-            if pos['symbol'] == symbol:
-                position_info = pos
-                position_type = 'CE'
-                underlying = idx
+        symbols_by_timeframe = {}
+        # Strategy needs underlyings on its primary timeframe and any additional ones
+        for tf in self.all_timeframes:
+             symbols_by_timeframe[tf] = list(self.underlyings) # Return list of underlying symbols
+        self.logger.debug(f"Strategy '{self.id}' requires underlyings: {self.underlyings} on timeframes {self.all_timeframes}")
+        return symbols_by_timeframe
+
+    def on_start(self):
+        """Called when the strategy is started by StrategyManager."""
+        # Reset daily state
+        self.entry_triggered_today = False
+        self.exit_triggered_today = False
+        self.active_straddles.clear()
+        # Note: Initial underlying subscriptions are handled by StrategyManager based on get_required_symbols()
+        # Dynamic option subscriptions are handled by StrategyManager reacting to OptionManager events.
+        self.logger.info(f"ATM Straddle Strategy '{self.id}' started. Waiting for market data and entry time {self.entry_time_str}.")
+
+
+    def on_market_data(self, event: MarketDataEvent):
+        """Process tick data, primarily for updating option prices and checking SL/Target."""
+        if not event.instrument or not event.data: return
+
+        symbol_key = event.instrument.instrument_id # e.g., NFO:NIFTY... or NSE:NIFTY INDEX
+        if not symbol_key: return
+
+        # self.logger.debug(f"Received MarketDataEvent for {symbol_key}")
+
+        # Check if it's an option we are holding
+        underlying_holding = None
+        position_type = None # 'ce' or 'pe'
+        for u_sym, straddle_info in self.active_straddles.items():
+            if straddle_info.get('ce') and straddle_info['ce']['symbol_key'] == symbol_key:
+                underlying_holding = u_sym
+                position_type = 'ce'
                 break
-                
-        if not position_info:
-            for idx, pos in self.pe_positions.items():
-                if pos['symbol'] == symbol:
-                    position_info = pos
-                    position_type = 'PE'
-                    underlying = idx
-                    break
-        
-        if not position_info or not underlying:
+            if straddle_info.get('pe') and straddle_info['pe']['symbol_key'] == symbol_key:
+                underlying_holding = u_sym
+                position_type = 'pe'
+                break
+
+        if underlying_holding and position_type:
+            # It's an option we hold, update its price and check exits
+            price = event.data.get(MarketDataType.LAST_PRICE.value)
+            if price is not None:
+                try:
+                    current_price = float(price)
+                    self._update_option_position(underlying_holding, position_type, current_price)
+                except (ValueError, TypeError):
+                     self.logger.warning(f"Invalid price format for {symbol_key}: {price}")
+            # else:
+                 # self.logger.debug(f"No last price in market data for {symbol_key}")
+
+        # We don't need to process underlying ticks here, as OptionManager handles
+        # underlying price updates and triggers ATM changes.
+
+
+    def on_bar(self, event: BarEvent):
+        """Process bar data, primarily for entry and time-based exit logic."""
+        if not event.instrument: return
+
+        symbol_key = event.instrument.instrument_id
+        timeframe = event.timeframe
+
+        # Only act on the primary timeframe defined for the strategy
+        if timeframe != self.timeframe:
             return
-            
+
+        # self.logger.debug(f"Received BarEvent for {symbol_key}@{timeframe}")
+
+        current_dt = datetime.fromtimestamp(event.timestamp) # Bar completion time
+        current_time = current_dt.time()
+
+        # --- Entry Logic ---
+        # Check if it's time to enter and we haven't entered today
+        if not self.entry_triggered_today and current_time >= self.entry_time:
+            # Check if market is open (redundant if entry_time is within market hours, but safe)
+            # if is_market_open(current_dt): # Assumes is_market_open checks date too
+            self.logger.info(f"Entry time {self.entry_time_str} reached. Attempting to enter straddles.")
+            self._try_enter_positions()
+            self.entry_triggered_today = True # Mark entry attempt for today
+            # else:
+            #     self.logger.info(f"Entry time {self.entry_time_str} reached, but market is closed.")
+            #     self.entry_triggered_today = True # Prevent re-attempting today
+
+
+        # --- Time-Based Exit Logic ---
+        # Check if it's time to exit and we haven't exited today
+        if not self.exit_triggered_today and current_time >= self.exit_time:
+             if self.active_straddles: # Check if we have any open positions
+                 self.logger.info(f"Exit time {self.exit_time_str} reached. Exiting all open straddle positions.")
+                 self._exit_all_positions("Time-based exit")
+                 self.exit_triggered_today = True # Mark exit for today
+             # else: # No positions open, just mark exit time passed
+             #     self.exit_triggered_today = True
+
+
+    def _try_enter_positions(self):
+        """Attempts to enter ATM straddle positions for all configured underlyings."""
+        if not self.option_manager:
+             self.logger.error("OptionManager not available. Cannot enter positions.")
+             return
+
+        for underlying_symbol in self.underlyings:
+            # Skip if already holding a position for this underlying
+            if underlying_symbol in self.active_straddles:
+                 self.logger.info(f"Already have an active straddle for {underlying_symbol}. Skipping entry.")
+                 continue
+
+            # 1. Get current ATM strike from OptionManager
+            # Use the direct calculation based on latest price, not the potentially stale cached value
+            current_price = self.option_manager.underlying_prices.get(underlying_symbol)
+            strike_interval = self.option_manager.strike_intervals.get(underlying_symbol)
+
+            if current_price is None or strike_interval is None:
+                self.logger.warning(f"Cannot determine ATM strike for {underlying_symbol}: Price or interval missing.")
+                continue
+
+            atm_strike = self.option_manager._get_atm_strike_internal(current_price, strike_interval)
+            self.logger.info(f"Attempting entry for {underlying_symbol}. Current Price: {current_price:.2f}, ATM Strike: {atm_strike}")
+
+            # 2. Get the CE and PE Instrument objects using OptionManager
+            ce_instrument = self.option_manager.get_option_instrument(underlying_symbol, atm_strike, "CE", self.expiry_offset)
+            pe_instrument = self.option_manager.get_option_instrument(underlying_symbol, atm_strike, "PE", self.expiry_offset)
+
+            if not ce_instrument or not pe_instrument:
+                self.logger.error(f"Could not get CE/PE instruments for {underlying_symbol} ATM strike {atm_strike}. Subscription might be pending or failed.")
+                continue
+
+            ce_symbol_key = ce_instrument.instrument_id
+            pe_symbol_key = pe_instrument.instrument_id
+
+            # 3. Get latest prices for these options from DataManager's cache
+            ce_data = self.data_manager.get_latest_tick(ce_symbol_key) # Use DataManager cache
+            pe_data = self.data_manager.get_latest_tick(pe_symbol_key) # Use DataManager cache
+
+            if not ce_data or not pe_data:
+                self.logger.warning(f"Market data not yet available for {ce_symbol_key} or {pe_symbol_key}. Retrying next cycle.")
+                continue # Data might arrive shortly after subscription
+
+            ce_price = ce_data.get(MarketDataType.LAST_PRICE.value)
+            pe_price = pe_data.get(MarketDataType.LAST_PRICE.value)
+
+            if ce_price is None or pe_price is None:
+                self.logger.warning(f"Last price not found in data for {ce_symbol_key} or {pe_symbol_key}.")
+                continue
+
+            try:
+                ce_price = float(ce_price)
+                pe_price = float(pe_price)
+            except (ValueError, TypeError):
+                 self.logger.error(f"Invalid price format for CE ({ce_price}) or PE ({pe_price}).")
+                 continue
+
+            # 4. Generate BUY signals
+            common_signal_data = {
+                'quantity': self.quantity,
+                'strategy': self.id,
+                'underlying': underlying_symbol,
+                'atm_strike': atm_strike
+            }
+
+            self.generate_signal(ce_instrument.symbol, SignalType.BUY, data={**common_signal_data, 'type': 'CE', 'price': ce_price})
+            self.generate_signal(pe_instrument.symbol, SignalType.BUY, data={**common_signal_data, 'type': 'PE', 'price': pe_price})
+
+            # 5. Initialize position tracking immediately (don't wait for fill)
+            #    We assume the order will likely fill at or near the signal price for MARKET orders.
+            #    Stop loss/target calculations are based on this assumed entry.
+            self.active_straddles[underlying_symbol] = {
+                 'atm': atm_strike,
+                 'ce': {
+                     'symbol_key': ce_symbol_key,
+                     'symbol': ce_instrument.symbol, # Store trading symbol too
+                     'entry_price': ce_price,
+                     'current_price': ce_price,
+                     'high_price': ce_price, # Initialize high price
+                     'stop_loss': ce_price * (1 - self.stop_loss_percent / 100),
+                     'target': ce_price * (1 + self.target_percent / 100),
+                     'exited': False
+                 },
+                 'pe': {
+                     'symbol_key': pe_symbol_key,
+                     'symbol': pe_instrument.symbol,
+                     'entry_price': pe_price,
+                     'current_price': pe_price,
+                     'high_price': pe_price, # Initialize high price
+                     'stop_loss': pe_price * (1 - self.stop_loss_percent / 100),
+                     'target': pe_price * (1 + self.target_percent / 100),
+                     'exited': False
+                 }
+            }
+            self.logger.info(f"BUY signals generated for {underlying_symbol} straddle. CE: {ce_instrument.symbol} @ ~{ce_price:.2f}, PE: {pe_instrument.symbol} @ ~{pe_price:.2f}")
+
+
+    def _update_option_position(self, underlying_symbol: str, position_type: str, current_price: float):
+        """Update option position tracking (price, high, SL) and check for individual leg exits."""
+        if underlying_symbol not in self.active_straddles or position_type not in self.active_straddles[underlying_symbol]:
+            # self.logger.warning(f"Attempted to update non-existent position: {underlying_symbol} {position_type}")
+            return
+
+        position_info = self.active_straddles[underlying_symbol][position_type]
+
+        # Ignore if already exited
+        if position_info['exited']:
+            return
+
         # Update current price
-        position_info['current_price'] = price
-        
-        # Update high price for trailing stop
-        if price > position_info['high_price']:
-            position_info['high_price'] = price
-            
-            # Update trailing stop if enabled
-            if self.trail_points > 0:
-                new_stop = price * (1 - self.trail_points / 100)
-                if new_stop > position_info['stop_loss']:
-                    position_info['stop_loss'] = new_stop
-                    self.logger.info(f"Updated trailing stop for {symbol} to {new_stop}")
-        
-        # Check stop loss
-        if price <= position_info['stop_loss']:
-            # Exit this leg
-            self.generate_signal(symbol, SignalType.SELL, {
-                'price': price,
-                'quantity': 1,
-                'strategy': 'atm_straddle',
-                'reason': 'stop_loss',
-                'underlying': underlying,
-                'type': position_type
+        position_info['current_price'] = current_price
+        symbol = position_info['symbol'] # Trading symbol
+        entry_price = position_info['entry_price']
+
+        # Update high price for trailing stop calculation
+        position_info['high_price'] = max(position_info['high_price'], current_price)
+
+        # Update trailing stop loss if applicable
+        if self.trail_percent > 0:
+            # Calculate potential new stop loss based on high price
+            potential_new_stop = position_info['high_price'] * (1 - self.trail_percent / 100)
+            # Only trail upwards
+            if potential_new_stop > position_info['stop_loss']:
+                old_sl = position_info['stop_loss']
+                position_info['stop_loss'] = potential_new_stop
+                # self.logger.info(f"Trailing SL updated for {symbol}: {old_sl:.2f} -> {potential_new_stop:.2f} (High: {position_info['high_price']:.2f})")
+
+        # --- Check Exit Conditions for this leg ---
+        exit_reason = None
+        if current_price <= position_info['stop_loss']:
+            exit_reason = "stop_loss"
+        elif current_price >= position_info['target']:
+            exit_reason = "target"
+
+        if exit_reason:
+            self.logger.info(f"{exit_reason.replace('_',' ').title()} triggered for {symbol} at {current_price:.2f} (Entry: {entry_price:.2f}, SL: {position_info['stop_loss']:.2f}, Target: {position_info['target']:.2f})")
+            # Generate SELL signal for this leg only
+            self.generate_signal(symbol, SignalType.SELL, data={
+                'price': current_price, # Use current price for market order exit
+                'quantity': self.quantity,
+                'strategy': self.id,
+                'reason': exit_reason,
+                'underlying': underlying_symbol,
+                'type': position_type.upper(),
+                'entry_price': entry_price # Include entry for PnL calculation later
             })
-            
-            self.logger.info(f"Stop loss triggered for {symbol} at {price} (entry: {position_info['entry_price']})")
-            
-            # Remove from tracking
-            if position_type == 'CE':
-                del self.ce_positions[underlying]
-            else:
-                del self.pe_positions[underlying]
-                
-        # Check target
-        elif price >= position_info['target']:
-            # Exit this leg
-            self.generate_signal(symbol, SignalType.SELL, {
-                'price': price,
-                'quantity': 1,
-                'strategy': 'atm_straddle',
-                'reason': 'target',
-                'underlying': underlying,
-                'type': position_type
-            })
-            
-            self.logger.info(f"Target reached for {symbol} at {price} (entry: {position_info['entry_price']})")
-            
-            # Remove from tracking
-            if position_type == 'CE':
-                del self.ce_positions[underlying]
-            else:
-                del self.pe_positions[underlying]
-    
-    def _check_exit_conditions(self, underlying: str, current_price: float, timestamp: datetime):
-        """Check underlying-based exit conditions"""
-        # For ATM straddle, we might want to exit based on underlying movement
-        # For now, this is just a placeholder
-        pass
-    
+            # Mark this leg as exited
+            position_info['exited'] = True
+
+            # Check if both legs have exited, if so, remove the straddle entry
+            other_leg_type = 'pe' if position_type == 'ce' else 'ce'
+            if self.active_straddles[underlying_symbol][other_leg_type]['exited']:
+                self.logger.info(f"Both legs exited for {underlying_symbol} straddle. Removing from active tracking.")
+                del self.active_straddles[underlying_symbol]
+
+
     def _exit_all_positions(self, reason: str):
-        """Exit all open positions"""
-        self.exit_triggered = True
-        
-        # Exit all CE positions
-        for underlying, position in list(self.ce_positions.items()):
-            symbol = position['symbol']
-            price = position['current_price']
-            
-            self.generate_signal(symbol, SignalType.SELL, {
-                'price': price,
-                'quantity': 1,
-                'strategy': 'atm_straddle',
-                'reason': reason,
-                'underlying': underlying,
-                'type': 'CE'
-            })
-            
-            self.logger.info(f"Exiting CE position for {underlying}: {symbol} at {price} - {reason}")
-        
-        # Exit all PE positions
-        for underlying, position in list(self.pe_positions.items()):
-            symbol = position['symbol']
-            price = position['current_price']
-            
-            self.generate_signal(symbol, SignalType.SELL, {
-                'price': price,
-                'quantity': 1,
-                'strategy': 'atm_straddle',
-                'reason': reason,
-                'underlying': underlying,
-                'type': 'PE'
-            })
-            
-            self.logger.info(f"Exiting PE position for {underlying}: {symbol} at {price} - {reason}")
-        
-        # Clear position tracking
-        self.ce_positions.clear()
-        self.pe_positions.clear()
-    
-    def on_fill(self, event):
-        """Handle fill events"""
-        # Update performance tracking
-        if hasattr(event, 'signal_type') and hasattr(event, 'symbol'):
-            symbol = event.symbol
-            
-            if event.signal_type == SignalType.BUY:
-                self.logger.info(f"Buy order filled for {symbol} at {event.fill_price}")
-            elif event.signal_type == SignalType.SELL:
-                self.logger.info(f"Sell order filled for {symbol} at {event.fill_price}")
-                
-                # Check if this was a profitable trade
-                if hasattr(event, 'entry_price') and event.fill_price > event.entry_price:
-                    self.successful_trades += 1
-                else:
-                    self.failed_trades += 1
-    
+        """Exit all currently open legs of all active straddles."""
+        self.logger.info(f"Exiting all active positions. Reason: {reason}")
+        straddles_to_remove = list(self.active_straddles.keys()) # Avoid modifying dict while iterating
+
+        for underlying_symbol in straddles_to_remove:
+            straddle_info = self.active_straddles.get(underlying_symbol)
+            if not straddle_info: continue # Should not happen
+
+            for leg_type in ['ce', 'pe']:
+                position_info = straddle_info.get(leg_type)
+                if position_info and not position_info['exited']:
+                    symbol = position_info['symbol']
+                    current_price = position_info['current_price'] # Use last known price
+                    entry_price = position_info['entry_price']
+
+                    self.logger.info(f"Generating SELL signal for {symbol} at ~{current_price:.2f}. Reason: {reason}")
+                    self.generate_signal(symbol, SignalType.SELL, data={
+                        'price': current_price,
+                        'quantity': self.quantity,
+                        'strategy': self.id,
+                        'reason': reason,
+                        'underlying': underlying_symbol,
+                        'type': leg_type.upper(),
+                        'entry_price': entry_price
+                    })
+                    # Mark as exited immediately
+                    position_info['exited'] = True
+
+            # Remove the straddle entry after processing both legs
+            if underlying_symbol in self.active_straddles:
+                 del self.active_straddles[underlying_symbol]
+
+        self.logger.info("Finished generating exit signals for all active positions.")
+
+
+    def on_fill(self, event: FillEvent):
+        """Handle fill events to confirm trades and potentially update entry prices."""
+        # Optional: Update entry price based on actual fill price if needed
+        # For now, just log the fill.
+        if hasattr(event, 'symbol') and hasattr(event, 'fill_price') and hasattr(event, 'quantity'):
+             action = "Bought" if event.quantity > 0 else "Sold"
+             self.logger.info(f"Fill received: {action} {abs(event.quantity)} of {event.symbol} @ {event.fill_price:.2f} (Order ID: {event.order_id})")
+
+             # Update performance tracking (basic example)
+             # More complex logic needed if tracking PnL per trade
+             # if action == "Sold":
+             #      # Find corresponding entry - requires linking fills to entries
+             #      pass
+
+
     def on_stop(self):
-        """Called when the strategy is stopped"""
-        # Exit all positions if any are open
-        if self.position_opened and not self.exit_triggered:
+        """Called when the strategy is stopped by StrategyManager."""
+        # Ensure all positions are exited cleanly
+        if self.active_straddles:
+            self.logger.warning(f"Strategy '{self.id}' stopping with active positions. Forcing exit.")
             self._exit_all_positions("Strategy stopped")
-        
-        self.logger.info("ATM Straddle Strategy stopped")
+
+        self.logger.info(f"ATM Straddle Strategy '{self.id}' stopped.")
+
+

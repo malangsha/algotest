@@ -1,23 +1,24 @@
-import logging
 import os
 import json
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Any, Set, Tuple, Union
-from datetime import datetime, timedelta
 import threading
 import time
 import queue
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from enum import Enum
 import pickle
 import hashlib
 
-from utils.constants import MarketDataType, Exchange, InstrumentType, Timeframe
+from typing import Dict, List, Optional, Any, Set, Tuple, Union
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from collections import defaultdict
+from enum import Enum
+
+from utils.constants import MarketDataType, Exchange, InstrumentType
 from utils.timeframe_manager import TimeframeManager
 from models.instrument import Instrument, AssetClass
-from models.events import Event, EventType, MarketDataEvent, BarEvent, TimeframeEventType, TimeframeBarEvent
+from models.events import Event, EventType, MarketDataEvent, BarEvent
 from core.event_manager import EventManager
 from core.logging_manager import get_logger
 from utils.greeks_calculator import OptionsGreeksCalculator
@@ -53,6 +54,7 @@ class DataManager:
         self.persistence_interval = data_config.get('persistence', {}).get('interval', 60)  # Reduced to 60 seconds
         self.use_cache = data_config.get('use_cache', True)
         self.cache_limit = data_config.get('cache_limit', 10000)  # per symbol
+        self.tfm_cache_limit = data_config.get('timeframe_manager_cache_limit', 10000)
         self.use_redis = data_config.get('use_redis', False)
         self.redis_client = None
         
@@ -60,11 +62,12 @@ class DataManager:
         self.thread_pool_size = data_config.get('thread_pool_size', 4)
         self.processing_queue_size = data_config.get('processing_queue_size', 10000)
         self.batch_processing = data_config.get('batch_processing', True)
-        self.batch_size = data_config.get('batch_size', 100)
+        self.batch_size = data_config.get('batch_size', 200)
         
         # Greek calculation configuration
         self.calculate_greeks = data_config.get('calculate_greeks', True)
         self.greeks_risk_free_rate = data_config.get('greeks_risk_free_rate', 0.05)
+        self.default_volatility = data_config.get('default_volatility', 0.20) 
         
         # Enhanced data structures for tick, 1m and other timeframe data
         # Using dictionaries for O(1) lookups instead of lists where possible
@@ -85,24 +88,29 @@ class DataManager:
         self.data_locks = {}  # Symbol -> Lock
         self.global_lock = threading.RLock()
         
-        # Initialize thread pool for parallel processing
-        self.thread_pool = ThreadPoolExecutor(max_workers=self.thread_pool_size)
-        
-        # Initialize processing queue and thread
+        # --- Threading & Concurrency ---
+        self.data_locks: Dict[str, threading.RLock] = defaultdict(threading.RLock)
+        self.global_lock = threading.RLock()
         self.tick_queue = queue.Queue(maxsize=self.processing_queue_size)
         self._shutdown_event = threading.Event()
+        self.persistence_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='PersistenceWorker')
+        self.tick_processing_executor = ThreadPoolExecutor(max_workers=self.thread_pool_size, thread_name_prefix='TickProcessor')
         
         # Store instrument objects for easy lookup
         self.instruments: Dict[str, Instrument] = {} # symbol_key -> Instrument
+        # Store the *converted* tick data (using MarketDataType keys)
+        self.last_tick_data: Dict[str, Dict[str, Any]] = {} # symbol_key -> latest converted tick dict
+        # Store last cumulative volume for calculating tick volume from feeds like Finvasia
+        self.last_cumulative_volume: Dict[str, int] = {} # symbol_key -> last value of cumulative volume field
         
-        # Initialize subscription tracking
+        # Initialize timeframe management
+        self.timeframe_manager = TimeframeManager(max_bars_in_memory=self.tfm_cache_limit)
         self.timeframe_subscriptions = {}
         for timeframe in TimeframeManager.VALID_TIMEFRAMES:
             self.timeframe_subscriptions[timeframe] = {}
             
-        # Additional index for reverse lookup (symbol -> strategies)
-        # This helps with efficient event distribution
-        self.symbol_subscribers = {}  # {symbol: {timeframe: set(strategy_ids)}}
+        # {symbol_key: {timeframe: set(strategy_ids)}}
+        self.symbol_subscribers: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
 
         # Persistence mechanism with improved threading
         self._persistence_thread = None
@@ -125,20 +133,16 @@ class DataManager:
         self.tick_processor_thread.start()
         
         # Track active subscriptions
-        self.active_subscriptions = set()
+        self.active_subscriptions: Set[str] = set() 
         
-        self.logger.info("Enhanced Data Manager initialized with low latency optimizations")
+        self.logger.info(f"DataManager initialized. Persistence: {self.persistence_enabled}. TFM Cache: {self.tfm_cache_limit} bars.")
         
     def _setup_persistence(self):
         """Setup the persistence directory structure and mechanism"""
         try:
             # Create main data directory
             os.makedirs(self.persistence_path, exist_ok=True)
-            
-            # Create subdirectories for different data types
-            os.makedirs(os.path.join(self.persistence_path, 'ticks'), exist_ok=True)
             os.makedirs(os.path.join(self.persistence_path, 'bars'), exist_ok=True)
-            os.makedirs(os.path.join(self.persistence_path, 'greeks'), exist_ok=True)
             
             # Start persistence thread
             self._persistence_thread = threading.Thread(target=self._persistence_loop, daemon=True)
@@ -247,7 +251,15 @@ class DataManager:
             return
         
         if symbol_key not in self.instruments:
-            self.instruments[symbol_key] = instrument
+            with self.global_lock:
+                # Double check after acquiring lock
+                if symbol_key not in self.instruments:
+                    self.instruments[symbol_key] = event.instrument
+
+        # Add symbol_key to data for downstream convenience
+        # This might be redundant if the key is already derived from instrument,
+        # but ensures it's present in the dict passed around.
+        event.data['symbol_key'] = symbol_key
 
         try:
             # Put event in queue for processing
@@ -256,455 +268,358 @@ class DataManager:
             self.logger.warning("Tick processing queue full, dropping market data event")
 
     def _process_tick_queue(self):
-        """Process market data events from the queue"""
+        """Continuously processes market data events from the queue."""
+        self.logger.info("Tick processing thread started.")
         batch = []
-        last_process_time = time.time()
-        
-        while True:
+        last_batch_time = time.monotonic()
+        while not self._shutdown_event.is_set():
             try:
-                # Get next event from queue with timeout
-                try:
-                    event = self.tick_queue.get(timeout=0.001)
-                    batch.append(event)
-                except queue.Empty:
-                    # Process batch if we have any events or it's been a while
-                    if batch and (len(batch) >= self.batch_size or 
-                                  time.time() - last_process_time > 0.01):
-                        self._process_market_data_batch(batch)
-                        batch = []
-                        last_process_time = time.time()
-                    continue
-                
-                # Process batch if it's full
-                if len(batch) >= self.batch_size:
+                while len(batch) < self.batch_size:
+                    try:
+                        event = self.tick_queue.get_nowait()
+                        if event is None: self._shutdown_event.set(); break
+                        batch.append(event)
+                        self.tick_queue.task_done()
+                    except queue.Empty: break
+                if self._shutdown_event.is_set(): break
+                if batch:
                     self._process_market_data_batch(batch)
                     batch = []
-                    last_process_time = time.time()
-                    
+                    last_batch_time = time.monotonic()
+                else: time.sleep(0.001) # Prevent busy-waiting
             except Exception as e:
-                self.logger.error(f"Error in tick processing thread: {str(e)}")
-                import traceback
-                self.logger.error(traceback.format_exc())
-                # Clear batch on error
+                self.logger.error(f"Error in tick processing loop: {e}", exc_info=True)
                 batch = []
-                time.sleep(0.01)  # Brief pause on error
+                time.sleep(0.1)
+        # Process remaining after shutdown
+        if batch: self._process_market_data_batch(batch)
+        while not self.tick_queue.empty():
+             try:
+                  event = self.tick_queue.get_nowait()
+                  if event and event.data.get('symbol_key'): self._process_market_data_batch([event])
+                  self.tick_queue.task_done()
+             except queue.Empty: break
+             except Exception as e: self.logger.error(f"Error processing final ticks: {e}")
+        self.logger.info("Tick processing thread stopped.")
     
     def _process_market_data_batch(self, batch: List[MarketDataEvent]):
-        """Process market data events in a batch for improved performance.
-        
-        Args:
-            batch: List of market data events
-        """
-        # Group events by symbol to process together
-        symbol_events = {}
+        """Processes a batch of market data events, grouping by symbol."""
+        symbol_event_groups = defaultdict(list)
         for event in batch:
-            if event.instrument:
-                symbol_key = self._get_symbol_key(event.instrument)
-                if symbol_key not in symbol_events:
-                    symbol_events[symbol_key] = []
-                symbol_events[symbol_key].append(event)
-            else:
-                self.logger.warning(f"Received market data event without instrument: {event}")
-
-        # Process each symbol's events in parallel
-        with ThreadPoolExecutor(max_workers=min(len(symbol_events), self.thread_pool_size)) as executor:
-            futures = [executor.submit(self._process_symbol_events, key, events) 
-                       for key, events in symbol_events.items()]
-            
-            # Wait for all processing to complete
-            for future in futures:
+            symbol_key = event.data.get('symbol_key') # Key should be added in _on_market_data
+            if symbol_key: symbol_event_groups[symbol_key].append(event)
+        futures = [self.tick_processing_executor.submit(self._process_symbol_events, key, events)
+                   for key, events in symbol_event_groups.items()]
+        for future in futures:
+            try: future.result(timeout=1.0)
+            except Exception as e: self.logger.error(f"Error processing symbol events batch future: {e}", exc_info=True)
+    
+    def _process_symbol_events(self, symbol_key: str, events: List[MarketDataEvent]):
+        """Processes all events for a single symbol sequentially."""
+        with self.data_locks[symbol_key]: # Lock specific to this symbol
+            for event in events:
                 try:
-                    future.result()  # Check for exceptions
+                    self._process_single_market_data_event(symbol_key, event)
                 except Exception as e:
-                    self.logger.error(f"Error processing symbol events: {e}")
+                    self.logger.error(f"Error processing single event for {symbol_key}: {e}", exc_info=True)
     
-    def _process_symbol_events(self, key: str, events: List[MarketDataEvent]):
+    def _process_single_market_data_event(self, symbol_key: str, event: MarketDataEvent):
         """
-        Process all events for a specific symbol.
-        
-        Args:
-            key: Symbol key (including exchange if applicable)
-            events: List of events for this symbol
+        Processes one market data event:
+        1. Calculates tick volume from cumulative volume if necessary.
+        2. Updates last tick data store.
+        3. Passes standardized tick to TimeframeManager.
+        4. Handles completed bars (Greeks calculation, event publishing).
+        Assumes event.data already contains converted data using MarketDataType keys.
         """
         try:
-            # Get symbol-specific lock
-            lock = self._get_lock_for_symbol(key)
-            
-            # Process events sequentially for this symbol
-            with lock:
-                for event in events:
-                    self._process_single_market_data_event(key, event)
-        except Exception as e:
-            self.logger.error(f"Error processing events for {key}: {str(e)}")
-    
-    def _process_single_market_data_event(self, key: str, event: MarketDataEvent):
-        """
-        Process a single market data event.
-        
-        Args:
-            key: Symbol key
-            event: Market data event
-        """
-        try:
-            # Extract event data
-            instrument = event.instrument
-            data = event.data
-            timestamp = event.timestamp
-            
-            # Convert TIMESTAMP to lowercase timestamp if present in data
-            if 'TIMESTAMP' in data:
-                data['timestamp'] = data['TIMESTAMP']
-            
-            # Initialize data structures if needed
-            if key not in self.data_store:
-                self.data_store[key] = {}
-            if key not in self.tick_cache:
-                self.tick_cache[key] = []
-            
-            # Store the latest data
-            self.last_data[key] = data
-            
-            # Add to historical data store with timestamp as key for O(1) lookup
-            self.data_store[key][timestamp] = data
-            
-            # Also keep in tick cache for quick access (circular buffer)
-            self.tick_cache[key].append((timestamp, data))
-            if len(self.tick_cache[key]) > self.tick_cache_size:
-                self.tick_cache[key].pop(0)
-            
-            # Enforce overall cache limit if needed
-            if self.use_cache and len(self.data_store[key]) > self.cache_limit:
-                # Remove oldest entries
-                oldest_keys = sorted(self.data_store[key].keys())[:len(self.data_store[key]) - self.cache_limit]
-                for old_key in oldest_keys:
-                    del self.data_store[key][old_key]
-            
-            # Handle bar/OHLC data
-            if (event.data_type == MarketDataType.BAR or
-                MarketDataType.OHLC.value in data):
-                self._update_ohlc(key, data, timestamp, instrument)
-            
-            # Process tick data through the timeframe manager if price is available
-            if event.data_type == MarketDataType.TRADE and 'price' in data:
-                # Extract OI if available
-                open_interest = data.get('open_interest', 0)
-                
-                tick_data = {
-                    'timestamp': timestamp,
-                    'price': float(data['price']),
-                    'volume': float(data.get('volume', 0)),
-                    'open_interest': float(open_interest)
-                }
-                
-                # Process this tick in the timeframe manager
-                completed_bars = self.timeframe_manager.process_tick(key, tick_data)
-                
-                # For each completed bar, publish a bar event to subscribers
-                for timeframe, is_completed in completed_bars.items():
-                    if is_completed:
-                        # Get the completed bar
-                        bars_df = self.timeframe_manager.get_bars(key, timeframe, 1)
-                        if bars_df is not None and not bars_df.empty:
-                            # Get the latest bar
-                            bar = bars_df.iloc[-1].to_dict()
-                            
-                            # Calculate Greeks for options if needed
-                            greeks_data = None
-                            if self.calculate_greeks and instrument.instrument_type == InstrumentType.OPTION:
-                                greeks_data = self._calculate_option_greeks(instrument, bar['close'], timestamp)
-                                
-                                # Store Greeks with the bar data
-                                if greeks_data:
-                                    if key not in self.greeks_data:
-                                        self.greeks_data[key] = {}
-                                    self.greeks_data[key][timestamp] = greeks_data
-                            
-                            # Publish bar event to interested strategies with Greeks data
-                            self._publish_timeframe_bar_event(key, timeframe, bar, greeks_data, open_interest, instrument)
+            instrument = self.instruments.get(symbol_key)
+            if not instrument: return
 
-                            # If this is a 1-minute bar, store it specially
-                            if timeframe == '1m':
-                                self._store_one_minute_bar(key, bar, greeks_data, open_interest)
+            converted_tick_data = event.data
             
-            # Store in Redis if enabled
-            if self.use_redis and self.redis_client:
-                self._store_in_redis(key, data, timestamp)
-                
+            # Store the converted tick data
+            self.last_tick_data[symbol_key] = converted_tick_data
+
+            # --- Calculate Tick Volume from Cumulative (if applicable) ---
+            # The feed handler (_convert_tick_to_market_data) puts cumulative volume
+            # into MarketDataType.VOLUME.value. We need to calculate the delta here.
+            tick_for_tfm = converted_tick_data.copy() # Create a copy to modify for TFM
+            current_cumulative_v = converted_tick_data.get(MarketDataType.VOLUME.value)
+            tick_volume = 0.0 # Default volume
+            
+            if current_cumulative_v is not None:
+                try:
+                    current_v_int = int(current_cumulative_v)
+                    last_v_int = self.last_cumulative_volume.get(symbol_key, 0)
+
+                    if current_v_int >= last_v_int: # Normal case or first tick
+                        tick_volume = float(current_v_int - last_v_int)
+                    else: # Volume reset detected
+                        self.logger.warning(f"Cumulative volume reset detected for {symbol_key}. Current: {current_v_int}, Last: {last_v_int}. Using current as tick volume.")
+                        tick_volume = float(current_v_int)
+
+                    self.last_cumulative_volume[symbol_key] = current_v_int
+                except (ValueError, TypeError) as e:
+                    self.logger.warning(f"Could not process cumulative volume for {symbol_key}: {e}. Raw: {current_cumulative_v}. Using volume 0.")
+                    tick_volume = 0.0
+            
+            # Update the dictionary being passed to TimeframeManager with the calculated tick volume
+            tick_for_tfm[MarketDataType.VOLUME.value] = tick_volume
+
+            # --- Tick Processing via TimeframeManager ---
+            # Ensure necessary fields for TimeframeManager are present
+            self.logger.debug(f"tick_for_tfm: {tick_for_tfm}")
+            if MarketDataType.LAST_PRICE.value in tick_for_tfm and MarketDataType.TIMESTAMP.value in tick_for_tfm:
+                try:
+                    # Pass the modified tick data (with calculated volume) to TimeframeManager
+                    completed_bars_info = self.timeframe_manager.process_tick(symbol_key, tick_for_tfm)
+
+                    # --- Handle Completed Bars ---
+                    for timeframe, is_completed in completed_bars_info.items():
+                        if is_completed:
+                            # Retrieve the newly completed bar
+                            bars_df = self.timeframe_manager.get_bars(symbol_key, timeframe, limit=1)
+                            if bars_df is not None and not bars_df.empty:
+                                # Convert the bar row to a dictionary
+                                bar_data = bars_df.iloc[-1].to_dict()
+                                greeks_data = None
+                                implied_vol = None
+
+                                # Calculate Greeks if applicable
+                                if self.calculate_greeks and instrument.instrument_type == InstrumentType.OPTION:
+                                    greeks_result = self._calculate_option_greeks_for_bar(instrument, bar_data)
+                                    if greeks_result:
+                                        greeks_data, implied_vol = greeks_result
+                                        # Add greeks and IV to the bar dictionary itself for BarEvent
+                                        bar_data.update(greeks_data)
+                                        bar_data['implied_volatility'] = implied_vol
+
+                                # --- Publish Standard BarEvent ---
+                                self._publish_bar_event(
+                                    symbol_key=symbol_key,
+                                    timeframe=timeframe,
+                                    bar_data=bar_data, # Contains OHLCVOI + Greeks/IV if calculated
+                                    instrument=instrument
+                                )
+
+                except Exception as e:
+                     self.logger.error(f"Error processing tick via TimeframeManager for {symbol_key}: {e}. Tick for TFM: {tick_for_tfm}", exc_info=True)
+            else:
+                self.logger.warning(f"Skipping tick for {symbol_key} due to missing price or timestamp in converted data: {tick_for_tfm}")
         except Exception as e:
-            self.logger.error(f"Error processing market data for {key}: {str(e)}")
+            self.logger.error(f"Error processing market data for {symbol_key}: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
 
-    def _get_underlying_price(self, underlying_symbol: str) -> Optional[float]:
+    def _publish_bar_event(self, symbol_key: str, timeframe: str, bar_data: Dict[str, Any],
+                           instrument: Instrument):
         """
-        Get the price of an underlying symbol.
-        
+        Checks subscriptions and publishes a standard BarEvent for a completed bar.
+        (Replaces _publish_timeframe_bar_event)
+
         Args:
-            underlying_symbol: Underlying symbol
-            
-        Returns:
-            Optional[float]: Underlying price or None if not available
+            symbol_key: The unique symbol key (e.g., 'NSE:RELIANCE').
+            timeframe: The timeframe of the completed bar (e.g., '1m', '5m').
+            bar_data: The completed bar data as a dictionary (OHLCVOI + optional Greeks/IV).
+            instrument: The Instrument object corresponding to the symbol_key.
         """
-        # First check the last tick data
-        if underlying_symbol in self.last_tick_data:
-            data = self.last_tick_data[underlying_symbol]
-            price = data.get(MarketDataType.LAST_PRICE.value)
-            if price is not None:
-                return float(price)
-                
-            # Try bid/ask midpoint
-            bid = data.get(MarketDataType.BID.value)
-            ask = data.get(MarketDataType.ASK.value)
-            if bid is not None and ask is not None:
-                return (float(bid) + float(ask)) / 2
-                
-        # If not in tick data, check minute bars
-        if underlying_symbol in self.one_minute_data:
-            df = self.one_minute_data[underlying_symbol]
-            if not df.empty:
-                return float(df.iloc[-1]['close'])
-                
-        return None
-    
-    def _store_one_minute_bar(self, key: str, bar: Dict, greeks: Optional[Dict] = None, open_interest: Optional[float] = None):
-        """
-        Store a 1-minute bar with associated Greeks and OI.
-        
-        Args:
-            key: Symbol key
-            bar: Bar data dictionary
-            greeks: Optional Greeks data
-            open_interest: Optional open interest
-        """
-        try:
-            # Initialize if needed
-            if key not in self.one_minute_data:
-                self.one_minute_data[key] = pd.DataFrame(
-                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
-                             'open_interest', 'delta', 'gamma', 'theta', 'vega', 'rho']
+        # Check if any strategy is subscribed to this specific symbol and timeframe
+        subscribers = self.symbol_subscribers.get(symbol_key, {}).get(timeframe)
+
+        if subscribers:
+            # Extract Greeks and OI from bar_data if they exist (they were added during calculation)
+            greeks = {k: bar_data.get(k) for k in ['delta', 'gamma', 'theta', 'vega', 'rho'] if k in bar_data}
+            open_interest = bar_data.get('open_interest')
+            implied_vol = bar_data.get('implied_volatility')
+
+            try:
+                # Ensure timestamp is an integer if required by event definition
+                bar_timestamp = int(bar_data['timestamp'])
+
+                # Create the standard BarEvent
+                bar_event = BarEvent(
+                    event_type=EventType.BAR,
+                    timestamp=bar_timestamp,
+                    instrument=instrument,
+                    timeframe=timeframe,
+                    # Pass individual OHLCV values to BarEvent constructor
+                    open_price=bar_data.get('open', 0.0),
+                    high_price=bar_data.get('high', 0.0),
+                    low_price=bar_data.get('low', 0.0),
+                    close_price=bar_data.get('close', 0.0),
+                    volume=bar_data.get('volume', 0.0),
+                    bar_start_time=bar_timestamp, # Use bar timestamp as start time
+                    # Pass optional attributes separately if needed by BarEvent definition
+                    # (Assuming BarEvent doesn't automatically take greeks/oi/iv from a dict)
+                    # greeks=greeks if any(v is not None for v in greeks.values()) else None,
+                    # open_interest=open_interest,
+                    # implied_volatility=implied_vol
                 )
-                self.one_minute_data[key].set_index('timestamp', inplace=True)
-            
-            # Use current timestamp in milliseconds if not provided
-            current_timestamp = int(time.time() * 1000)
-            
-            # Create bar data with Greeks and OI
-            bar_data = {
-                'timestamp': bar.get('timestamp', current_timestamp),
-                'open': bar.get('open', 0),
-                'high': bar.get('high', 0),
-                'low': bar.get('low', 0),
-                'close': bar.get('close', 0),
-                'volume': bar.get('volume', 0),
-                'open_interest': open_interest if open_interest is not None else 0
-            }
-            
-            # Handle TIMESTAMP from market data if present
-            if 'TIMESTAMP' in bar:
-                # Ensure timestamp is a large enough number to represent current time
-                # A timestamp from 1970 would be very small compared to current timestamps
-                ts = bar['TIMESTAMP']
-                if isinstance(ts, (int, float)) and ts > 1000000000000:  # Reasonable timestamp after 2001
-                    bar_data['timestamp'] = ts
-                else:
-                    bar_data['timestamp'] = current_timestamp
-            
-            # Add Greeks if available
-            if greeks:
-                bar_data.update({
-                    'delta': greeks.get('delta', 0),
-                    'gamma': greeks.get('gamma', 0),
-                    'theta': greeks.get('theta', 0),
-                    'vega': greeks.get('vega', 0),
-                    'rho': greeks.get('rho', 0)
-                })
-            else:
-                # Add empty Greeks
-                bar_data.update({
-                    'delta': 0,
-                    'gamma': 0,
-                    'theta': 0,
-                    'vega': 0,
-                    'rho': 0
-                })
-            
-            # Add to DataFrame
-            new_row = pd.DataFrame([bar_data])
-            new_row.set_index('timestamp', inplace=True)
-            
-            # Concatenate with existing data
-            self.one_minute_data[key] = pd.concat([self.one_minute_data[key], new_row], ignore_index=False, sort=False)
-            
-            # Check if we need to persist this 1-minute data
-            # If it's been more than the persistence interval since the last persistence for this symbol
-            current_time = time.time()
-            last_persist_time = self.last_persistence_time.get(key, 0)
-            
-            if current_time - last_persist_time > self.persistence_interval:
-                # Schedule persistence for this symbol
-                self.thread_pool.submit(self._persist_one_minute_data, key)
-                self.last_persistence_time[key] = current_time
-                
-        except Exception as e:
-            self.logger.error(f"Error storing 1-minute bar for {key}: {str(e)}")
+                # Add greeks and OI to the event object directly if BarEvent supports it
+                if hasattr(bar_event, 'greeks'):
+                    bar_event.greeks = greeks if any(v is not None for v in greeks.values()) else None
+                if hasattr(bar_event, 'open_interest'):
+                     bar_event.open_interest = open_interest
+                if hasattr(bar_event, 'implied_volatility'):
+                     bar_event.implied_volatility = implied_vol
+                # Alternatively, could add them to a generic 'data' field if BarEvent has one
 
-    def _publish_timeframe_bar_event(self, symbol: str, timeframe: str, bar_data: Dict[str, Any], 
-                                greeks: Optional[Dict] = None, open_interest: Optional[float] = None,
-                                instrument: Optional[Instrument] = None):
-        """
-        Publish a bar event for a specific timeframe.
-        
-        Args:
-            symbol: Symbol of the instrument
-            timeframe: Timeframe of the bar
-            bar_data: Bar data
-            greeks: Optional Greeks data
-            open_interest: Optional open interest
-            instrument: Optional instrument object
-        """
-        try:
-            # Check if anyone is subscribed to this timeframe for this symbol
-            if symbol not in self.symbol_subscribers or timeframe not in self.symbol_subscribers[symbol]:
-                return
-            
-            # If instrument is not provided, try to get it
-            if instrument is None and hasattr(self, 'instruments'):
-                instrument = self.instruments.get(symbol)
-            
-            # The TimeframeBarEvent requires event_type in __init__ even though it will be overridden
-            # We pass EventType.BAR here as a placeholder - it will be replaced internally by the class
-            bar_event = TimeframeBarEvent(                
-                event_type=EventType.BAR,  # This will be overridden by the timeframe-based mapping
-                timestamp=int(bar_data['timestamp']),
-                instrument=instrument,
-                timeframe=timeframe,
-                bar_data=bar_data,
-                greeks=greeks,
-                open_interest=open_interest
-            )
-            
-            # Publish the event
-            if hasattr(self, 'event_manager'):
+
+                # Publish the event - EventManager routes it
                 self.event_manager.publish(bar_event)
-                
-        except Exception as e:
-            self.logger.error(f"Error publishing timeframe bar event: {str(e)}")
-    
-    def _update_ohlc(self, symbol: str, data: Dict, timestamp: float, instrument: Optional[Instrument] = None):
-        """
-        Update OHLC data from a market data event with enhanced support for Greeks and OI.
-    
-        Args:
-            symbol: Symbol of the instrument
-            data: Market data dictionary
-            timestamp: Event timestamp
-            instrument: Optional instrument object
-        """
+                # self.logger.debug(f"Published BarEvent for {symbol_key} @ {timeframe} to {len(subscribers)} subscribers.")
+
+            except KeyError as ke:
+                 self.logger.error(f"Missing key in bar_data for {symbol_key}@{timeframe}: {ke}. Bar Data: {bar_data}")
+            except Exception as e:
+                 self.logger.error(f"Error creating/publishing BarEvent for {symbol_key}@{timeframe}: {e}", exc_info=True)
+
+    def _calculate_option_greeks_for_bar(self, instrument: Instrument, bar_data: Dict[str, Any]) -> Optional[Tuple[Dict[str, float], float]]:
+        """Calculate option Greeks using data from a completed bar."""
+        if not self.calculate_greeks or not isinstance(instrument, Instrument) or instrument.instrument_type != InstrumentType.OPTION:
+            return None
         try:
-            # Initialize OHLC storage for this symbol if needed
-            if symbol not in self.ohlc_data:
-                self.ohlc_data[symbol] = {}
-    
-            # Check if we have OHLC data in the event
-            if MarketDataType.OHLC.value in data:
-                ohlc = data[MarketDataType.OHLC.value]
-                timeframe = ohlc.get('timeframe', '1m')
-    
-                # Create DataFrame if it doesn't exist for this timeframe
-                if timeframe not in self.ohlc_data[symbol]:
-                    columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest']
-                    
-                    # Add columns for Greeks if this is an option
-                    if instrument and instrument.instrument_type == InstrumentType.OPTION:
-                        columns.extend(['delta', 'gamma', 'theta', 'vega', 'rho'])
-                        
-                    self.ohlc_data[symbol][timeframe] = pd.DataFrame(columns=columns)
-                    self.ohlc_data[symbol][timeframe].set_index('timestamp', inplace=True)
-    
-                # Add the bar to the DataFrame
-                bar = {
-                    'timestamp': timestamp,
-                    'open': float(ohlc.get('OPEN', 0)),
-                    'high': float(ohlc.get('HIGH', 0)),
-                    'low': float(ohlc.get('LOW', 0)),
-                    'close': float(ohlc.get('CLOSE', 0)),
-                    'volume': float(ohlc.get('VOLUME', 0)),
-                    'open_interest': float(ohlc.get('OPEN_INTEREST', 0))
-                }
-                
-                # Map TIMESTAMP to lowercase timestamp if present in data
-                if 'TIMESTAMP' in ohlc:
-                    bar['timestamp'] = float(ohlc['TIMESTAMP'])
-                    
-                # Calculate Greeks and Volatility for options if needed
-                greeks_data = None
-                implied_volatility = None
-                if self.calculate_greeks and instrument and instrument.instrument_type == InstrumentType.OPTION:
-                    # _calculate_option_greeks now returns a tuple (greeks_dict, iv)
-                    result = self._calculate_option_greeks(instrument, bar["close"], timestamp)
-                    if result:
-                        greeks_data, implied_volatility = result
-                        bar.update({
-                            "delta": greeks_data.get("delta", 0),
-                            "gamma": greeks_data.get("gamma", 0),
-                            "theta": greeks_data.get("theta", 0),
-                            "vega": greeks_data.get("vega", 0),
-                            "rho": greeks_data.get("rho", 0),
-                            "implied_volatility": implied_volatility # Store IV in the bar data
-                        })
-                    else:
-                        # Add placeholders if calculation failed
-                         bar.update({
-                            "delta": 0, "gamma": 0, "theta": 0, "vega": 0, "rho": 0, "implied_volatility": 0
-                        })
-                elif instrument and instrument.instrument_type == InstrumentType.OPTION:
-                     # Add placeholders if greeks calculation is disabled but it's an option
-                     bar.update({
-                        "delta": 0, "gamma": 0, "theta": 0, "vega": 0, "rho": 0, "implied_volatility": 0
-                    })
+            option_price = float(bar_data['close'])
+            timestamp = float(bar_data['timestamp'])
+            # 1. Get Underlying Price
+            underlying_symbol_key = getattr(instrument, 'underlying_symbol_key', None)
+            if not underlying_symbol_key:
+                 underlying_sym = getattr(instrument, 'underlying_symbol', None)
+                 if underlying_sym and instrument.exchange:
+                      exch = instrument.exchange.value if isinstance(instrument.exchange, Enum) else str(instrument.exchange)
+                      underlying_symbol_key = f"{exch}:{underlying_sym}"
+                 else: self.logger.warning(f"Cannot determine underlying for option {instrument.symbol}"); return None
+            underlying_price = self._get_last_price(underlying_symbol_key) # Uses converted data
+            if underlying_price is None: self.logger.warning(f"No underlying price for {underlying_symbol_key}"); return None
 
-                # Add bar to DataFrame
-                # Ensure the DataFrame columns include 'implied_volatility' if it's an option
-                if timeframe not in self.ohlc_data[symbol]:
-                    columns = ["timestamp", "open", "high", "low", "close", "volume", "open_interest"]
-                    if instrument and instrument.instrument_type == InstrumentType.OPTION:
-                        columns.extend(["delta", "gamma", "theta", "vega", "rho", "implied_volatility"])
-                    self.ohlc_data[symbol][timeframe] = pd.DataFrame(columns=columns)
-                    self.ohlc_data[symbol][timeframe].set_index("timestamp", inplace=True)
-                elif instrument and instrument.instrument_type == InstrumentType.OPTION and "implied_volatility" not in self.ohlc_data[symbol][timeframe].columns:
-                    # Add IV column if missing (e.g., if dataframe was created before this change)
-                    self.ohlc_data[symbol][timeframe]["implied_volatility"] = 0.0 # Add with default value
+            # 2. Get Time to Expiry
+            expiry_dt = getattr(instrument, 'expiry_date', None) # Expecting datetime object
+            if not isinstance(expiry_dt, datetime):
+                 if isinstance(expiry_dt, str): # Attempt parsing common formats
+                      for fmt in ('%Y-%m-%d', '%d-%b-%Y', '%Y-%m-%dT%H:%M:%S'):
+                           try: expiry_dt = datetime.strptime(expiry_dt, fmt); break
+                           except ValueError: pass
+                      else: self.logger.error(f"Cannot parse expiry date '{expiry_dt}' for {instrument.symbol}"); return None
+                 else: self.logger.error(f"Invalid expiry date type ({type(expiry_dt)}) for {instrument.symbol}"); return None
 
-                new_row = pd.DataFrame([bar])
-                new_row.set_index("timestamp", inplace=True)
+            current_dt = datetime.fromtimestamp(timestamp)
+            time_to_expiry_years = max(0, (expiry_dt - current_dt).total_seconds() / (365.25 * 86400))
 
-                # Concatenate with existing data
-                # Use pd.concat and handle potential column mismatches if IV was added
-                try:
-                    self.ohlc_data[symbol][timeframe] = pd.concat(
-                        [self.ohlc_data[symbol][timeframe], new_row],
-                        ignore_index=False, sort=False # Keep index, don't sort columns
-                    ).iloc[-self.cache_limit:]
-                    # Fill NaN in IV column if introduced by concat
-                    if "implied_volatility" in self.ohlc_data[symbol][timeframe].columns:
-                         self.ohlc_data[symbol][timeframe]["implied_volatility"].fillna(0.0, inplace=True)
+            # 3. Get Strike Price
+            strike_price = getattr(instrument, 'strike', None)
+            if strike_price is None: self.logger.error(f"Missing strike for option {instrument.symbol}"); return None
+            strike_price = float(strike_price)
 
-                except Exception as concat_err:
-                     self.logger.error(f"Error concatenating OHLC data for {symbol}@{timeframe}: {concat_err}")
-                     # Fallback or recovery logic might be needed here
+            # 4. Volatility (Use default or implement IV calculation)
+            # TODO: Implement Implied Volatility calculation
+            volatility = self.default_volatility
 
-                # If this is a 1-minute bar, store it specially and consider persistence
-                if timeframe == "1m":
-                    # Pass greeks_data and implied_volatility separately
-                    self._store_one_minute_bar(symbol, bar, greeks_data, bar.get("open_interest"))
+            # 5. Risk-Free Rate
+            risk_free_rate = self.greeks_risk_free_rate
 
-                # Publish a timeframe-specific bar event
-                # Pass greeks_data and implied_volatility separately
-                self._publish_timeframe_bar_event(symbol, timeframe, bar, greeks_data, bar.get("open_interest"), instrument)
-    
+            # 6. Call Calculation Function (from greeks_calculator.py)
+            # Assuming calculate_greeks returns dict or raises error
+            greeks_dict = OptionsGreeksCalculator.calculate_greeks(
+                option_type=instrument.option_type.lower() if instrument.option_type else 'call', # Ensure 'call' or 'put'
+                underlying_price=underlying_price,
+                strike_price=strike_price,
+                time_to_expiry=time_to_expiry_years,
+                risk_free_rate=risk_free_rate,
+                volatility=volatility # Pass default/historical vol as IV guess
+            )
+            # Assuming IV calculation would happen inside or alongside calculate_greeks
+            implied_vol = volatility # Placeholder: Use input vol as IV for now
+
+            if greeks_dict:
+                 greeks_dict['time_to_expiry_years'] = round(time_to_expiry_years, 6)
+                 return greeks_dict, implied_vol # Return tuple (greeks, iv)
+            else:
+                 self.logger.warning(f"Greeks calculation failed for {instrument.symbol}")
+                 return None
+
         except Exception as e:
-            self.logger.error(f"Error updating OHLC data for {symbol}: {str(e)}")
-    
+            self.logger.error(f"Error calculating greeks for {instrument.symbol} bar: {e}", exc_info=True)
+            return None
+
+    def _get_last_price(self, symbol_key: str) -> Optional[float]:
+        """Gets the last known price from last_tick_data (converted)."""
+        converted_tick = self.last_tick_data.get(symbol_key)
+        if converted_tick:
+            # Use MarketDataType enum value as the key
+            price = converted_tick.get(MarketDataType.LAST_PRICE.value)
+            if price is not None:
+                try: return float(price)
+                except (ValueError, TypeError): pass # Logged elsewhere if conversion fails
+        return None
+
+    # --- Persistence ---
+    def _persistence_loop(self):
+        """Background thread for periodic data persistence."""
+        self.logger.info("Persistence loop started.")
+        while not self._shutdown_event.wait(self.persistence_interval):
+            try:
+                symbols_to_persist = list(self.instruments.keys())
+                if not symbols_to_persist: continue
+                self.logger.debug(f"Starting periodic persistence check for {len(symbols_to_persist)} symbols...")
+                start_time = time.monotonic()
+                futures = []
+                now = time.time()
+                for symbol_key in symbols_to_persist:
+                    if now - self.last_persistence_time.get(symbol_key, 0) >= self.persistence_interval:
+                         # Primarily persist 1m data, adjust if others needed
+                         future = self.persistence_executor.submit(self._persist_symbol_data, symbol_key, '1m')
+                         futures.append(future)
+                         self.last_persistence_time[symbol_key] = now
+                submitted_count = len(futures)
+                for future in futures:
+                    try: future.result(timeout=60)
+                    except Exception as e: self.logger.error(f"Persistence task error: {e}", exc_info=True)
+                elapsed = time.monotonic() - start_time
+                if submitted_count > 0:
+                     self.logger.info(f"Persistence cycle completed in {elapsed:.2f}s for {submitted_count} tasks.")
+            except Exception as e:
+                self.logger.error(f"Error in persistence loop: {e}", exc_info=True)
+                time.sleep(60)
+        self.logger.info("Persistence loop stopped.")
+
+    def _persist_symbol_data(self, symbol_key: str, timeframe: str):
+        """Persists bar data for a symbol/timeframe from TimeframeManager."""
+        if not self.persistence_enabled: return
+        try:
+            df = self.timeframe_manager.get_bars(symbol_key, timeframe) # Gets cached/buffered data
+            if df is None or df.empty: return
+
+            df = df.reindex(columns=TimeframeManager.BAR_COLUMNS).copy()
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+            parts = symbol_key.split(':', 1)
+            exchange = parts[0] if len(parts) > 1 else 'UNKNOWN_EX'
+            pure_symbol = parts[1] if len(parts) > 1 else symbol_key
+            safe_symbol = "".join(c if c.isalnum() else "_" for c in pure_symbol)
+
+            date_groups = df.groupby(df['datetime'].dt.date)
+            saved_count = 0
+            for date, date_df in date_groups:
+                date_str = date.strftime('%Y-%m-%d')
+                persist_dir = os.path.join(self.persistence_path, 'bars', date_str, exchange, timeframe)
+                os.makedirs(persist_dir, exist_ok=True)
+                file_path = os.path.join(persist_dir, f"{safe_symbol}.parquet")
+                # Use timestamp as index for saving
+                save_df = date_df.set_index('timestamp').drop(columns=['datetime'], errors='ignore')
+                try:
+                    if os.path.exists(file_path):
+                        existing_df = pd.read_parquet(file_path)
+                        combined_df = pd.concat([existing_df, save_df])
+                        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+                        combined_df.sort_index(inplace=True)
+                        combined_df.to_parquet(file_path, index=True)
+                    else:
+                        save_df.to_parquet(file_path, index=True)
+                    saved_count += len(save_df)
+                except Exception as e: self.logger.error(f"Error saving parquet {file_path}: {e}")
+            # if saved_count > 0: self.logger.debug(f"Persisted {saved_count} {timeframe} bars for {symbol_key}.")
+        except Exception as e: self.logger.error(f"Error persisting {timeframe} data for {symbol_key}: {e}", exc_info=True)
+ 
     def _store_in_redis(self, key: str, data: Dict, timestamp: float):
         """
         Store market data in Redis for real-time access.
@@ -752,129 +667,96 @@ class DataManager:
                     self.use_redis = False
             else:
                 self._redis_errors = 1
-    
-    def _persistence_loop(self):
-        """Background thread for periodic data persistence"""
-        self.logger.info("Starting persistence loop")
-        while True:
-            try:
-                # Sleep for the persistence interval
-                time.sleep(self.persistence_interval)
-                
-                # Persist data for all symbols that haven't been persisted recently
-                current_time = time.time()
-                symbols_to_persist = []
-                
-                with self.global_lock:
-                    for symbol in self.one_minute_data:
-                        last_persist_time = self.last_persistence_time.get(symbol, 0)
-                        if current_time - last_persist_time > self.persistence_interval:
-                            symbols_to_persist.append(symbol)
-                            self.last_persistence_time[symbol] = current_time
-                
-                # Persist in parallel using thread pool
-                futures = []
-                for symbol in symbols_to_persist:
-                    futures.append(self.thread_pool.submit(self._persist_one_minute_data, symbol))
-                    
-                # Wait for all to complete (optional)
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.logger.error(f"Error in persistence task: {str(e)}")
-                        
-            except Exception as e:
-                self.logger.error(f"Error in persistence loop: {str(e)}")
-                time.sleep(5)  # Sleep longer on error
-    
-    def _persist_one_minute_data(self, symbol: str):
-        """
-        Persist 1-minute bar data for a specific symbol.
-        
-        Args:
-            symbol: Symbol to persist data for
-        """
+
+    # --- Data Retrieval ---
+    def get_historical_data(self, symbol_key: str, timeframe: str,
+                            n_bars: Optional[int] = None,
+                            start_time: Optional[Union[datetime, float]] = None,
+                            end_time: Optional[Union[datetime, float]] = None) -> Optional[pd.DataFrame]:
+        """Get historical bars, checking memory then persistence."""
+        df = self.timeframe_manager.get_bars(symbol_key, timeframe)
+        needs_persistence_load = False
+        start_ts = start_time.timestamp() if isinstance(start_time, datetime) else float(start_time) if start_time else None
+
+        if df is None: needs_persistence_load = True
+        elif start_ts and not df.empty and df.index.min() > start_ts: needs_persistence_load = True
+        # Add check if n_bars requires more data than available in memory
+        elif n_bars is not None and n_bars > 0 and (df is None or len(df) < n_bars):
+             needs_persistence_load = True
+
+
+        if needs_persistence_load and self.persistence_enabled:
+             persistent_df = self._load_historical_data_from_storage(symbol_key, timeframe, start_time, end_time)
+             if persistent_df is not None:
+                  if df is not None:
+                       # Combine, ensuring consistent columns (preferring TFM columns)
+                       combined_df = pd.concat([persistent_df.reindex(columns=df.columns), df])
+                       df = combined_df[~combined_df.index.duplicated(keep='last')].sort_index()
+                  else: df = persistent_df
+
+        if df is None or df.empty: return None
+        if not df.index.is_monotonic_increasing: df.sort_index(inplace=True)
+
+        # Apply filters
+        if start_ts: df = df[df.index >= start_ts]
+        if end_time:
+            end_ts = end_time.timestamp() if isinstance(end_time, datetime) else float(end_time)
+            df = df[df.index <= end_ts]
+        if n_bars is not None and n_bars > 0: df = df.iloc[-n_bars:]
+        elif n_bars == 0: return pd.DataFrame(columns=df.columns)
+
+        return df.copy() if not df.empty else None
+
+    def _load_historical_data_from_storage(self, symbol_key: str, timeframe: str,
+                                           start_time: Optional[Union[datetime, float]] = None,
+                                           end_time: Optional[Union[datetime, float]] = None) -> Optional[pd.DataFrame]:
+        """Loads historical data from persistent parquet files."""
+        if not self.persistence_enabled: return None
+        dfs = []
         try:
-            if not self.persistence_enabled or symbol not in self.one_minute_data:
-                return
-                
-            # Make a copy of the data to avoid lock contention
-            with self._get_lock_for_symbol(symbol):
-                df = self.one_minute_data[symbol].copy()
-                
-            if df.empty:
-                return
-                
-            # Convert TIMESTAMP to lowercase timestamp if present
-            if 'TIMESTAMP' in df.columns:
-                df['timestamp'] = df['TIMESTAMP']
-                df = df.drop(columns=['TIMESTAMP'])
-                
-            # Convert timestamp index to datetime
-            df.reset_index(inplace=True)
-            
-            # Ensure timestamps are valid by replacing any very old dates with current time
-            current_ms = int(time.time() * 1000)
-            # Threshold for "old" timestamps (e.g., before 2020)
-            threshold = 1577836800000  # Jan 1, 2020 in milliseconds
-            
-            # Replace invalid timestamps with current time
-            if 'timestamp' in df.columns:
-                df.loc[df['timestamp'] < threshold, 'timestamp'] = current_ms
-            
-            # Convert to datetime
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-            
-            # Get the date range in the dataframe
-            min_date = df['datetime'].min().strftime('%Y-%m-%d')
-            max_date = df['datetime'].max().strftime('%Y-%m-%d')
-            
-            # Get exchange from symbol if applicable
-            exchange = "DEFAULT"
-            if ":" in symbol:
-                exchange, pure_symbol = symbol.split(":", 1)
-            else:
-                pure_symbol = symbol
-                
-            # Group by date and save separate files
-            date_groups = df.groupby(df['datetime'].dt.date)
-            
-            for date, date_df in date_groups:
-                date_str = date.strftime('%Y-%m-%d')
-                
-                # Create directory if it doesn't exist
-                date_dir = os.path.join(self.persistence_path, 'bars', date_str)
-                os.makedirs(date_dir, exist_ok=True)
-                
-                # File path
-                file_path = os.path.join(date_dir, f"{exchange}_{pure_symbol}.parquet")
-                
-                # Check if file exists and append or create as needed
+            end_dt = datetime.fromtimestamp(end_time) if isinstance(end_time, (int, float)) else end_time if isinstance(end_time, datetime) else datetime.now()
+            start_dt = datetime.fromtimestamp(start_time) if isinstance(start_time, (int, float)) else start_time if isinstance(start_time, datetime) else end_dt - timedelta(days=30) # Default lookback
+
+            parts = symbol_key.split(':', 1)
+            exchange = parts[0] if len(parts) > 1 else 'UNKNOWN_EX'
+            pure_symbol = parts[1] if len(parts) > 1 else symbol_key
+            safe_symbol = "".join(c if c.isalnum() else "_" for c in pure_symbol)
+
+            current_date = start_dt.date()
+            while current_date <= end_dt.date():
+                date_str = current_date.strftime('%Y-%m-%d')
+                file_path = os.path.join(self.persistence_path, 'bars', date_str, exchange, timeframe, f"{safe_symbol}.parquet")
                 if os.path.exists(file_path):
-                    existing_df = pd.read_parquet(file_path)
-                    
-                    # Combine and deduplicate
-                    date_df.set_index("timestamp", inplace=True)
-                    combined_df = pd.concat([existing_df, date_df], ignore_index=False, sort=False)
-                    combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
-                    
-                    # Sort by timestamp
-                    combined_df.sort_index(inplace=True)
-                    
-                    # Save back to file
-                    combined_df.to_parquet(file_path)
-                else:
-                    # Just save this dataframe
-                    date_df.set_index('timestamp', inplace=True)
-                    date_df.to_parquet(file_path)
-                    
-            self.logger.debug(f"Persisted 1-minute data for {symbol} from {min_date} to {max_date}")
-            
+                    try:
+                        daily_df = pd.read_parquet(file_path)
+                        daily_df.index = daily_df.index.astype(float) # Ensure index is float timestamp
+                        dfs.append(daily_df)
+                    except Exception as e: self.logger.error(f"Error reading parquet {file_path}: {e}")
+                current_date += timedelta(days=1)
+
+            if not dfs: return None
+            combined_df = pd.concat(dfs).sort_index()
+            # Reindex to standard columns, adding missing ones with NaN
+            combined_df = combined_df.reindex(columns=TimeframeManager.BAR_COLUMNS)
+
+            # Filter precisely by timestamp
+            start_ts = start_time.timestamp() if isinstance(start_time, datetime) else float(start_time) if start_time else None
+            end_ts = end_time.timestamp() if isinstance(end_time, datetime) else float(end_time) if end_time else None
+            if start_ts: combined_df = combined_df[combined_df.index >= start_ts]
+            if end_ts: combined_df = combined_df[combined_df.index <= end_ts]
+
+            return combined_df if not combined_df.empty else None
         except Exception as e:
-            self.logger.error(f"Error persisting data for {symbol}: {str(e)}")
-            import traceback
-            self.logger.error(traceback.format_exc())
+            self.logger.error(f"Error loading historical data for {symbol_key} {timeframe}: {e}", exc_info=True)
+            return None
+
+    def get_current_bar(self, symbol_key: str, timeframe: str) -> Optional[Dict[str, Any]]:
+        """Gets the currently forming bar from TimeframeManager."""
+        return self.timeframe_manager.get_current_bar(symbol_key, timeframe)
+
+    def get_latest_tick(self, symbol_key: str) -> Optional[Dict[str, Any]]:
+         """Gets the most recent *converted* tick data stored."""
+         return self.last_tick_data.get(symbol_key)
     
     def _handle_system_event(self, event: Event):
         """
@@ -975,272 +857,79 @@ class DataManager:
         except Exception as e:
             self.logger.error(f"Error unsubscribing from {symbol}: {str(e)}")
             return False
-
-    def subscribe_market_data(self, instrument: Instrument, strategy_id: str = None) -> bool:
-        """
-        Subscribe to market data for an instrument.
-        
-        Args:
-            instrument: Instrument to subscribe to
-            strategy_id: Optional ID of the strategy subscribing
-            
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            symbol = instrument.symbol
-            exchange = getattr(instrument, 'exchange', None)
-            
-            # Create symbol key
-            key = f"{exchange}:{symbol}" if exchange else symbol
-            
-            # Add to active subscriptions
-            self.active_subscriptions.add(key)
-            
-            # Add strategy subscription if provided
-            if strategy_id:
-                if key not in self.symbol_subscribers:
-                    self.symbol_subscribers[key] = {}
-                
-                # Subscribe to all timeframes by default
-                for timeframe in TimeframeManager.VALID_TIMEFRAMES:
-                    if timeframe not in self.symbol_subscribers[key]:
-                        self.symbol_subscribers[key][timeframe] = set()
-                    
-                    self.symbol_subscribers[key][timeframe].add(strategy_id)
-                    
-                    # Update reverse lookup
-                    if timeframe not in self.timeframe_subscriptions:
-                        self.timeframe_subscriptions[timeframe] = {}
-                    if strategy_id not in self.timeframe_subscriptions[timeframe]:
-                        self.timeframe_subscriptions[timeframe][strategy_id] = set()
-                    
-                    self.timeframe_subscriptions[timeframe][strategy_id].add(key)
-            
-            # Connect to broker market data feed if not already connected
-            if self.broker and hasattr(self.broker, 'subscribe_market_data'):
-                self.broker.subscribe_market_data(instrument)
-                self.logger.info(f"Subscribed to market data for {key}")
-                return True
-            else:
-                self.logger.warning(f"Broker doesn't support market data subscription for {key}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Error subscribing to market data: {str(e)}")
-            return False
     
-    def unsubscribe_market_data(self, instrument: Instrument, strategy_id: str = None) -> bool:
-        """
-        Unsubscribe from market data for an instrument.
-        
-        Args:
-            instrument: Instrument to unsubscribe from
-            strategy_id: Optional ID of the strategy unsubscribing
-            
-        Returns:
-            Boolean indicating success
-        """
-        try:
-            symbol = instrument.symbol
-            exchange = getattr(instrument, 'exchange', None)
-            
-            # Create symbol key
-            key = f"{exchange}:{symbol}" if exchange else symbol
-            
-            # Remove strategy subscription if provided
-            if strategy_id:
-                if key in self.symbol_subscribers:
-                    for timeframe in self.symbol_subscribers[key]:
-                        if strategy_id in self.symbol_subscribers[key][timeframe]:
-                            self.symbol_subscribers[key][timeframe].remove(strategy_id)
-                            
-                        # If no more subscribers for this timeframe, remove it
-                        if not self.symbol_subscribers[key][timeframe]:
-                            del self.symbol_subscribers[key][timeframe]
-                            
-                    # If no more timeframes, remove symbol
-                    if not self.symbol_subscribers[key]:
-                        del self.symbol_subscribers[key]
-                        
-                    # Update reverse lookup
-                    for timeframe in self.timeframe_subscriptions:
-                        if strategy_id in self.timeframe_subscriptions[timeframe]:
-                            if key in self.timeframe_subscriptions[timeframe][strategy_id]:
-                                self.timeframe_subscriptions[timeframe][strategy_id].remove(key)
-                                
-                            # If no more symbols, remove strategy
-                            if not self.timeframe_subscriptions[timeframe][strategy_id]:
-                                del self.timeframe_subscriptions[timeframe][strategy_id]
-            
-            # Check if anyone is still subscribed
-            still_subscribed = False
-            for timeframe_subs in self.symbol_subscribers.get(key, {}).values():
-                if timeframe_subs:
-                    still_subscribed = True
-                    break
-                    
-            # If no one is subscribed, remove from active subscriptions
-            if not still_subscribed:
-                if key in self.active_subscriptions:
-                    self.active_subscriptions.remove(key)
-                    
-                # Unsubscribe from broker
-                if self.broker and hasattr(self.broker, 'unsubscribe_market_data'):
-                    self.broker.unsubscribe_market_data(instrument)
-                    self.logger.info(f"Unsubscribed from market data for {key}")
-                    
-            return True
-                
-        except Exception as e:
-            self.logger.error(f"Error unsubscribing from market data: {str(e)}")
+    # --- Subscription Management ---
+    def subscribe_to_timeframe(self, instrument: Instrument, timeframe: str, strategy_id: str) -> bool:
+        """Subscribe a strategy to a specific instrument and timeframe."""
+        symbol_key = self._get_symbol_key(instrument)
+        if not symbol_key: return False
+        if timeframe not in TimeframeManager.VALID_TIMEFRAMES or timeframe == 'tick':
+            self.logger.error(f"Invalid timeframe for subscription: {timeframe}")
             return False
-    
-    def subscribe_to_timeframe(self, instrument: Instrument | str, timeframe: str, strategy_id: str) -> bool:
-        """
-        Subscribe to market data for a specific instrument and timeframe.
 
-        Args:
-            instrument: Instrument to subscribe to (can be Instrument object or string)
-            timeframe: Timeframe to subscribe to
-            strategy_id: ID of the strategy requesting the subscription
-
-        Returns:
-            bool: True if subscription was successful
-        """
-        try:
-            # Convert string to Instrument if needed
-            if isinstance(instrument, str):
-                instrument_obj = self.get_or_create_instrument(instrument)
-                if not instrument_obj:
-                    self.logger.error(f"Cannot subscribe to timeframe: failed to create instrument for {instrument} (strategy: {strategy_id}, timeframe: {timeframe})")
-                    return False
-                instrument = instrument_obj
-
-            if not instrument:
-                self.logger.error(f"Cannot subscribe to timeframe: instrument is None (strategy: {strategy_id}, timeframe: {timeframe})")
-                return False
-                
-            if not hasattr(instrument, 'symbol') or not instrument.symbol:
-                self.logger.error(f"Cannot subscribe to timeframe: instrument has no symbol attribute (strategy: {strategy_id}, timeframe: {timeframe})")
-                return False
-                
-            if not hasattr(instrument, 'exchange') or not instrument.exchange:
-                self.logger.error(f"Cannot subscribe to timeframe: {instrument.symbol} has no exchange attribute (strategy: {strategy_id}, timeframe: {timeframe})")
-                return False
-        
-            if timeframe not in TimeframeManager.VALID_TIMEFRAMES:
-                self.logger.error(f"Invalid timeframe for subscription: {timeframe}")
-                return False
-
-            symbol_key = self._get_symbol_key(instrument)
-            if symbol_key.startswith("INVALID:"):
-                self.logger.error(f"Cannot subscribe {strategy_id} to {timeframe}: invalid symbol key {symbol_key}")
-                return False
-        
-            # Store instrument object if not already stored
-            if symbol_key not in self.instruments:
-                self.instruments[symbol_key] = instrument
-
-            # Ensure we have an active subscription to the instrument
-            if symbol_key not in self.active_subscriptions:
-                # Subscribe to the instrument
-                if self.market_data_feed and hasattr(self.market_data_feed, 'subscribe'):
-                    success = self.market_data_feed.subscribe(instrument)
-                    if not success:
-                        self.logger.error(f"Failed to subscribe to {symbol_key}")
-                        return False
-                self.active_subscriptions.add(symbol_key)
-                self.logger.info(f"Subscribed to {symbol_key}")
-
-            # Add to timeframe subscriptions
-            if timeframe not in self.timeframe_subscriptions:
-                self.timeframe_subscriptions[timeframe] = {}
-            
-            if strategy_id not in self.timeframe_subscriptions[timeframe]:
-                self.timeframe_subscriptions[timeframe][strategy_id] = set()
-                
-            self.timeframe_subscriptions[timeframe][strategy_id].add(symbol_key)
-            
-            # Update symbol_subscribers for reverse lookup
-            if symbol_key not in self.symbol_subscribers:
-                self.symbol_subscribers[symbol_key] = {}
-                
-            if timeframe not in self.symbol_subscribers[symbol_key]:
-                self.symbol_subscribers[symbol_key][timeframe] = set()
-                
+        with self.global_lock:
+            first_subscription_for_symbol = symbol_key not in self.active_subscriptions
+            # Add strategy subscription first
+            # self.timeframe_subscriptions[timeframe][strategy_id].add(symbol_key) # This structure seems redundant if we use symbol_subscribers
             self.symbol_subscribers[symbol_key][timeframe].add(strategy_id)
-            
-            self.logger.info(f"Subscribed {strategy_id} to {symbol_key} on timeframe {timeframe}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error subscribing to timeframe: {str(e)}")
-            return False
+
+            # If it's the first time any strategy needs this symbol, subscribe at broker
+            if first_subscription_for_symbol:
+                 # If we have a market data feed, use it
+                if hasattr(self, 'market_data_feed') \
+                    and self.market_data_feed        \
+                    and self.market_data_feed.subscribe(instrument):
+                    self.active_subscriptions.add(symbol_key)
+                    
+                    # Store instrument object if first time subscribing
+                    if symbol_key not in self.instruments:
+                        self.instruments[symbol_key] = instrument
+                    self.logger.info(f"Subscribed to market data feed for {symbol_key} (Triggered by {strategy_id} for {timeframe})")
+                else: # Broker subscription failed, roll back strategy subscription
+                    # del self.timeframe_subscriptions[timeframe][strategy_id] # Remove if structure removed
+                    self.symbol_subscribers[symbol_key][timeframe].discard(strategy_id)
+                    if not self.symbol_subscribers[symbol_key][timeframe]: del self.symbol_subscribers[symbol_key][timeframe]
+                    if not self.symbol_subscribers[symbol_key]: del self.symbol_subscribers[symbol_key]
+                    self.logger.error(f"Failed broker subscription for {symbol_key}. Cannot add {strategy_id} for {timeframe}.")
+                    return False
+
+        self.logger.info(f"Strategy '{strategy_id}' subscribed to {symbol_key} on timeframe {timeframe}")
+        return True
 
     def unsubscribe_from_timeframe(self, instrument: Instrument, timeframe: str, strategy_id: str) -> bool:
-        """
-        Unsubscribe from market data for a specific instrument and timeframe.
+        """Unsubscribe a strategy from a specific instrument and timeframe."""
+        symbol_key = self._get_symbol_key(instrument)
+        if not symbol_key or timeframe not in TimeframeManager.VALID_TIMEFRAMES: 
+            return False
 
-        Args:
-            instrument: Instrument to unsubscribe from
-            timeframe: Timeframe to unsubscribe from
-            strategy_id: ID of the strategy
-
-        Returns:
-            bool: True if unsubscription was successful
-        """
-        try:
-            symbol_key = self._get_symbol_key(instrument)
-            
-            # Remove from timeframe subscriptions
-            if (timeframe in self.timeframe_subscriptions and 
-                strategy_id in self.timeframe_subscriptions[timeframe]):
-                
-                self.timeframe_subscriptions[timeframe][strategy_id].discard(symbol_key)
-                
-                # If strategy has no more symbols for this timeframe, remove it
-                if not self.timeframe_subscriptions[timeframe][strategy_id]:
-                    del self.timeframe_subscriptions[timeframe][strategy_id]
-                    
-                # If timeframe has no more strategies, remove it
-                if not self.timeframe_subscriptions[timeframe]:
-                    del self.timeframe_subscriptions[timeframe]
-            
-            # Update symbol_subscribers
-            if (symbol_key in self.symbol_subscribers and 
-                timeframe in self.symbol_subscribers[symbol_key]):
-                
+        removed = False
+        with self.global_lock:
+            # Remove strategy subscription from symbol_subscribers
+            if symbol_key in self.symbol_subscribers and timeframe in self.symbol_subscribers[symbol_key]:
                 self.symbol_subscribers[symbol_key][timeframe].discard(strategy_id)
-                
-                # If no more strategies for this timeframe, remove it
                 if not self.symbol_subscribers[symbol_key][timeframe]:
                     del self.symbol_subscribers[symbol_key][timeframe]
-                    
-                # If symbol has no more timeframes, remove it
-                if not self.symbol_subscribers[symbol_key]:
-                    del self.symbol_subscribers[symbol_key]
-                    
-                    # Check if we should unsubscribe from the feed
-                    should_unsubscribe = True
-                    for tf_subs in self.timeframe_subscriptions.values():
-                        for strat_symbols in tf_subs.values():
-                            if symbol_key in strat_symbols:
-                                should_unsubscribe = False
-                                break
-                                
-                    if should_unsubscribe and symbol_key in self.active_subscriptions:
-                        if self.market_data_feed and hasattr(self.market_data_feed, 'unsubscribe'):
-                            self.market_data_feed.unsubscribe(instrument)
-                        self.active_subscriptions.discard(symbol_key)
-                        self.logger.info(f"Unsubscribed from {symbol_key}")
-            
-            self.logger.info(f"Unsubscribed {strategy_id} from {symbol_key} on timeframe {timeframe}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error unsubscribing from timeframe: {str(e)}")
-            return False
+                removed = True
+
+            # Check if any strategy still needs this symbol on any timeframe
+            if symbol_key in self.symbol_subscribers and not self.symbol_subscribers[symbol_key]:
+                # No strategy needs this symbol anymore
+                del self.symbol_subscribers[symbol_key]
+                if symbol_key in self.active_subscriptions:
+                   if self.market_data_feed.unsubscribe(instrument):
+                       self.active_subscriptions.discard(symbol_key)
+                       # Clean up other data for this symbol
+                       if symbol_key in self.instruments: del self.instruments[symbol_key]
+                       if symbol_key in self.last_tick_data: del self.last_tick_data[symbol_key]
+                       if symbol_key in self.last_cumulative_volume: del self.last_cumulative_volume[symbol_key]
+                       # Reset TimeframeManager data for this symbol
+                       self.timeframe_manager.reset(symbol=symbol_key)
+                       self.logger.info(f"Unsubscribed from broker feed for {symbol_key} and cleaned up data.")
+                   else: self.logger.error(f"Failed broker unsubscribe for {symbol_key}.")
+
+        if removed: 
+            self.logger.info(f"Strategy '{strategy_id}' unsubscribed from {symbol_key} on {timeframe}")
+        return removed
     
     def get_latest_data(self, symbol: str, n: int = 1) -> Optional[List[Dict]]:
         """
@@ -1283,519 +972,7 @@ class DataManager:
         except Exception as e:
             self.logger.error(f"Error getting latest data for {symbol}: {str(e)}")
             return None
-    
-    def get_historical_data(self, symbol: str, timeframe: str = '1m', 
-                        n_bars: int = 100, start_time: Optional[float] = None, 
-                        end_time: Optional[float] = None) -> Optional[pd.DataFrame]:
-        """
-        Get historical bar data for a symbol and timeframe.
         
-        Args:
-            symbol: Symbol to get data for
-            timeframe: Timeframe to get data for (1m, 5m, etc.)
-            n_bars: Number of bars to get
-            start_time: Optional start time (timestamp in ms)
-            end_time: Optional end time (timestamp in ms)
-            
-        Returns:
-            DataFrame of historical data or None if not available
-        """
-        try:
-            # Check if this is a compound key
-            if ":" not in symbol:
-                # Try different exchanges if needed
-                exchanges = ["NSE", "BSE"]  # Prioritize Indian exchanges
-                found_key = None
-                
-                for exchange in exchanges:
-                    test_key = f"{exchange}:{symbol}"
-                    if test_key in self.ohlc_data and timeframe in self.ohlc_data[test_key]:
-                        found_key = test_key
-                        break
-                        
-                if not found_key and symbol in self.ohlc_data and timeframe in self.ohlc_data[symbol]:
-                    found_key = symbol
-            else:
-                found_key = symbol
-                
-            if not found_key:
-                # Check if data is in persistence
-                return self._load_historical_data_from_storage(symbol, timeframe, start_time, end_time, n_bars)
-                
-            # Get data from in-memory store
-            df = self.ohlc_data[found_key][timeframe].copy()
-            
-            # Apply time filters
-            if start_time:
-                df = df[df.index >= start_time]
-                
-            if end_time:
-                df = df[df.index <= end_time]
-                
-            # Limit to n_bars
-            if n_bars > 0:
-                df = df.iloc[-n_bars:]
-                
-            return df
-                
-        except Exception as e:
-            self.logger.error(f"Error getting historical data for {symbol}:{timeframe}: {str(e)}")
-            return self._load_historical_data_from_storage(symbol, timeframe, start_time, end_time, n_bars)
-    
-    def _load_historical_data_from_storage(self, symbol: str, timeframe: str = '1m',
-                                        start_time: Optional[float] = None, 
-                                        end_time: Optional[float] = None,
-                                        n_bars: int = 100) -> Optional[pd.DataFrame]:
-        """
-        Load historical data from persistent storage.
-        
-        Args:
-            symbol: Symbol to get data for
-            timeframe: Timeframe to get data for
-            start_time: Optional start time (timestamp in ms)
-            end_time: Optional end time (timestamp in ms)
-            n_bars: Number of bars to get
-            
-        Returns:
-            DataFrame of historical data or None if not available
-        """
-        try:
-            if not self.persistence_enabled or timeframe != '1m':
-                return None
-                
-            # Get exchange from symbol if applicable
-            exchange = "DEFAULT"
-            if ":" in symbol:
-                exchange, pure_symbol = symbol.split(":", 1)
-            else:
-                pure_symbol = symbol
-                
-            # Convert timestamps to dates
-            if start_time:
-                start_date = datetime.fromtimestamp(start_time / 1000).date()
-            else:
-                # Default to last 7 days
-                start_date = (datetime.now() - timedelta(days=7)).date()
-                
-            if end_time:
-                end_date = datetime.fromtimestamp(end_time / 1000).date()
-            else:
-                end_date = datetime.now().date()
-                
-            # Get list of dates in range
-            date_range = []
-            current_date = start_date
-            while current_date <= end_date:
-                date_range.append(current_date.strftime('%Y-%m-%d'))
-                current_date += timedelta(days=1)
-                
-            # Load data for each date
-            dfs = []
-            
-            for date_str in date_range:
-                file_path = os.path.join(self.persistence_path, 'bars', date_str, 
-                                    f"{exchange}_{pure_symbol}.parquet")
-                
-                if os.path.exists(file_path):
-                    try:
-                        df = pd.read_parquet(file_path)
-                        dfs.append(df)
-                    except Exception as e:
-                        self.logger.error(f"Error reading parquet file {file_path}: {str(e)}")
-                        continue
-                        
-            if not dfs:
-                return None
-                
-            # Combine all dataframes
-            combined_df = pd.concat(dfs)
-            
-            # Apply time filters if needed
-            if start_time:
-                combined_df = combined_df[combined_df.index >= start_time]
-                
-            if end_time:
-                combined_df = combined_df[combined_df.index <= end_time]
-                
-            # Sort by timestamp
-            combined_df.sort_index(inplace=True)
-            
-            # Limit to n_bars
-            if n_bars > 0:
-                combined_df = combined_df.iloc[-n_bars:]
-                
-            return combined_df
-                
-        except Exception as e:
-            self.logger.error(f"Error loading historical data for {symbol}: {str(e)}")
-            return None
-    
-    def calculate_option_greeks_for_instruments(self, instruments: List[Instrument]) -> Dict[str, Dict[str, float]]:
-        """
-        Calculate Greeks for a list of option instruments.
-        
-        Args:
-            instruments: List of option instruments
-            
-        Returns:
-            Dictionary of instrument symbol -> Greeks data
-        """
-        results = {}
-        
-        for instrument in instruments:
-            if instrument.instrument_type != InstrumentType.OPTION:
-                continue
-                
-            symbol = instrument.symbol
-            exchange = getattr(instrument, 'exchange', None)
-            key = f"{exchange}:{symbol}" if exchange else symbol
-            
-            # Get latest price
-            price = None
-            if key in self.last_data and 'price' in self.last_data[key]:
-                price = float(self.last_data[key]['price'])
-            elif key in self.ohlc_data and '1m' in self.ohlc_data[key] and not self.ohlc_data[key]['1m'].empty:
-                price = float(self.ohlc_data[key]['1m'].iloc[-1]['close'])
-                
-            if price is None:
-                self.logger.warning(f"No price data available for {key}")
-                continue
-                
-            # Calculate Greeks
-            greeks = self._calculate_option_greeks(instrument, price, time.time() * 1000)
-            
-            if greeks:
-                results[key] = greeks
-                    
-        return results
-    
-    def get_option_chain_data(self, underlying_symbol: str, 
-                         expiry_date: Optional[str] = None) -> Optional[pd.DataFrame]:
-        """
-        Get option chain data for an underlying symbol.
-        
-        Args:
-            underlying_symbol: Underlying symbol
-            expiry_date: Optional expiry date (YYYY-MM-DD)
-            
-        Returns:
-            DataFrame with option chain data or None if not available
-        """
-        try:
-            # This assumes we have subscribed to all options for this underlying
-            # Find all options for this underlying
-            options_data = []
-            
-            # Check all active subscriptions
-            for key in self.active_subscriptions:
-                # Extract exchange and symbol
-                exchange = None
-                if ":" in key:
-                    exchange, symbol = key.split(":", 1)
-                else:
-                    symbol = key
-                    
-                # Check if this is an option for our underlying
-                if (symbol.startswith(underlying_symbol) or 
-                    (hasattr(self.ohlc_data.get(key, {}), 'underlying_symbol') and 
-                    self.ohlc_data[key].underlying_symbol == underlying_symbol)):
-                    
-                    # Get option details
-                    option_type = None
-                    strike_price = None
-                    option_expiry = None
-                    
-                    # Try to extract from symbol
-                    # This is broker-specific and might need adjustment
-                    if 'CE' in symbol:
-                        option_type = 'CALL'
-                    elif 'PE' in symbol:
-                        option_type = 'PUT'
-                        
-                    # For Indian options like NIFTY22JUN17500CE
-                    # Extract strike and expiry from symbol
-                    if option_type:
-                        # Specific to Indian options format
-                        parts = symbol.replace('CE', '').replace('PE', '').split('/')
-                        if len(parts) > 1:
-                            try:
-                                strike_price = float(parts[-1])
-                            except:
-                                pass
-                                
-                    # Get latest price and Greeks
-                    price = None
-                    greeks = None
-                    oi = 0
-                    
-                    if key in self.last_data:
-                        data = self.last_data[key]
-                        price = data.get('price', data.get('close', None))
-                        oi = data.get('open_interest', 0)
-                    elif key in self.ohlc_data and '1m' in self.ohlc_data[key] and not self.ohlc_data[key]['1m'].empty:
-                        last_bar = self.ohlc_data[key]['1m'].iloc[-1]
-                        price = last_bar['close']
-                        oi = last_bar.get('open_interest', 0)
-                        
-                        # Check for Greeks
-                        if 'delta' in last_bar:
-                            greeks = {
-                                'delta': last_bar['delta'],
-                                'gamma': last_bar['gamma'],
-                                'theta': last_bar['theta'],
-                                'vega': last_bar['vega'],
-                                'rho': last_bar['rho']
-                            }
-                    
-                    # Skip if no price
-                    if price is None:
-                        continue
-                        
-                    # Add to list
-                    option_data = {
-                        'symbol': symbol,
-                        'exchange': exchange,
-                        'option_type': option_type,
-                        'strike_price': strike_price,
-                        'expiry_date': option_expiry,
-                        'price': price,
-                        'open_interest': oi
-                    }
-                    
-                    # Add Greeks if available
-                    if greeks:
-                        option_data.update(greeks)
-                        
-                    options_data.append(option_data)
-            
-            if not options_data:
-                return None
-                
-            # Create DataFrame
-            df = pd.DataFrame(options_data)
-            
-            # Filter by expiry date if specified
-            if expiry_date and 'expiry_date' in df.columns:
-                df = df[df['expiry_date'] == expiry_date]
-                
-            # Organize by option type and strike price
-            if not df.empty and 'strike_price' in df.columns and 'option_type' in df.columns:
-                # Sort by strike price
-                df = df.sort_values(by='strike_price')
-                
-                # If we have both CALL and PUT options, pivot the data
-                if set(df['option_type'].unique()) == {'CALL', 'PUT'}:
-                    # Create a more readable option chain format
-                    call_data = df[df['option_type'] == 'CALL'].set_index('strike_price')
-                    put_data = df[df['option_type'] == 'PUT'].set_index('strike_price')
-                    
-                    # Rename columns to avoid conflicts
-                    call_columns = {col: f'call_{col}' for col in call_data.columns if col != 'strike_price'}
-                    put_columns = {col: f'put_{col}' for col in put_data.columns if col != 'strike_price'}
-                    
-                    call_data = call_data.rename(columns=call_columns)
-                    put_data = put_data.rename(columns=put_columns)
-                    
-                    # Combine into single DataFrame
-                    chain_df = pd.concat([call_data, put_data], axis=1)
-                    
-                    # Ensure strike price is included
-                    chain_df.reset_index(inplace=True)
-                    
-                    return chain_df
-            
-            return df
-                
-        except Exception as e:
-            self.logger.error(f"Error getting option chain data for {underlying_symbol}: {str(e)}")
-            return None
-    
-    def _calculate_option_greeks(self, instrument: Instrument, current_price: float, timestamp: float) -> Dict[str, float]:
-        """
-        Calculate option Greeks for an instrument.
-        
-        Args:
-            instrument: Option instrument
-            current_price: Current price of the option
-            timestamp: Current timestamp
-            
-        Returns:
-            Dictionary of Greeks values
-        """
-        try:
-            if not instrument or instrument.instrument_type != InstrumentType.OPTION:
-                return {}
-            
-            # Extract option details
-            strike_price = getattr(instrument, 'strike', 0)
-            if not strike_price:
-                return {}
-                
-            # Get expiry as days to expiry
-            expiry_date = getattr(instrument, 'expiry_date', None)
-            if not expiry_date:
-                return {}
-                
-            # Convert expiry date to datetime
-            if isinstance(expiry_date, str):
-                try:
-                    # For Indian options with expiry format DD-MM-YYYY
-                    expiry_dt = datetime.strptime(expiry_date, '%d-%m-%Y')
-                except:
-                    try:
-                        # Alternative format YYYY-MM-DD
-                        expiry_dt = datetime.strptime(expiry_date, '%Y-%m-%d')
-                    except:
-                        self.logger.error(f"Unable to parse expiry date: {expiry_date}")
-                        return {}
-            else:
-                expiry_dt = expiry_date
-                
-            # Calculate days to expiry
-            current_dt = datetime.fromtimestamp(timestamp / 1000)
-            days_to_expiry = (expiry_dt - current_dt).days + (expiry_dt - current_dt).seconds / 86400
-            
-            if days_to_expiry <= 0:
-                return {}
-            
-            # Convert to years
-            time_to_expiry = days_to_expiry / 365.0
-            
-            # Get option type
-            option_type = getattr(instrument, 'option_type', None)
-            if not option_type:
-                # Try to infer from symbol
-                symbol = instrument.symbol
-                if 'CE' in symbol:
-                    option_type = 'CALL'
-                elif 'PE' in symbol:
-                    option_type = 'PUT'
-                else:
-                    return {}
-            
-            # Get underlying price
-            underlying_symbol = getattr(instrument, 'underlying_symbol', None)
-            underlying_price = None
-            
-            if underlying_symbol:
-                # Try different exchanges
-                exchanges = ["NSE", "BSE"]
-                for exchange in exchanges:
-                    key = f"{exchange}:{underlying_symbol}"
-                    if key in self.last_data:
-                        underlying_data = self.last_data[key]
-                        underlying_price = underlying_data.get('price', underlying_data.get('close', None))
-                        break
-                
-                # Try without exchange
-                if underlying_price is None and underlying_symbol in self.last_data:
-                    underlying_data = self.last_data[underlying_symbol]
-                    underlying_price = underlying_data.get('price', underlying_data.get('close', None))
-            
-            # If we still don't have underlying price, try to estimate from the option price
-            if underlying_price is None:
-                # This is a very rough estimate for Indian options
-                if option_type == 'CALL':
-                    underlying_price = strike_price + current_price
-                else:
-                    underlying_price = strike_price - current_price
-            
-            # Default parameters for Indian market
-            # Risk-free rate (approximate based on Indian Treasury yield)
-            risk_free_rate = self.greeks_risk_free_rate
-            
-            # Volatility - use a default or calculate from historical data
-            volatility = 0.25  # 25% annual volatility as default
-            
-            # Try to get historical volatility if available
-            if underlying_symbol:
-                try:
-                    # Look for underlying historical data
-                    historical_data = self.get_historical_data(underlying_symbol, timeframe='1d', n_bars=30)
-                    if historical_data is not None and len(historical_data) > 5:
-                        # Calculate log returns
-                        returns = np.log(historical_data['close'] / historical_data['close'].shift(1)).dropna()
-                        # Calculate annualized volatility
-                        volatility = returns.std() * np.sqrt(252)  # 252 trading days in a year
-                except Exception as e:
-                    self.logger.debug(f"Error calculating historical volatility: {str(e)}")
-            
-            # Calculate Greeks using Black-Scholes model
-            # Import required for calculations
-            from scipy.stats import norm
-            
-            # Helper functions for Black-Scholes
-            def bs_call_price(S, K, T, r, sigma):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                d2 = d1 - sigma * np.sqrt(T)
-                return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-            
-            def bs_put_price(S, K, T, r, sigma):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                d2 = d1 - sigma * np.sqrt(T)
-                return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-            
-            def bs_call_delta(S, K, T, r, sigma):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                return norm.cdf(d1)
-            
-            def bs_put_delta(S, K, T, r, sigma):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                return norm.cdf(d1) - 1
-            
-            def bs_gamma(S, K, T, r, sigma):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                return norm.pdf(d1) / (S * sigma * np.sqrt(T))
-            
-            def bs_vega(S, K, T, r, sigma):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                return S * np.sqrt(T) * norm.pdf(d1) / 100  # Divided by 100 for percentage
-            
-            def bs_theta(S, K, T, r, sigma, option_type):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                d2 = d1 - sigma * np.sqrt(T)
-                if option_type == 'CALL':
-                    return (-S * sigma * norm.pdf(d1) / (2 * np.sqrt(T)) - 
-                            r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
-                else:  # PUT
-                    return (-S * sigma * norm.pdf(d1) / (2 * np.sqrt(T)) + 
-                            r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
-            
-            def bs_rho(S, K, T, r, sigma, option_type):
-                d1 = (np.log(S/K) + (r + sigma**2/2) * T) / (sigma * np.sqrt(T))
-                d2 = d1 - sigma * np.sqrt(T)
-                if option_type == 'CALL':
-                    return K * T * np.exp(-r * T) * norm.cdf(d2) / 100
-                else:  # PUT
-                    return -K * T * np.exp(-r * T) * norm.cdf(-d2) / 100
-            
-            # Calculate Greeks
-            delta = bs_call_delta(underlying_price, strike_price, time_to_expiry, risk_free_rate, volatility) \
-                    if option_type == 'CALL' else bs_put_delta(underlying_price, strike_price, time_to_expiry, risk_free_rate, volatility)
-            
-            gamma = bs_gamma(underlying_price, strike_price, time_to_expiry, risk_free_rate, volatility)
-            vega = bs_vega(underlying_price, strike_price, time_to_expiry, risk_free_rate, volatility)
-            theta = bs_theta(underlying_price, strike_price, time_to_expiry, risk_free_rate, volatility, option_type)
-            rho = bs_rho(underlying_price, strike_price, time_to_expiry, risk_free_rate, volatility, option_type)
-            
-            # Return Greeks
-            return {
-                'delta': round(delta, 4),
-                'gamma': round(gamma, 4),
-                'theta': round(theta, 4),
-                'vega': round(vega, 4),
-                'rho': round(rho, 4),
-                'implied_vol': round(volatility, 4),
-                'time_to_expiry': round(time_to_expiry, 4)
-            }
-            
-        except ImportError:
-            self.logger.error("scipy package not available for Greeks calculation")
-            return {}
-        except Exception as e:
-            self.logger.error(f"Error calculating Greeks: {str(e)}")
-            return {}
-    
     def load_historical_data_for_backtest(self, symbols: List[str], start_date: str, end_date: str, 
                                         timeframe: str = '1m') -> Dict[str, pd.DataFrame]:
         """
@@ -2223,240 +1400,7 @@ class DataManager:
             
         except Exception as e:
             self.logger.error(f"Error optimizing memory usage: {str(e)}")
-    
-    def calculate_technical_indicators(self, symbol: str, timeframe: str = '1d',
-                                    indicators: List[str] = None) -> Optional[pd.DataFrame]:
-        """
-        Calculate technical indicators for a symbol.
-        
-        Args:
-            symbol: Symbol to calculate indicators for
-            timeframe: Timeframe to use
-            indicators: List of indicators to calculate
-            
-        Returns:
-            DataFrame with technical indicators or None if not available
-        """
-        try:
-            # Default indicators if none specified
-            if not indicators:
-                indicators = ['sma_20', 'ema_20', 'rsi_14', 'macd', 'bollinger_bands']
-                
-            # Get historical data
-            df = self.get_historical_data(symbol, timeframe)
-            
-            if df is None or df.empty:
-                return None
-                
-            # Try to import TA-Lib
-            try:
-                import talib
-                has_talib = True
-            except ImportError:
-                self.logger.warning("TA-Lib not available, using custom implementations")
-                has_talib = False
-                
-            # Create result DataFrame
-            result = df.copy()
-            
-            # Calculate requested indicators
-            for indicator in indicators:
-                parts = indicator.lower().split('_')
-                indicator_type = parts[0]
-                
-                if indicator_type == 'sma':
-                    # Simple Moving Average
-                    period = int(parts[1]) if len(parts) > 1 else 20
-                    
-                    if has_talib:
-                        result[f'sma_{period}'] = talib.SMA(result['close'].values, timeperiod=period)
-                    else:
-                        result[f'sma_{period}'] = result['close'].rolling(window=period).mean()
-                        
-                elif indicator_type == 'ema':
-                    # Exponential Moving Average
-                    period = int(parts[1]) if len(parts) > 1 else 20
-                    
-                    if has_talib:
-                        result[f'ema_{period}'] = talib.EMA(result['close'].values, timeperiod=period)
-                    else:
-                        result[f'ema_{period}'] = result['close'].ewm(span=period, adjust=False).mean()
-                        
-                elif indicator_type == 'rsi':
-                    # Relative Strength Index
-                    period = int(parts[1]) if len(parts) > 1 else 14
-                    
-                    if has_talib:
-                        result[f'rsi_{period}'] = talib.RSI(result['close'].values, timeperiod=period)
-                    else:
-                        # Custom RSI implementation
-                        delta = result['close'].diff()
-                        gain = delta.where(delta > 0, 0)
-                        loss = -delta.where(delta < 0, 0)
-                        
-                        avg_gain = gain.rolling(window=period).mean()
-                        avg_loss = loss.rolling(window=period).mean()
-                        
-                        rs = avg_gain / avg_loss
-                        result[f'rsi_{period}'] = 100 - (100 / (1 + rs))
-                        
-                elif indicator_type == 'macd':
-                    # Moving Average Convergence Divergence
-                    fast_period = int(parts[1]) if len(parts) > 1 else 12
-                    slow_period = int(parts[2]) if len(parts) > 2 else 26
-                    signal_period = int(parts[3]) if len(parts) > 3 else 9
-                    
-                    if has_talib:
-                        macd, signal, hist = talib.MACD(
-                            result['close'].values,
-                            fastperiod=fast_period,
-                            slowperiod=slow_period,
-                            signalperiod=signal_period
-                        )
-                        result['macd_line'] = macd
-                        result['macd_signal'] = signal
-                        result['macd_hist'] = hist
-                    else:
-                        # Custom MACD implementation
-                        result['ema_fast'] = result['close'].ewm(span=fast_period, adjust=False).mean()
-                        result['ema_slow'] = result['close'].ewm(span=slow_period, adjust=False).mean()
-                        result['macd_line'] = result['ema_fast'] - result['ema_slow']
-                        result['macd_signal'] = result['macd_line'].ewm(span=signal_period, adjust=False).mean()
-                        result['macd_hist'] = result['macd_line'] - result['macd_signal']
-                        
-                elif indicator_type == 'bollinger':
-                    # Bollinger Bands
-                    period = int(parts[2]) if len(parts) > 2 else 20
-                    std_dev = float(parts[3]) if len(parts) > 3 else 2.0
-                    
-                    if has_talib:
-                        upper, middle, lower = talib.BBANDS(
-                            result['close'].values,
-                            timeperiod=period,
-                            nbdevup=std_dev,
-                            nbdevdn=std_dev
-                        )
-                        result[f'bb_upper_{period}'] = upper
-                        result[f'bb_middle_{period}'] = middle
-                        result[f'bb_lower_{period}'] = lower
-                    else:
-                        # Custom Bollinger Bands implementation
-                        result[f'bb_middle_{period}'] = result['close'].rolling(window=period).mean()
-                        result[f'bb_std_{period}'] = result['close'].rolling(window=period).std()
-                        result[f'bb_upper_{period}'] = result[f'bb_middle_{period}'] + (result[f'bb_std_{period}'] * std_dev)
-                        result[f'bb_lower_{period}'] = result[f'bb_middle_{period}'] - (result[f'bb_std_{period}'] * std_dev)
-                
-                elif indicator_type == 'atr':
-                    # Average True Range
-                    period = int(parts[1]) if len(parts) > 1 else 14
-                    
-                    if has_talib:
-                        result[f'atr_{period}'] = talib.ATR(
-                            result['high'].values,
-                            result['low'].values,
-                            result['close'].values,
-                            timeperiod=period
-                        )
-                    else:
-                        # Custom ATR implementation
-                        tr1 = result['high'] - result['low']
-                        tr2 = abs(result['high'] - result['close'].shift())
-                        tr3 = abs(result['low'] - result['close'].shift())
-                        
-                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                        result[f'atr_{period}'] = tr.rolling(window=period).mean()
-                
-                elif indicator_type == 'stoch':
-                    # Stochastic Oscillator
-                    k_period = int(parts[1]) if len(parts) > 1 else 14
-                    d_period = int(parts[2]) if len(parts) > 2 else 3
-                    
-                    if has_talib:
-                        slowk, slowd = talib.STOCH(
-                            result['high'].values,
-                            result['low'].values,
-                            result['close'].values,
-                            fastk_period=k_period,
-                            slowk_period=d_period,
-                            slowd_period=d_period
-                        )
-                        result[f'stoch_k_{k_period}'] = slowk
-                        result[f'stoch_d_{k_period}'] = slowd
-                    else:
-                        # Custom Stochastic Oscillator implementation
-                        period_low = result['low'].rolling(window=k_period).min()
-                        period_high = result['high'].rolling(window=k_period).max()
-                        
-                        result[f'stoch_k_{k_period}'] = 100 * ((result['close'] - period_low) / (period_high - period_low))
-                        result[f'stoch_d_{k_period}'] = result[f'stoch_k_{k_period}'].rolling(window=d_period).mean()
-                        
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating technical indicators: {str(e)}")
-            return None
-    
-    def get_market_depth(self, symbol: str) -> Optional[Dict]:
-        """
-        Get market depth (order book) for a symbol.
-        
-        Args:
-            symbol: Symbol to get market depth for
-            
-        Returns:
-            Dictionary with bids and asks or None if not available
-        """
-        try:
-            if not self.use_redis:
-                return None
-                
-            # Get order book from Redis if available
-            key = f"orderbook:{symbol}"
-            
-            if not self.redis_client.exists(key):
-                return None
-                
-            # Get order book data
-            order_book = self.redis_client.hgetall(key)
-            
-            if not order_book:
-                return None
-                
-            # Parse order book
-            bids = []
-            asks = []
-            
-            for level_key, value in order_book.items():
-                if isinstance(level_key, bytes):
-                    level_key = level_key.decode('utf-8')
-                    
-                if isinstance(value, bytes):
-                    value = value.decode('utf-8')
-                    
-                if level_key.startswith('bid:'):
-                    level = int(level_key.split(':')[1])
-                    price, quantity = map(float, value.split(':'))
-                    bids.append((price, quantity, level))
-                    
-                elif level_key.startswith('ask:'):
-                    level = int(level_key.split(':')[1])
-                    price, quantity = map(float, value.split(':'))
-                    asks.append((price, quantity, level))
-                    
-            # Sort bids and asks
-            bids.sort(key=lambda x: (-x[0], x[2]))  # Sort bids by price desc, level asc
-            asks.sort(key=lambda x: (x[0], x[2]))   # Sort asks by price asc, level asc
-            
-            # Return formatted result
-            return {
-                'bids': [{'price': price, 'quantity': quantity} for price, quantity, _ in bids],
-                'asks': [{'price': price, 'quantity': quantity} for price, quantity, _ in asks]
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting market depth for {symbol}: {str(e)}")
-            return None
-    
+      
     def setup_scheduled_tasks(self):
         """Setup scheduled tasks for the data manager"""
         try:
@@ -2518,78 +1462,6 @@ class DataManager:
             
         except Exception as e:
             self.logger.error(f"Error shutting down data manager: {str(e)}")
-    
-    def get_top_gainers_losers(self, exchange: str = "NSE", n: int = 5) -> Dict[str, List[Dict]]:
-        """
-        Get top gainers and losers for an exchange.
-        
-        Args:
-            exchange: Exchange to get data for (NSE, BSE)
-            n: Number of symbols to return
-            
-        Returns:
-            Dictionary with top gainers and losers
-        """
-        try:
-            results = {
-                'gainers': [],
-                'losers': []
-            }
-            
-            # Get all symbols for this exchange
-            symbols = []
-            for key in self.ohlc_data:
-                if key.startswith(f"{exchange}:"):
-                    symbols.append(key)
-                    
-            if not symbols:
-                return results
-                
-            # Calculate daily changes
-            changes = []
-            
-            for symbol in symbols:
-                if '1d' not in self.ohlc_data.get(symbol, {}):
-                    continue
-                    
-                df = self.ohlc_data[symbol]['1d']
-                
-                if df.empty or len(df) < 2:
-                    continue
-                    
-                # Get latest and previous close
-                latest = df.iloc[-1]
-                prev = df.iloc[-2]
-                
-                close = latest['close']
-                prev_close = prev['close']
-                
-                # Calculate percent change
-                pct_change = ((close - prev_close) / prev_close) * 100
-                
-                symbol_name = symbol.split(':', 1)[1] if ':' in symbol else symbol
-                
-                changes.append({
-                    'symbol': symbol_name,
-                    'price': close,
-                    'change': close - prev_close,
-                    'pct_change': pct_change
-                })
-                
-            # Sort by percent change
-            changes.sort(key=lambda x: x['pct_change'], reverse=True)
-            
-            # Get top gainers
-            results['gainers'] = changes[:n]
-            
-            # Get top losers
-            results['losers'] = sorted(changes, key=lambda x: x['pct_change'])[:n]
-            
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Error getting top gainers/losers: {str(e)}")
-            return {'gainers': [], 'losers': []}
     
     def get_option_implied_volatility_surface(self, underlying_symbol: str) -> Optional[Dict]:
         """
@@ -2706,3 +1578,169 @@ class DataManager:
         except Exception as e:
             self.logger.error(f"Failed to create instrument for {symbol_str}: {e}")
             return None
+
+# --- Placeholder EventManager ---
+class MockEventManager:
+    def subscribe(self, event_type, handler, component_name): print(f"Subscribed {component_name} to {event_type}")
+    def publish(self, event):
+        print(f"Published Event: Type={event.event_type}, Symbol={getattr(event, 'symbol', 'N/A')}, TF={getattr(event, 'timeframe', 'N/A')}, Data={getattr(event, 'bar_data', getattr(event, 'data', {}))}")
+# --- End Placeholders ---
+
+# Example Usage Snippet
+if __name__ == '__main__':
+    # Mock EventManager and Broker for testing
+    event_manager = MockEventManager()
+    class MockBroker:
+        def subscribe_market_data(self, instrument): print(f"Broker subscribed to {instrument.symbol}"); return True
+        def unsubscribe_market_data(self, instrument): print(f"Broker unsubscribed from {instrument.symbol}"); return True
+
+    mock_config = {
+        'market_data': {
+            'persistence': {'enabled': False}, # Disable persistence for simple test
+            'calculate_greeks': True,
+            'greeks_risk_free_rate': 0.06,
+            'default_volatility': 0.22
+        }
+    }
+    broker = MockBroker()
+
+    # Initialize DataManager
+    data_manager = DataManager(mock_config, event_manager, broker)
+
+    # Example instrument (using token as per Finvasia logs)
+    nifty_idx = Instrument(
+        symbol="NIFTY", # Symbol for reference
+        token="26000",  # Token used in Finvasia feed
+        exchange=Exchange.NSE,
+        instrument_type=InstrumentType.INDEX,
+        asset_class=AssetClass.INDEX,
+        instrument_id="NSE:26000" # Consistent ID
+    )
+    nifty_key = data_manager._get_symbol_key(nifty_idx) # Should produce "NSE:26000"
+
+    nifty_opt = Instrument(
+        symbol="NIFTY25MAY...", # Full symbol if available
+        token="38605",
+        exchange=Exchange.NFO,
+        instrument_type=InstrumentType.OPTION,
+        asset_class=AssetClass.OPTIONS,
+        instrument_id="NFO:38605",
+        underlying_symbol="NIFTY", # Needed for Greeks
+        strike=24500, # Example strike
+        expiry_date=datetime(2025, 5, 29), # Example expiry
+        option_type="CALL", # Example type
+        underlying_symbol_key="NSE:26000" # Link to underlying
+    )
+    opt_key = data_manager._get_symbol_key(nifty_opt) # Should produce "NFO:38605"
+
+
+    # Subscribe strategies
+    data_manager.subscribe_to_timeframe(nifty_idx, '1m', 'StrategyA')
+    data_manager.subscribe_to_timeframe(nifty_opt, '1m', 'StrategyB') # Subscribe option strategy
+
+
+    # Simulate MarketDataEvents (Ticks - converted format)
+    print("\n--- Simulating Ticks (Converted Format) ---")
+    start_ts = time.time()
+
+    # Tick 1 for Nifty Index
+    tick1_nifty = MarketDataEvent(
+        event_type=EventType.MARKET_DATA,
+        instrument=nifty_idx,
+        timestamp=start_ts + 5,
+        data={
+            MarketDataType.LAST_PRICE.value: 24269.90,
+            MarketDataType.TIMESTAMP.value: start_ts + 5,
+            # Volume for index is often 0 or not applicable for bar volume
+            MarketDataType.VOLUME.value: 0, # Feed handler puts cumulative here
+            'symbol_key': nifty_key # Added by _on_market_data
+        }
+    )
+    data_manager._on_market_data(tick1_nifty)
+    time.sleep(0.01)
+
+    # Tick 1 for Nifty Option
+    tick1_opt = MarketDataEvent(
+        event_type=EventType.MARKET_DATA,
+        instrument=nifty_opt,
+        timestamp=start_ts + 6,
+        data={
+            MarketDataType.LAST_PRICE.value: 208.90,
+            MarketDataType.TIMESTAMP.value: start_ts + 6,
+            MarketDataType.VOLUME.value: 64032750, # Cumulative volume from feed
+            MarketDataType.OPEN_INTEREST.value: 500000, # Example OI
+            'symbol_key': opt_key
+        }
+    )
+    data_manager._on_market_data(tick1_opt)
+    time.sleep(0.01)
+
+    # Tick 2 for Nifty Index (completes 1m bar if start_ts was near minute start)
+    tick2_nifty = MarketDataEvent(
+        event_type=EventType.MARKET_DATA,
+        instrument=nifty_idx,
+        timestamp=start_ts + 65,
+        data={
+            MarketDataType.LAST_PRICE.value: 24275.00,
+            MarketDataType.TIMESTAMP.value: start_ts + 65,
+            MarketDataType.VOLUME.value: 0,
+            'symbol_key': nifty_key
+        }
+    )
+    data_manager._on_market_data(tick2_nifty)
+    time.sleep(0.01)
+
+    # Tick 2 for Nifty Option (completes 1m bar)
+    tick2_opt = MarketDataEvent(
+        event_type=EventType.MARKET_DATA,
+        instrument=nifty_opt,
+        timestamp=start_ts + 70,
+        data={
+            MarketDataType.LAST_PRICE.value: 210.00,
+            MarketDataType.TIMESTAMP.value: start_ts + 70,
+            MarketDataType.VOLUME.value: 64035150, # Increased cumulative volume
+            MarketDataType.OPEN_INTEREST.value: 500500, # Changed OI
+            'symbol_key': opt_key
+        }
+    )
+    data_manager._on_market_data(tick2_opt)
+    time.sleep(0.1) # Allow time for processing
+
+
+    # Wait for queue processing (in real app, threads run continuously)
+    print("\nWaiting for queue processing...")
+    # In a real system, you wouldn't join the queue like this.
+    # Instead, you'd query data or rely on published events.
+    # For this example, we simulate waiting.
+    time.sleep(1) # Give threads time to process
+
+
+    print("\n--- Querying Data ---")
+    # Get current bar (might be empty if last tick completed a bar)
+    current_1m_nifty = data_manager.get_current_bar(nifty_key, '1m')
+    print(f"Current 1m bar for {nifty_key}: {current_1m_nifty}")
+    current_1m_opt = data_manager.get_current_bar(opt_key, '1m')
+    print(f"Current 1m bar for {opt_key}: {current_1m_opt}")
+
+
+    # Get historical bars
+    hist_1m_nifty = data_manager.get_historical_data(nifty_key, '1m', n_bars=5)
+    print(f"\nHistorical 1m bars for {nifty_key}:\n{hist_1m_nifty}")
+
+    hist_1m_opt = data_manager.get_historical_data(opt_key, '1m', n_bars=5)
+    print(f"\nHistorical 1m bars for {opt_key}:\n{hist_1m_opt}")
+
+
+    # Get latest tick (converted format)
+    latest_tick_nifty = data_manager.get_latest_tick(nifty_key)
+    print(f"\nLatest Converted Tick for {nifty_key}: {latest_tick_nifty}")
+    latest_tick_opt = data_manager.get_latest_tick(opt_key)
+    print(f"\nLatest Converted Tick for {opt_key}: {latest_tick_opt}")
+
+
+    # Shutdown
+    print("\n--- Shutting Down ---")
+    try:
+        data_manager.close()
+    except Exception as e:
+        print(f"Error during shutdown: {e}")

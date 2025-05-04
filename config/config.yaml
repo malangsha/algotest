@@ -91,6 +91,7 @@ market_data:
   processing_queue_size: 10000
   batch_processing: true
   batch_size: 100
+  timeframe_manager_cache_limit: 10000
   
   # Greek calculation
   calculate_greeks: true
@@ -158,7 +159,7 @@ market:
     - symbol: "NIFTY INDEX"
       exchange: "NSE"
       derivative_exchange: "NFO"
-      strike_interval: 100
+      strike_interval: 50
       expiry: "weekly"
       atm_range: 1  # Number of strikes above and below ATM
     - symbol: "SENSEX"

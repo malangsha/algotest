@@ -67,6 +67,7 @@ class PositionManager:
         Args:
             instrument: Instrument object
         """
+        self.logger.debug(f"Adding symbol : {instrument.symbol}")
         # Check if this symbol already exists in the dictionary
         if instrument.symbol in self.instruments_by_symbol:
             self.logger.debug(f"Instrument with symbol {instrument.symbol} already exists, skipping addition")
@@ -89,6 +90,15 @@ class PositionManager:
         """Get instrument by symbol."""
         return self.instruments_by_symbol.get(symbol)
 
+    def has_open_position(self, symbol) -> bool:
+
+        instrument = self.get_instrument_by_symbol(symbol)
+         # Update position if we have one
+        if instrument in self.positions:
+            return True
+
+        return False
+    
     def update_market_prices(self, market_event: MarketDataEvent) -> None:
         """
         Update market prices based on market data event.
@@ -137,12 +147,12 @@ class PositionManager:
         # Try OHLC.close next if price still None
         if price is None and 'OHLC' in data and isinstance(data['OHLC'], dict):
             ohlc = data['OHLC']
-            if 'close' in ohlc and ohlc['close'] is not None:
+            if 'CLOSE' in ohlc and ohlc['CLOSE'] is not None:
                 try:
-                    price = float(ohlc['close'])
-                    self.logger.debug(f"Found price {price} in OHLC.close for {symbol}")
+                    price = float(ohlc['CLOSE'])
+                    self.logger.debug(f"Found price {price} in OHLC.CLOSE for {symbol}")
                 except (ValueError, TypeError):
-                    self.logger.warning(f"Invalid OHLC close value for {symbol}: {ohlc['close']}")
+                    self.logger.warning(f"Invalid OHLC close value for {symbol}: {ohlc['CLOSE']}")
                     price = None
 
         # Try mid price from bid/ask if price still None

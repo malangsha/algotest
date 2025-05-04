@@ -14,7 +14,8 @@ import pandas as pd
 from models.events import Event, EventType, MarketDataEvent, SignalEvent, BarEvent, PositionEvent, FillEvent, OrderEvent, TimerEvent
 from models.order import Order
 from models.position import Position
-from utils.constants import SignalType, Timeframe, EventPriority
+from utils.constants import SignalType, Timeframe, EventPriority, Exchange
+from models.instrument import Instrument
 
 class OptionStrategy(ABC):
     """
@@ -119,14 +120,14 @@ class OptionStrategy(ABC):
             component_name=self.id
         )
         
-        # Timer events (NORMAL priority)
-        if self.config.get('uses_timer', False):
-            self.event_manager.subscribe(
-                EventType.TIMER,
-                self._handle_timer,
-                component_name=self.id
+        # # Timer events (NORMAL priority)
+        # if self.config.get('uses_timer', False):
+        #     self.event_manager.subscribe(
+        #         EventType.TIMER,
+        #         self._handle_timer,
+        #         component_name=self.id
 
-            )
+        #     )
         
         self.logger.info(f"Strategy {self.id} event handlers registered with appropriate priorities")
 
@@ -457,6 +458,7 @@ class OptionStrategy(ABC):
             bool: True if subscription was successful, False otherwise
         """
         # Add to used symbols
+        self.logger.debug(f"request_symbol: symbol, {symbol} exchange, {exchange}")
         self.used_symbols.add(symbol)
 
         # Determine the exchange to use
@@ -582,23 +584,39 @@ class OptionStrategy(ABC):
         Returns:
             Dict[str, Any]: Strategy status information
         """
+        position_count = 0
+        if self.portfolio_manager:
+             try:
+                  # Assumes portfolio_manager has a way to get positions related to this strategy
+                  # Or just count all positions for simplicity here
+                  all_positions = self.portfolio_manager.get_all_positions()
+                  # Filter positions potentially related to this strategy's symbols
+                  # This is complex without proper linking. Simple count for now.
+                  position_count = len([p for p in all_positions if p.quantity != 0])
+             except Exception as e:
+                  self.logger.warning(f"Could not get position count from PortfolioManager: {e}")
+
         return {
             'id': self.id,
             'name': self.name,
             'description': self.description,
             'is_running': self.is_running,
             'last_run_time': self.last_run_time,
+            'last_heartbeat': self.last_heartbeat,
             'signals_generated': self.signals_generated,
+            'position_count': position_count,
             'successful_trades': self.successful_trades,
             'failed_trades': self.failed_trades,
             'positions': len(self.positions),
-            'active_subscriptions': len(self.active_subscriptions)
+            'active_subscriptions': len(self.active_subscriptions),
+            'primary_timeframe': self.timeframe,
+            'additional_timeframes': list(self.additional_timeframes),
         }
 
     def get_required_symbols(self) -> Dict[str, List[str]]:
         """
         Get the list of symbols required by this strategy.
-        This is used by the strategy manager to subscribe to the required symbols.
+        This is used by the strategy manager   to subscribe to the required symbols.
 
         Returns:
             Dict[str, List[str]]: Dictionary mapping timeframes to lists of required symbols

@@ -1,6 +1,5 @@
 # Strategy configurations
-strategies:
-  # ATM Straddle Strategy
+strategies:  
   atm_straddle:
     enabled: true
     type: "atm_straddle_strategy"
@@ -44,6 +43,54 @@ strategies:
     # Position management
     risk:
       max_positions: 1
+      max_risk_per_trade: 2.0  # percentage of portfolio
+
+  # EMA VWAP Option Strategy configuration
+  ema_vwap_option:
+    enabled: true
+    type: "ema_vwap_option_strategy"
+    description: "Option strategy based on EMA crossovers and VWAP with price retracement"
+    
+    # Index and symbol configurations
+    use_options: true
+    underlyings:
+    - name: "NIFTY INDEX"
+      spot_exchange: NSE
+      option_exchange: NFO
+    - name: "SENSEX"
+      spot_exchange: BSE
+      option_exchange: BFO
+    
+    expiry_offset: 0  # 0=current expiry, 1=next expiry
+    
+    # Timeframe configurations
+    timeframe: "1m"
+    additional_timeframes: ["5m"]
+    
+    # Entry and exit parameters
+    parameters:
+      entry_time: "09:30:00"
+      exit_time: "15:15:00"
+      fast_ema: 5
+      slow_ema: 21
+      retracement_percent: 60  # Percentage for retracement back to EMA21
+      stop_loss_percent: 40    # 40% of capital deployed
+      target_percent: 50       # 50% of capital deployed
+    
+    # Data requirements
+    data:
+      min_history_bars: 30     # Need enough bars to calculate EMAs and VWAP
+      warmup_bars: 25
+    
+    # Execution settings
+    execution:
+      order_type: "MARKET"
+      quantity: 1
+      slippage_percent: 0.1
+    
+    # Position management
+    risk:
+      max_positions: 2        # Can have both CE and PE positions simultaneously
       max_risk_per_trade: 2.0  # percentage of portfolio
 
   # Iron Butterfly Strategy

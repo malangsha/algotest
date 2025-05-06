@@ -7,6 +7,7 @@ import time
 import queue
 import pickle
 import hashlib
+import concurrent
 
 from typing import Dict, List, Optional, Any, Set, Tuple, Union
 from datetime import datetime, timedelta
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 from enum import Enum
 
-from utils.constants import MarketDataType, Exchange, InstrumentType
+from utils.constants import MarketDataType, Exchange, InstrumentType, SYMBOL_MAPPINGS
 from utils.timeframe_manager import TimeframeManager
 from models.instrument import Instrument, AssetClass
 from models.events import Event, EventType, MarketDataEvent, BarEvent
@@ -306,13 +307,25 @@ class DataManager:
         """Processes a batch of market data events, grouping by symbol."""
         symbol_event_groups = defaultdict(list)
         for event in batch:
+            if not event.instrument:
+                self.logger.warning(f"Received market data event without instrument: {event}")
+                continue
             symbol_key = event.data.get('symbol_key') # Key should be added in _on_market_data
             if symbol_key: symbol_event_groups[symbol_key].append(event)
+        
+        # If timeout is consistently a problem, consider making it configurable
+        timeout = self.config.get('symbol_processing_timeout', 3.0)  # Increased from 1.0
         futures = [self.tick_processing_executor.submit(self._process_symbol_events, key, events)
                    for key, events in symbol_event_groups.items()]
         for future in futures:
-            try: future.result(timeout=1.0)
-            except Exception as e: self.logger.error(f"Error processing symbol events batch future: {e}", exc_info=True)
+            try:
+                future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                self.logger.error(f"Symbol processing timed out after {timeout}s")
+            except Exception as e:
+                # Log the full exception details with traceback
+                self.logger.error(f"Error processing symbol events batch future: {str(e)}", exc_info=True)
+
     
     def _process_symbol_events(self, symbol_key: str, events: List[MarketDataEvent]):
         """Processes all events for a single symbol sequentially."""
@@ -369,7 +382,6 @@ class DataManager:
 
             # --- Tick Processing via TimeframeManager ---
             # Ensure necessary fields for TimeframeManager are present
-            self.logger.debug(f"tick_for_tfm: {tick_for_tfm}")
             if MarketDataType.LAST_PRICE.value in tick_for_tfm and MarketDataType.TIMESTAMP.value in tick_for_tfm:
                 try:
                     # Pass the modified tick data (with calculated volume) to TimeframeManager
@@ -395,6 +407,7 @@ class DataManager:
                                         bar_data.update(greeks_data)
                                         bar_data['implied_volatility'] = implied_vol
 
+                                self.logger.debug(f"bar_data: {bar_data}")
                                 # --- Publish Standard BarEvent ---
                                 self._publish_bar_event(
                                     symbol_key=symbol_key,
@@ -479,19 +492,26 @@ class DataManager:
         """Calculate option Greeks using data from a completed bar."""
         if not self.calculate_greeks or not isinstance(instrument, Instrument) or instrument.instrument_type != InstrumentType.OPTION:
             return None
+        
+        if instrument.symbol in SYMBOL_MAPPINGS:
+            self.logger.debug(f"Skipping greek calculation for: {instrument.symbol}")
+            return None
+        
+        self.logger.debug(f"Instrument: {instrument}")
         try:
             option_price = float(bar_data['close'])
             timestamp = float(bar_data['timestamp'])
+            
             # 1. Get Underlying Price
-            underlying_symbol_key = getattr(instrument, 'underlying_symbol_key', None)
-            if not underlying_symbol_key:
+            symbol_key = getattr(instrument, 'symbol_key', None)
+            if not symbol_key:
                  underlying_sym = getattr(instrument, 'underlying_symbol', None)
                  if underlying_sym and instrument.exchange:
                       exch = instrument.exchange.value if isinstance(instrument.exchange, Enum) else str(instrument.exchange)
-                      underlying_symbol_key = f"{exch}:{underlying_sym}"
+                      symbol_key = f"{exch}:{underlying_sym}"
                  else: self.logger.warning(f"Cannot determine underlying for option {instrument.symbol}"); return None
-            underlying_price = self._get_last_price(underlying_symbol_key) # Uses converted data
-            if underlying_price is None: self.logger.warning(f"No underlying price for {underlying_symbol_key}"); return None
+            underlying_price = self._get_last_price(symbol_key) # Uses converted data
+            if underlying_price is None: self.logger.warning(f"No underlying price for {symbol_key}"); return None
 
             # 2. Get Time to Expiry
             expiry_dt = getattr(instrument, 'expiry_date', None) # Expecting datetime object
@@ -1624,12 +1644,11 @@ if __name__ == '__main__':
         exchange=Exchange.NFO,
         instrument_type=InstrumentType.OPTION,
         asset_class=AssetClass.OPTIONS,
-        instrument_id="NFO:38605",
-        underlying_symbol="NIFTY", # Needed for Greeks
+        instrument_id="NFO:38605",        
         strike=24500, # Example strike
         expiry_date=datetime(2025, 5, 29), # Example expiry
         option_type="CALL", # Example type
-        underlying_symbol_key="NSE:26000" # Link to underlying
+        symbol_key="NSE:26000" # Link to underlying
     )
     opt_key = data_manager._get_symbol_key(nifty_opt) # Should produce "NFO:38605"
 

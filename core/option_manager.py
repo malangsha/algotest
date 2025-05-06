@@ -17,7 +17,7 @@ from functools import lru_cache
 
 from models.instrument import Instrument, AssetClass
 from core.event_manager import EventManager
-from utils.constants import OptionType, Exchange, InstrumentType, NSE_INDICES, BSE_INDICES, MarketDataType
+from utils.constants import OptionType, Exchange, InstrumentType, NSE_INDICES, BSE_INDICES, MarketDataType, SYMBOL_MAPPINGS
 from core.logging_manager import get_logger
 from models.events import MarketDataEvent, OptionsSubscribedEvent
 from core.event_manager import EventType
@@ -68,17 +68,7 @@ class OptionManager:
         
         # Underlying configurations
         market_config = config.get('market', {})
-        underlyings_config = market_config.get('underlyings', [])
-
-        self.underlying_mapping = {
-            "NIFTY INDEX": "NIFTY",
-            "NIFTY": "NFITY",
-            "NIFTY BANK": "BANKNIFTY",
-            "MIDCPNIFTY": "MIDCAP",
-            "FINNIFTY": "FINNIFTY",
-            "SENSEX": "SENSEX",
-            "BANKEX": "BANKEX"
-        }
+        underlyings_config = market_config.get('underlyings', [])       
         
         # Initialize underlyings dictionary
         self.underlyings = {}
@@ -431,7 +421,7 @@ class OptionManager:
             market_data_feed = self.data_manager.market_data_feed
 
             # Use mapped symbol for broker interaction if necessary
-            mapped_underlying = self.underlying_mapping.get(underlying_symbol, underlying_symbol)
+            mapped_underlying = SYMBOL_MAPPINGS.get(underlying_symbol, underlying_symbol)
             expiry_dates = market_data_feed.get_expiry_dates(mapped_underlying) # Use mapped symbol if needed by feed
             if not expiry_dates:
                 self.logger.error(f"No expiry dates found for {mapped_underlying}")
@@ -563,14 +553,15 @@ class OptionManager:
             if newly_subscribed_instruments:
                 self.logger.info(f"Subscribed to {len(newly_subscribed_instruments)} new ATM options for {underlying_symbol}")
                 # Publish event with the list of *newly* subscribed Instrument objects
+                self.logger.debug(f"Publish OptionsSubscribedEvent (CUSTOM) event with the list of newly subscribed Insrument Objects")
                 event = OptionsSubscribedEvent(
                     underlying_symbol=underlying_symbol,
                     instruments=newly_subscribed_instruments
                 )
                 self.event_manager.publish(event)
-            # else:
-                # self.logger.info(f"No new ATM options needed subscription for {underlying_symbol}")
-                #     
+            else:
+                self.logger.info(f"No new ATM options needed subscription for {underlying_symbol}")
+                     
     def update_atm_options(self, underlying_symbol: str, expiry_offset: int = 0) -> None:
         """
         Update option subscriptions based on the new ATM strike.
@@ -638,7 +629,8 @@ class OptionManager:
                 if hasattr(self.data_manager, 'market_data_feed') and self.data_manager.market_data_feed:
                     market_data_feed = self.data_manager.market_data_feed
                     # Use market_data_feed's batch unsubscription method
-                    unsubscription_results = market_data_feed.unsubscribe_symbols(instruments_to_remove) # Expects list of Instruments
+                    # unsubscription_results = market_data_feed.unsubscribe_symbols(instruments_to_remove)
+                    unsubscription_results = {instrument.symbol: True for instrument in instruments_to_remove}
 
                     for instrument in instruments_to_remove:
                         symbol_key = instrument.instrument_id

@@ -1027,14 +1027,14 @@ class MarketDataFeed:
                 self.broker.on_market_data(event)
 
             # Log event at debug level
-            self.logger.debug(f"Received market data event: {event}")
+            # self.logger.debug(f"Received market data event: {event}")
 
             # Forward to event manager for system-wide distribution         
             if hasattr(self, 'event_manager') and self.event_manager:
-                self.logger.debug(f"Distributing market data event to event manager: {event}")
+                # self.logger.debug(f"Distributing market data event to event manager: {event}")
                 self.event_manager.publish(event)
             elif hasattr(self, 'callback') and callable(self.callback):
-                self.logger.debug(f"Distributing market data event via callback: {event}")
+                # self.logger.debug(f"Distributing market data event via callback: {event}")
                 self.callback(event)
 
         except Exception as e:
@@ -1091,21 +1091,21 @@ class MarketDataFeed:
             return False
             
         try:
-            self.feed.remove_instrument(instrument)
-
-            # Remove from subscribed symbols cache
-            cache_key = f"{instrument.exchange.value}:{instrument.symbol}"
-            self._subscribed_symbols.discard(cache_key)
-            
             # Unsubscribe through the feed
             self.logger.info(f"Unsubscribing from instrument: {instrument.symbol}")
             success = self.feed.unsubscribe(instrument)
-            
+
             if success:
                 self.logger.info(f"Successfully unsubscribed from {instrument.symbol}")
+
+                self.feed.remove_instrument(instrument)
+
+                # Remove from subscribed symbols cache
+                cache_key = f"{instrument.exchange.value}:{instrument.symbol}"
+                self._subscribed_symbols.discard(cache_key)
             else:
                 self.logger.error(f"Failed to unsubscribe from {instrument.symbol}")
-                
+
             return success
             
         except Exception as e:
@@ -1238,6 +1238,43 @@ class MarketDataFeed:
         # Log summary
         success_count = sum(1 for v in results.values() if v)
         self.logger.info(f"Subscribed to {success_count}/{len(instruments)} instruments")
+        
+        return results
+    
+    def unsubscribe_symbols(self, instruments: List[Instrument]) -> Dict[str, bool]:
+        """
+        Unsubscribe to multiple instruments at once
+        
+        Args:
+            instruments: List of instruments to unsubscribe from
+            
+        Returns:
+            Dict[str, bool]: Dictionary mapping instrument symbols to unsubscription success status
+        """       
+        
+        if not self.feed:
+            self.logger.error("Feed not initialized, cannot unsubscribe to instruments")
+            return {instrument.symbol: False for instrument in instruments}
+            
+        results = {}
+        
+        # For each instrument, call subscribe method
+        for instrument in instruments:
+            try:
+                # Use existing subscribe method
+                success = self.unsubscribe(instrument)
+                results[instrument.symbol] = success
+                
+                if not success:
+                    self.logger.warning(f"Failed to unsubscribe to {instrument.symbol} on {instrument.exchange}")
+                
+            except Exception as e:
+                self.logger.error(f"Error unsubscribing to {instrument.symbol}: {e}")
+                results[instrument.symbol] = False
+                
+        # Log summary
+        success_count = sum(1 for v in results.values() if v)
+        self.logger.info(f"Unsubscribed to {success_count}/{len(instruments)} instruments")
         
         return results
 

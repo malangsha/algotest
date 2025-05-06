@@ -129,7 +129,7 @@ class PositionManager:
 
         symbol = instrument.symbol
         
-        self.logger.debug(f"Market event for {symbol}: {market_event.data_type} - {market_event.data}")
+        # self.logger.debug(f"Market event for {symbol}: {market_event.data_type} - {market_event.data}")
 
         # Extract price using string keys
         price = None

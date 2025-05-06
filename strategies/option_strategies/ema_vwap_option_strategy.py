@@ -6,6 +6,8 @@ This strategy buys Call or Put options based on EMA crossovers and VWAP conditio
 - For PE: Buy when price is below VWAP and EMA_5 crosses EMA_21 from above, after a 60% retracement to EMA_21
 """
 
+import logging
+import time
 from datetime import datetime, time as dt_time
 from typing import Dict, List, Any, Optional, Set, Tuple
 import numpy as np
@@ -18,8 +20,6 @@ from utils.constants import SignalType, MarketDataType
 from utils.time_utils import is_market_open, time_in_range
 from strategies.strategy_registry import StrategyRegistry
 from models.instrument import Instrument
-from core.logging_manager import get_logger
-
 
 @StrategyRegistry.register('ema_vwap_option_strategy')
 class EmaVwapOptionStrategy(OptionStrategy):
@@ -597,4 +597,4 @@ class EmaVwapOptionStrategy(OptionStrategy):
             self.logger.warning(f"Strategy '{self.id}' stopping with active positions. Forcing exit.")
             self._exit_all_positions("Strategy stopped")
             
-        self.logger.info(f"EMA VWAP Option Strategy '{self.id}' stopped.") 
+        self.logger.info(f"EMA VWAP Option Strategy '{self.id}' stopped.")

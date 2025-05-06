@@ -32,15 +32,7 @@ class EventFlowMonitor:
             EventType.ORDER: {EventType.EXECUTION, EventType.FILL},  # Orders should lead to Execution and/or Fills
             EventType.FILL: {EventType.POSITION},  # Fills should lead to Position updates
             EventType.POSITION: {EventType.ACCOUNT},  # Position updates should lead to Account updates
-            EventType.EXECUTION: {EventType.FILL},  # Executions should lead to Fills
-            EventType.BAR: {EventType.SIGNAL},  # Bars should lead to Signals
-            TimeframeEventType.BAR_1M: {EventType.SIGNAL},  # 1-minute bars should lead to Signals
-            TimeframeEventType.BAR_5M: {EventType.SIGNAL},  # 5-minute bars should lead to Signals
-            TimeframeEventType.BAR_15M: {EventType.SIGNAL},  # 15-minute bars should lead to Signals
-            TimeframeEventType.BAR_30M: {EventType.SIGNAL},  # 30-minute bars should lead to Signals
-            TimeframeEventType.BAR_1H: {EventType.SIGNAL},  # 1-hour bars should lead to Signals
-            TimeframeEventType.BAR_4H: {EventType.SIGNAL},  # 4-hour bars should lead to Signals
-            TimeframeEventType.BAR_1D: {EventType.SIGNAL}  # 1-day bars should lead to Signals
+            EventType.EXECUTION: {EventType.FILL}  # Executions should lead to Fills            
         }
         
         # Track actual events seen
@@ -57,15 +49,7 @@ class EventFlowMonitor:
             EventType.FILL: 5.0,
             EventType.EXECUTION: 10.0,
             EventType.POSITION: 5.0,
-            EventType.ACCOUNT: 5.0,
-            EventType.BAR: 5.0,
-            TimeframeEventType.BAR_1M: 5.0,
-            TimeframeEventType.BAR_5M: 5.0,
-            TimeframeEventType.BAR_15M: 5.0,
-            TimeframeEventType.BAR_30M: 5.0,
-            TimeframeEventType.BAR_1H: 5.0,
-            TimeframeEventType.BAR_4H: 5.0,
-            TimeframeEventType.BAR_1D: 5.0
+            EventType.ACCOUNT: 5.0            
         }
         
         # Statistics

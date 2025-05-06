@@ -136,7 +136,7 @@ class OptionStrategy(ABC):
         if not isinstance(event, MarketDataEvent):
             return
             
-        self.logger.debug(f"Received MarketDataEvent: {event}")
+        # self.logger.debug(f"Received MarketDataEvent: {event}")
         # Update last heartbeat
         self.last_heartbeat = time.time()
             

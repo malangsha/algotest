@@ -41,30 +41,28 @@ class StrategyRegistry:
     def get_strategy_class(cls, strategy_type: str) -> Optional[Type[OptionStrategy]]:
         """
         Get a strategy class by type name.
-        
+
         Args:
             strategy_type: Type name of the strategy
-            
+
         Returns:
             Strategy class if found, None otherwise
         """
         if strategy_type not in cls._strategies:
-            # First try to import from strategies.{strategy_type}
-            try:
-                module_name = f"strategies.{strategy_type}"
-                importlib.import_module(module_name)
-            except ImportError:
-                logger.info(f"Could not import strategy module: {module_name}")
-                
-                # If first import fails, try strategies.option_strategies.{strategy_type}
+            # Attempt to import from either strategies or strategies.option_strategies
+            for pkg in ("strategies", "strategies.option_strategies"):
+                module_name = f"{pkg}.{strategy_type}"
                 try:
-                    module_name = f"strategies.option_strategies.{strategy_type}"
                     importlib.import_module(module_name)
+                    logger.info(f"Imported strategy module: {module_name}")
+                    break
                 except ImportError:
-                    logger.error(f"Could not import strategy module: {module_name}")
-                    return None
-                
-        return cls._strategies.get(strategy_type)
+                    logger.debug(f"Could not import strategy module: {module_name}")
+            else:
+                logger.error(f"Failed to import any module for strategy: {strategy_type}")
+                return None
+
+        return cls._strategies.get(strategy_type)   
     
     @classmethod
     def load_all_strategies(cls):

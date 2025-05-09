@@ -136,13 +136,14 @@ class OptionStrategy(ABC):
         if not isinstance(event, MarketDataEvent):
             return
             
-        # self.logger.debug(f"Received MarketDataEvent: {event}")
+        self.logger.debug(f"Received MarketDataEvent: {event}")
         # Update last heartbeat
         self.last_heartbeat = time.time()
             
         # Check if the event is for a symbol we're monitoring
         symbol = event.instrument.symbol
         
+        self.logger.debug(f"symbol: {symbol}, self.used_symbols: {self.used_symbols}")
         if symbol in self.used_symbols:
             # If this is an option, update option data cache
             if self._is_option_symbol(symbol):
@@ -564,7 +565,7 @@ class OptionStrategy(ABC):
             bool: True if symbol is an option, False otherwise
         """
         # Simplified check - in a real implementation, this would be more robust
-        return 'CE' in symbol or 'PE' in symbol
+        return 'C' in symbol or 'P' in symbol
     
     def _update_option_data(self, symbol: str, data: Dict[str, Any]):
         """

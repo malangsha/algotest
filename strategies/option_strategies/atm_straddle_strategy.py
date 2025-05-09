@@ -110,6 +110,9 @@ class AtmStraddleStrategy(OptionStrategy):
 
     def on_market_data(self, event: MarketDataEvent):
         """Process tick data, primarily for updating option prices and checking SL/Target."""
+        
+        self.logger.debug(f"Received MarketDataEvent: {event}")
+
         if not event.instrument or not event.data: return
 
         symbol_key = event.instrument.instrument_id # e.g., NFO:NIFTY... or NSE:NIFTY INDEX
@@ -148,6 +151,8 @@ class AtmStraddleStrategy(OptionStrategy):
 
     def on_bar(self, event: BarEvent):
         """Process bar data, primarily for entry and time-based exit logic."""
+        
+        self.logger.debug(f"Received BarEvent: {event}")
         if not event.instrument: return
 
         symbol_key = event.instrument.instrument_id

@@ -27,6 +27,8 @@ class SignalType(Enum):
     EXIT = "EXIT"
     ADJUST = "ADJUST"
     ALERT = "ALERT"
+    BUY_CALL = "BUY_CALL"
+    BUY_PUT = "BUY_PUT"
 
 class OrderStatus(Enum):
     PENDING = "PENDING"

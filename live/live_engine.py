@@ -269,7 +269,7 @@ class LiveEngine(TradingEngine):
             self.running = True
 
             # print event manager statistics
-            self.event_manager.print_event_statistics()
+            # self.event_manager.print_event_statistics()
             
             self.logger.info("Event manager started successfully")
 

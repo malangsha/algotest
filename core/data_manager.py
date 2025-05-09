@@ -505,11 +505,13 @@ class DataManager:
             # 1. Get Underlying Price
             symbol_key = getattr(instrument, 'symbol_key', None)
             if not symbol_key:
-                 underlying_sym = getattr(instrument, 'underlying_symbol', None)
-                 if underlying_sym and instrument.exchange:
-                      exch = instrument.exchange.value if isinstance(instrument.exchange, Enum) else str(instrument.exchange)
-                      symbol_key = f"{exch}:{underlying_sym}"
-                 else: self.logger.warning(f"Cannot determine underlying for option {instrument.symbol}"); return None
+                 symbol_key = getattr(instrument, 'instrument_id', None)
+                 if not symbol_key:
+                    instrument_sym = getattr(instrument, 'symbol', None)
+                    if instrument_sym and instrument.exchange:
+                        exch = instrument.exchange.value if isinstance(instrument.exchange, Enum) else str(instrument.exchange)
+                        symbol_key = f"{exch}:{instrument_sym}"
+                    else: self.logger.warning(f"Cannot determine underlying for option {instrument.symbol}"); return None
             underlying_price = self._get_last_price(symbol_key) # Uses converted data
             if underlying_price is None: self.logger.warning(f"No underlying price for {symbol_key}"); return None
 
@@ -541,7 +543,7 @@ class DataManager:
             # 6. Call Calculation Function (from greeks_calculator.py)
             # Assuming calculate_greeks returns dict or raises error
             greeks_dict = OptionsGreeksCalculator.calculate_greeks(
-                option_type=instrument.option_type.lower() if instrument.option_type else 'call', # Ensure 'call' or 'put'
+                option_type=instrument.option_type,
                 underlying_price=underlying_price,
                 strike_price=strike_price,
                 time_to_expiry=time_to_expiry_years,

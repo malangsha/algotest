@@ -52,37 +52,27 @@ class StrategyFactory:
         strategy_class = StrategyRegistry.get_strategy_class(strategy_type)
 
         if strategy_class is None:
-            # Try to dynamically import the strategy module
-            try:
-                module_name = f"strategies.{strategy_type.lower()}"
-
-                # Convert snake_case to PascalCase
-                class_name = ''.join(word.capitalize() for word in strategy_type.split('_'))
-
+            # Try to dynamically import the strategy module, with fallback
+            class_name = ''.join(word.capitalize() for word in strategy_type.split('_'))
+            for pkg in ("strategies", "strategies.option_strategies"):
+                module_name = f"{pkg}.{strategy_type.lower()}"
                 logger.info(f"Attempting to load strategy: {strategy_type}")
                 logger.info(f"Module: {module_name}, Class: {class_name}")
-
-                # Import the module
-                module = importlib.import_module(module_name)
-
-                if hasattr(module, class_name):
-                    strategy_class = getattr(module, class_name)
-                    
-                    # Register the strategy if needed (the class might already have a decorator)
-                    # This doesn't create an instance, just registers the class
-                    StrategyRegistry.register(strategy_type)(strategy_class)
-                    logger.info(f"Successfully loaded {class_name} from {module_name}")
-                else:
-                    raise AttributeError(f"Class {class_name} not found in module {module_name}")
-
-            except ImportError as e:
-                logger.error(f"Failed to import module '{module_name}': {str(e)}")
-                raise ValueError(f"Strategy module not found: {strategy_type}")
-            except Exception as e:
-                logger.error(f"Failed to dynamically load strategy '{strategy_type}': {str(e)}")
-                raise ValueError(f"Error loading strategy: {strategy_type} - {str(e)}")
-
-        logger.info(f"Creating strategy instance: {name} of type {strategy_type}")
+                try:
+                    module = importlib.import_module(module_name)
+                    if hasattr(module, class_name):
+                        strategy_class = getattr(module, class_name)
+                        StrategyRegistry.register(strategy_type)(strategy_class)
+                        logger.info(f"Successfully loaded {class_name} from {module_name}")
+                        break
+                    else:
+                        raise AttributeError(f"Class {class_name} not found in module {module_name}")
+                except ModuleNotFoundError:
+                    logger.debug(f"Module not found: {module_name}")
+                except AttributeError as e:
+                    logger.debug(str(e))
+        else:
+            raise ImportError(f"Unable to load strategy class {class_name} for type {strategy_type}")
         
         # Create the strategy instance using the config
         return strategy_class(config)

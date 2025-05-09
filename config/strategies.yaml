@@ -93,6 +93,51 @@ strategies:
       max_positions: 2        # Can have both CE and PE positions simultaneously
       max_risk_per_trade: 2.0  # percentage of portfolio
 
+  high_frequency_momentum_option:
+    enabled: true
+    type: "high_frequency_momentum_option_strategy"
+    description: "High-frequency momentum strategy for NIFTY and SENSEX options, aiming for >= 90% hit rate."
+    
+    use_options: true
+    underlyings:
+    - name: "NIFTY INDEX"
+      spot_exchange: NSE
+      option_exchange: NFO
+    - name: "SENSEX"
+      spot_exchange: BSE
+      option_exchange: BFO
+    
+    expiry_offset: 0  # 0=current expiry, 1=next expiry
+    
+    timeframe: "1m" # Strategy requires 1m bars
+    # additional_timeframes: [] # No other timeframes explicitly mentioned as required by the strategy code
+    
+    parameters:
+      entry_time: "09:20:00"
+      exit_time: "15:15:00"
+      stop_loss_percent: 5
+      target_percent: 10
+      fast_ema_period: 5
+      slow_ema_period: 20
+      rsi_period: 14
+      rsi_upper_band: 70
+      rsi_lower_band: 30
+      breakout_bars: 3
+      cooldown_period_seconds: 300 # 5 minutes
+    
+    data:
+      min_history_bars: 75 # Needs enough for slow_ema, rsi, breakout_bars, and some buffer (e.g., 20 + 14 + 3 + buffer)
+      warmup_bars: 50 # Should be less than min_history_bars
+    
+    execution:
+      order_type: "MARKET"
+      quantity: 1 # Default quantity, can be overridden by RiskManager or specific strategy logic if needed
+      slippage_percent: 0.1
+    
+    risk:
+      max_positions: 2 # Can hold one CE and one PE, or one per underlying if configured for multiple
+      max_risk_per_trade: 1.0  # percentage of portfolio, adjust as per risk appetite for high hit-rate strategy
+
   # Iron Butterfly Strategy
   # iron_butterfly:
   #   enabled: true
@@ -331,3 +376,7 @@ strategies:
   #   lifecycle:
   #     warmup_bars: 30
   #     cooldown_after_stop_loss: 5
+
+
+  
+

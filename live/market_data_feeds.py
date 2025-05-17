@@ -480,6 +480,32 @@ class FinvasiaFeed(MarketDataFeedBase):
         ws_url: str = "wss://api.shoonya.com/NorenWSTP/",
         debug: bool = False
     ):
+        self.logger = get_logger("live.finvasia_feed")
+        if debug:
+            self.logger.setLevel(logging.DEBUG)
+
+        self._stop_reconnect_event = threading.Event()
+        self._reconnect_thread = None
+        
+        # State tracking
+        self.is_connected = False
+        self.is_authenticated = False
+        self.session_token = None
+        
+        # Reconnection attributes
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 5  # Default, can be overridden by params if needed
+        self._reconnect_delay = 5     # Default
+        
+        # Subscription tracking
+        self._subscribed_tokens: set = set()
+        self._token_to_symbol: dict = {}
+        self._symbol_to_token: dict = {}
+
+        # Thread locks
+        self._auth_lock = threading.Lock()
+        self._sub_lock = threading.Lock()
+
         super().__init__(instruments, callback)
         
         self.logger = get_logger("live.finvasia_feed")
@@ -499,44 +525,84 @@ class FinvasiaFeed(MarketDataFeedBase):
         
         # Initialize symbol cache
         self.symbol_cache = SymbolCache()
-        
-        # State tracking
-        self.is_authenticated = False
-        self.is_connected = False
-        self.session_token = None
-        
-        # Subscription tracking
-        self._subscribed_tokens: Set[str] = set()
-        self._token_to_symbol: Dict[str, str] = {}
-        self._symbol_to_token: Dict[str, str] = {}
-        
-        # Thread locks
-        self._auth_lock = threading.Lock()
-        self._sub_lock = threading.Lock()
-        
+
         self.logger.info("FinvasiaFeed Class initialized")
     
+    @property
+    def is_running(self):
+        """Indicates if the feed is actively connected and authenticated."""
+        return self.is_connected and self.is_authenticated
+    
+    @is_running.setter
+    def is_running(self, value: bool):
+        """
+        Setter for the is_running property.
+        Allows control over the feed's state (start/stop) and handles
+        assignments from base class during initialization.
+        """
+        # Logger might not be fully configured if this is called very early from base class,
+        # but it should exist due to earlier initialization.
+        self.logger.info(f"Attempt to set is_running to: {value}. Current actual state (getter): {self.is_running}")
+
+        if not isinstance(value, bool):
+            self.logger.warning(f"is_running can only be set to a boolean value. Received: {value}")
+            return
+
+        if value: # Trying to set to True
+            if not self.is_running: 
+                self.logger.info("is_running being set to True. Calling start() to initiate connection.")            
+                self.start() 
+            else:
+                self.logger.info("is_running is already True (actual state). No action taken by setter.")
+        else:             
+            if self.is_running:
+                self.logger.info("is_running being set to False. Calling stop() to terminate connection.")
+                self.stop()
+            else:
+                self.logger.info("is_running is already False (actual state). No action taken by setter.")
+
     def start(self):
         """Start the feed and connect to Finvasia."""
+        self.logger.info("Starting FinvasiaFeed...")
+        self._stop_reconnect_event.clear() # Allow reconnections
+
         if not self.is_authenticated:
             if not self.authenticate():
-                self.logger.error("Failed to authenticate")
-                return False
+                self.logger.error("Failed to authenticate. Cannot start feed.")
+                return False # Indicate failure to start
                 
         if not self.is_connected:
-            if not self.connect():
-                self.logger.error("Failed to connect to WebSocket")
-                return False
-                
-        # Subscribe to all instruments
-        for instrument in self.instruments:
-            self.subscribe(instrument)
-            
-        return True
+            if not self.connect(): # connect() will now handle its own logic for connection status
+                self.logger.error("Failed to connect to WebSocket during initial start.")
+                # _on_close might be triggered by connect() failure, initiating retries if appropriate
+                return False # Indicate failure to start
+
+        # If connect was successful, it would have set is_connected and called _on_open.
+        # _on_open handles resubscription. If it's an initial start, _subscribed_tokens is empty.
+        # For initial subscriptions based on self.instruments:
+        if self.is_connected:
+            self.logger.info("Initial subscription to provided instruments...")
+            # Create a copy for iteration, as self.instruments might be modified by add_instrument
+            instruments_to_subscribe = list(self.instruments)
+            for instrument in instruments_to_subscribe:
+                self.subscribe(instrument) # This uses the updated subscribe method
+            self.logger.info("FinvasiaFeed started.")
+            return True
+        else:
+            self.logger.warning("FinvasiaFeed started but initial connection failed. Reconnection might be in progress if enabled.")
+            return False # Or True, depending on desired behavior if initial connect fails but retries are active
     
     def stop(self):
-        """Stop the feed and disconnect from Finvasia."""
-        self.disconnect()
+        """Stop the feed, disconnect, and prevent further reconnections."""
+        self.logger.info("Stopping FinvasiaFeed...")
+        self._stop_reconnect_event.set() # Signal any reconnection attempts to stop
+
+        if self._reconnect_thread and self._reconnect_thread.is_alive():
+            self.logger.info("Waiting for active reconnect thread to terminate...")
+            self._reconnect_thread.join(timeout=self._reconnect_delay + 2.0) # Wait for it to finish or timeout
+
+        self.disconnect() # Call the disconnect method to clean up
+        self.logger.info("FinvasiaFeed stopped.")
         return True
     
     def authenticate(self) -> bool:
@@ -573,66 +639,106 @@ class FinvasiaFeed(MarketDataFeedBase):
                 return False
     
     def connect(self) -> bool:
-        """Connect to Finvasia WebSocket feed."""
+        """
+        Connect to Finvasia WebSocket feed.
+        Ensures previous connection is closed and handles connection timeout.
+        """
+        if self._stop_reconnect_event.is_set():
+            self.logger.info("Connect called but feed is stopping. Aborting connection attempt.")
+            return False
+
         if not self.is_authenticated:
-            if not self.authenticate():
-                return False
-                
+            with self._auth_lock: # Ensure thread-safe authentication check/attempt
+                if not self.is_authenticated: # Double check after acquiring lock
+                    self.logger.info("Authentication required before connecting. Attempting to authenticate...")
+                    if not self.authenticate(): # authenticate() is assumed to be thread-safe or called within lock
+                        self.logger.error("Authentication failed. Cannot connect.")
+                        return False
+        
+        self.logger.debug("Attempting to close any existing WebSocket connection before initiating new one.")
+        try:
+            self.api.close_websocket() # Crucial to prevent "socket already opened"
+        except Exception as e:
+            self.logger.warning(f"Exception while pre-closing websocket: {e}")
+        time.sleep(0.5) # Brief pause for cleanup
+
         try:
             # Setup WebSocket callbacks
             self.api.on_disconnect = self._on_disconnect
             self.api.on_error = self._on_error
             self.api.on_open = self._on_open
-            self.api.on_close = self._on_close
+            self.api.on_close = self._on_close # This is important
             self.api.on_ticks = self._on_market_data
-            self.api.on_order_update = self._on_order_update
-            
-            # Start WebSocket
+            # self.api.on_order_update = self._on_order_update # If you handle order updates
+
+            self.logger.info("Starting WebSocket connection with NorenApi...")
+            self.is_connected = False # Reset connection status before attempting
             self.api.start_websocket(
-                order_update_callback=self._on_order_update,
+                order_update_callback=self._on_order_update if hasattr(self, '_on_order_update') else None,
                 subscribe_callback=self._on_market_data,
                 socket_open_callback=self._on_open,
                 socket_close_callback=self._on_close
+                # error_callback=self._on_error # Check NorenApi documentation if it supports this
             )
             
-            # Wait for connection
+            # Wait for connection status to be updated by _on_open
             start_time = time.time()
-            while not self.is_connected and time.time() - start_time < 10:
+            connection_timeout = 15  # seconds
+            self.logger.debug(f"Waiting up to {connection_timeout}s for WebSocket connection to establish...")
+            
+            while not self.is_connected and (time.time() - start_time) < connection_timeout:
+                if self._stop_reconnect_event.is_set():
+                    self.logger.info("Connection attempt aborted as feed is stopping.")
+                    self.api.close_websocket() # Ensure cleanup
+                    return False
                 time.sleep(0.1)
                 
             if not self.is_connected:
-                self.logger.error("WebSocket connection timeout")
+                self.logger.error(f"WebSocket connection timeout after {connection_timeout} seconds. _on_open was not called.")
+                self.api.close_websocket() # Attempt to clean up the failed connection
+                # _on_close might be called by NorenApi if handshake fails, triggering reconnect.
+                # If not, we might want to trigger it manually or call _attempt_reconnect here.
+                # For now, rely on NorenApi's _on_close or a subsequent _attempt_reconnect call.
                 return False
-                
-            self.logger.info("WebSocket connected successfully")
-            return True
             
+            self.logger.info("WebSocket connection process initiated successfully. _on_open confirmed connection.")
+            # _reconnect_attempts are reset in _on_open
+            return True
+
         except Exception as e:
-            self.logger.error(f"Connection error: {e}")
+            self.logger.error(f"Exception during WebSocket connection: {e}", exc_info=True)
+            self.api.close_websocket() # Ensure cleanup on exception
+            self.is_connected = False  # Update state
+            # This exception might also lead to _on_close being called by the library.
+            # If not, consider calling _attempt_reconnect here after a small delay.
+            # self._attempt_reconnect() # Or let _on_close handle it if it's called.
             return False
     
-    def subscribe(self, instrument: Instrument):
-        """Subscribe to market data for an instrument."""
+    def subscribe(self, instrument: Instrument): # instrument: Instrument
+        """Subscribe to market data for an instrument. Uses full 'exchange|token' string."""
         if not self.is_connected:
-            if not self.connect():
-                return False              
+            self.logger.warning(f"Cannot subscribe to {instrument.symbol}: WebSocket not connected. Attempting to connect...")
+            if not self.connect(): # Try to connect first
+                 self.logger.error(f"Failed to connect. Subscription for {instrument.symbol} aborted.")
+                 return False              
         
         with self._sub_lock:
             try:
-                # Look up symbol in cache
-                exchange_str = instrument.exchange.value if isinstance(instrument.exchange, Exchange) else instrument.exchange              
-                symbol_info = self.symbol_cache.lookup_symbol(instrument.symbol, exchange_str)
-                if not symbol_info:
-                    self.logger.warning(f"Symbol not found in cache: {instrument.symbol}")
+                # Assuming instrument.exchange is an Enum or has a .value attribute for string representation
+                exchange_str = instrument.exchange.value if isinstance(instrument.exchange, Exchange) else str(instrument.exchange)                                
+                symbol_info = self.symbol_cache.lookup_symbol(instrument.symbol, exchange_str)              
+                if not symbol_info or 'token' not in symbol_info:
+                    self.logger.warning(f"Symbol not found in cache: {instrument.symbol}, Cannot subscribe")
                     return False
                     
                 token = symbol_info['token']
                 if token in self._subscribed_tokens:
-                    return True
+                    subscription_str = f"{exchange_str}|{token}"
+                    self.logger.debug(f"Already subscribed to {subscription_str} ({instrument.symbol}).")
+                    return True               
                     
-                # Subscribe to symbol
                 response = self.api.subscribe([f"{exchange_str}|{token}"])
-                self.logger.debug(f"Subscription response: {response}")
+                self.logger.debug(f"Subscription response: {response}")                
                 # if not isinstance(response, dict) or response.get('stat') != 'Ok':
                 #     self.logger.error(f"Subscription failed: {response}")
                 #     return False
@@ -644,16 +750,19 @@ class FinvasiaFeed(MarketDataFeedBase):
                 
                 self.logger.info(f"Subscribed to {instrument.symbol}")
                 return True
-                
+            
             except Exception as e:
-                self.logger.error(f"Subscription error: {e}")
+                self.logger.error(f"Exception during subscription to {instrument.symbol}: {e}", exc_info=True)
                 return False
     
     def unsubscribe(self, instrument: Instrument):
-        """Unsubscribe from market data for an instrument."""
+        """Unsubscribe from market data for an instrument. Uses full 'exchange|token' string."""
         if not self.is_connected:
-            return True
-            
+            self.logger.warning(f"Cannot unsubscribe from {instrument.symbol}: WebSocket not connected.")
+            # Unsubscription doesn't strictly need an active connection if we're just updating our state,
+            # but the API call would fail.
+            return True # Or False, depending on desired strictness
+        
         with self._sub_lock:
             try:
                 token = self._symbol_to_token.get(instrument.symbol)
@@ -679,32 +788,127 @@ class FinvasiaFeed(MarketDataFeedBase):
                 return False
     
     def _on_disconnect(self):
-        """Handle WebSocket disconnect."""
+        """Handle WebSocket disconnect callback specifically from NorenApi (if different from _on_close)."""
+        self.logger.warning(f"WebSocket _on_disconnect (NorenApi specific) received. Current connected state: {self.is_connected}")
+
+        if self.is_connected: 
+            self.logger.warning("WebSocket disconnected unexpectedly (was connected) via _on_disconnect.")
+        
         self.is_connected = False
-        self.logger.warning("WebSocket disconnected")
+
+        if self._stop_reconnect_event.is_set():
+            self.logger.info("Reconnection suppressed via _on_disconnect as feed is stopping.")
+            return
+
+        self._attempt_reconnect()
         
     def _on_error(self, error):
         """Handle WebSocket error."""
         self.logger.error(f"WebSocket error: {error}")
         
     def _on_open(self):
-        """Handle WebSocket open."""
+        """Handle WebSocket open event."""
+        self.logger.info("WebSocket connection opened successfully.")
         self.is_connected = True
-        self.logger.info("WebSocket opened")
-        
-        # Resubscribe to existing symbols
+        self._reconnect_attempts = 0 # Reset reconnect counter on successful connection
+        self.is_authenticated = True
+
+        # Resubscribe to all tracked instruments
         if self._subscribed_tokens:
-            self.logger.info("Resubscribing to existing symbols...")
+            self.logger.info(f"Resubscribing to {len(self._subscribed_tokens)} existing instrument strings after (re)connection...")
             with self._sub_lock:
                 tokens_to_resubscribe = list(self._subscribed_tokens)
                 if tokens_to_resubscribe:
-                    self.api.subscribe(tokens_to_resubscribe)
-        
+                    self.logger.debug(f"Attempting to resubscribe to: {tokens_to_resubscribe}")
+                    response = self.api.subscribe(tokens_to_resubscribe)
+                    self.logger.debug(f"Resubscription API response: {response}")                    
+        else:
+            self.logger.info("No existing subscriptions to resubscribe to on WebSocket open.")
+    
     def _on_close(self, code=None, reason=None):
-        """Handle WebSocket close."""
-        self.is_connected = False
-        self.logger.warning(f"WebSocket closed (code: {code}, reason: {reason})")
+        """Handle WebSocket close event. This is called by the underlying websocket library."""
+        self.logger.warning(f"WebSocket _on_close received. Code: {code}, Reason: '{reason}'. Current connected state: {self.is_connected}")
         
+        was_connected = self.is_connected
+        self.is_connected = False
+
+        if self._stop_reconnect_event.is_set():
+            self.logger.info("Reconnection suppressed as feed is stopping or has been stopped.")
+            return        
+        
+        if was_connected:
+            self.logger.warning(f"WebSocket connection lost (was connected). Code: {code}, Reason: '{reason}'")
+        else:
+            # This could happen if connect() fails and _on_close is called before _on_open.
+            self.logger.warning(f"WebSocket failed to establish connection or closed prematurely. Code: {code}, Reason: '{reason}'")
+        
+        # The 504 Gateway Timeout will trigger this.
+        # NorenApi might also trigger close for other reasons.
+        self._attempt_reconnect()    
+        
+    def _attempt_reconnect(self):
+        """Manages the logic and scheduling of reconnection attempts."""
+        if self._stop_reconnect_event.is_set():
+            self.logger.info("Reconnect attempt skipped: feed stopping.")
+            return
+
+        if self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            # Exponential backoff, capped at 60 seconds
+            delay = min(self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)), 60)
+            
+            self.logger.info(f"Attempting WebSocket reconnection in {delay:.2f} seconds (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts}).")
+            
+            # Ensure only one reconnect thread is active
+            if self._reconnect_thread and self._reconnect_thread.is_alive():
+                self.logger.debug("Previous reconnect thread still alive. Not starting a new one yet.")
+                return 
+
+            self._reconnect_thread = threading.Thread(target=self._run_reconnect, args=(delay,))
+            self._reconnect_thread.daemon = True # Allow program to exit even if thread is running
+            self._reconnect_thread.start()
+        else:
+            self.logger.error(f"Maximum reconnect attempts ({self._max_reconnect_attempts}) reached. Will not try to reconnect automatically.")
+            # Optionally, notify someone or take other actions for permanent failure.
+
+    def _run_reconnect(self, delay: float):
+        """Worker method for reconnection, executed in a separate thread."""
+        try:
+            self.logger.debug(f"Reconnect thread started, sleeping for {delay:.2f} seconds.")
+            
+            if self._stop_reconnect_event.wait(timeout=delay): 
+                self.logger.info("Reconnect cancelled during sleep as feed is stopping.")
+                return
+                
+            if self._stop_reconnect_event.is_set(): 
+                self.logger.info("Reconnect cancelled after sleep as feed is stopping.")
+                return
+
+            self.logger.info("Executing reconnection...")
+            
+            # Re-authenticate if not authenticated. Connection might have dropped session.
+            # Or, Finvasia might require re-login after certain types of disconnects.
+            # This depends on API behavior. For now, assume connect() handles auth if needed.
+            # if not self.is_authenticated:
+            #    self.logger.info("Authentication lost or not established. Re-authenticating before reconnect.")
+            #    if not self.authenticate():
+            #        self.logger.error("Re-authentication failed during reconnect sequence.")
+            #        # Potentially trigger another _attempt_reconnect or give up
+            #        return
+            if not self.connect(): 
+                self.logger.error("Reconnection attempt failed (connect call returned False).")
+                # connect() failure might trigger _on_close, which calls _attempt_reconnect again.
+                # This is okay as _reconnect_attempts counter will manage it.
+            else:
+                # If connect() is successful, _on_open is called, which resets _reconnect_attempts.
+                self.logger.info("Reconnection attempt initiated by connect() call. Waiting for _on_open confirmation.")
+        except Exception as e:
+            self.logger.error(f"Exception in _run_reconnect thread: {e}", exc_info=True)
+        finally:
+            # Ensure thread object is cleared if it's this thread finishing
+            if self._reconnect_thread is threading.current_thread():
+                self._reconnect_thread = None
+
     def _on_market_data(self, ticks):
         """Handle market data ticks."""
         if not isinstance(ticks, list):
@@ -716,7 +920,7 @@ class FinvasiaFeed(MarketDataFeedBase):
                 if not token:
                     continue
                     
-                self.logger.debug(f"tick: {tick}")
+                # self.logger.debug(f"tick: {tick}")
                 symbol = self._token_to_symbol.get(token)
                 if not symbol:
                     continue
@@ -735,7 +939,7 @@ class FinvasiaFeed(MarketDataFeedBase):
                 if not market_data:
                     return
                 
-                self.logger.debug(f"market_data: {market_data}")
+                # self.logger.debug(f"market_data: {market_data}")
                 
                 # Create market data event
                 event = MarketDataEvent(
@@ -825,7 +1029,7 @@ class FinvasiaFeed(MarketDataFeedBase):
                          (MarketDataType.BID.value in market_data and MarketDataType.ASK.value in market_data) or
                          MarketDataType.OHLC.value in market_data)
             if not has_price:
-                 self.logger.debug(f"Discarding tick - no essential price data found: {tick}")
+                 # self.logger.debug(f"Discarding tick - no essential price data found: {tick}")
                  return None
 
             return market_data
@@ -840,36 +1044,73 @@ class FinvasiaFeed(MarketDataFeedBase):
              return None
     
     def disconnect(self):
-        """Disconnect from Finvasia feed."""
+        """Gracefully disconnects from Finvasia feed and cleans up resources."""
+        self.logger.info("Disconnecting from Finvasia feed...")
+        self._stop_reconnect_event.set()
+
         try:
             # Unsubscribe from all symbols
-            with self._sub_lock:
-                if self._subscribed_tokens:
+            if self._subscribed_tokens:
+                with self._sub_lock:
                     tokens_to_unsubscribe = list(self._subscribed_tokens)
-                    self.api.unsubscribe(tokens_to_unsubscribe)
+                    if tokens_to_unsubscribe:
+                        self.logger.info(f"Unsubscribing from {len(tokens_to_unsubscribe)} instrument strings during disconnect.")
+                        # Check if API allows unsubscribe when not connected, or if it needs connection.
+                        # If API requires connection, this might only be effective if called while connected.
+                        if self.is_connected: # Only try to tell API if connected
+                           self.api.unsubscribe(tokens_to_unsubscribe)
+                    # Clear local tracking regardless of API success
                     self._subscribed_tokens.clear()
                     self._token_to_symbol.clear()
                     self._symbol_to_token.clear()
             
-            # Stop WebSocket
+            # Stop WebSocket            
             if self.is_connected:
-                self.api.close_websocket()
-                self.is_connected = False
-            
+                self.logger.info("Closing WebSocket connection via NorenApi...")
+                self.api.close_websocket() # This should handle NorenApi's internal state            
+                self.is_connected = False # Explicitly set state
+
             # Clear authentication
             if self.is_authenticated:
-                self.api.logout()
-                self.is_authenticated = False
-                self.session_token = None
+                self.logger.info("Logging out from Finvasia API.")
+                try:
+                    logout_response = self.api.logout()
+                    self.logger.debug(f"Logout API response: {logout_response}")
+                except Exception as e:
+                    self.logger.error(f"Exception during logout: {e}")
+            
+            self.is_authenticated = False
+            self.session_token = None
                 
-            self.logger.info("Disconnected from Finvasia feed")
+            self.logger.info("Successfully disconnected and cleaned up Finvasia feed.")
             
         except Exception as e:
-            self.logger.error(f"Error during disconnect: {e}")
+            self.logger.error(f"Error during disconnect procedure: {e}", exc_info=True)
+        finally:
+            # Ensure states are reset
+            self.is_connected = False
+            self.is_authenticated = False
+            self.logger.debug("FinvasiaFeed disconnect final state: is_connected=False, is_authenticated=False")
     
     def __del__(self):
         """Cleanup on object destruction."""
-        self.disconnect()
+        # Ensure logger exists or use print for __del__ if logger might be gone
+        log_func = self.logger.info if hasattr(self, 'logger') and self.logger else print
+        log_func("FinvasiaFeed instance being deleted. Ensuring disconnection.")
+        
+        # Call stop() only if essential attributes for it are present
+        # Check for _stop_reconnect_event as a proxy for successful enough __init__
+        if hasattr(self, '_stop_reconnect_event'):
+            self.stop()
+        else:
+            log_func("FinvasiaFeed __del__: Bypassing stop() due to likely partial initialization.")
+            # Minimal cleanup if stop() cannot be called:
+            if hasattr(self, 'api') and self.api:
+                try:
+                    log_func("FinvasiaFeed __del__: Attempting direct api.close_websocket()")
+                    self.api.close_websocket()
+                except Exception as e:
+                    log_func(f"FinvasiaFeed __del__: Error in direct websocket close: {e}")
 
 class MarketDataFeed:
     """
@@ -1180,7 +1421,7 @@ class MarketDataFeed:
                 # Get expiry dates from symbol cache
                 expiry_dates = self.feed.symbol_cache.get_combined_expiry_dates(symbol)
 
-                self.logger.debug(f"Expiry dates for {symbol}: {expiry_dates}")
+                # self.logger.debug(f"Expiry dates for {symbol}: {expiry_dates}")
                 if expiry_dates:
                     return sorted(expiry_dates)  # Return sorted expiries
                     

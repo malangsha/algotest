@@ -56,8 +56,8 @@ class StrategyRegistry:
                     importlib.import_module(module_name)
                     logger.info(f"Imported strategy module: {module_name}")
                     break
-                except ImportError:
-                    logger.debug(f"Could not import strategy module: {module_name}")
+                except ImportError as e:                    
+                    logger.debug(f"Could not import strategy module {module_name}: {e}")
             else:
                 logger.error(f"Failed to import any module for strategy: {strategy_type}")
                 return None

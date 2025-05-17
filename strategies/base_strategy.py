@@ -1,8 +1,6 @@
 """
 Base class for option trading strategies.
 """
-
-import logging
 import time
 import uuid
 import threading
@@ -11,11 +9,19 @@ from typing import Dict, List, Optional, Union, Any, Set
 from datetime import datetime
 import pandas as pd
 
-from models.events import Event, EventType, MarketDataEvent, SignalEvent, BarEvent, PositionEvent, FillEvent, OrderEvent, TimerEvent
+from models.events import (Event,
+    EventType, MarketDataEvent, SignalEvent,
+    BarEvent, PositionEvent, FillEvent,
+    OrderEvent, TimerEvent)
+
 from models.order import Order
 from models.position import Position
-from utils.constants import SignalType, Timeframe, EventPriority, Exchange
-from models.instrument import Instrument
+from utils.constants import (SignalType,
+    Timeframe, EventPriority, Exchange)
+
+from models.instrument import (Instrument,
+    InstrumentType, AssetClass)
+from core.logging_manager import get_logger
 
 class OptionStrategy(ABC):
     """
@@ -23,7 +29,9 @@ class OptionStrategy(ABC):
     Provides standardized interface for option strategy implementation.
     """
 
-    def __init__(self, strategy_id: str, config: Dict[str, Any], data_manager, option_manager, portfolio_manager, event_manager):
+    def __init__(self, strategy_id: str, config: Dict[str, Any],
+                 data_manager, option_manager, portfolio_manager,
+                 event_manager, broker=None, strategy_manager=None):
         """
         Initialize the strategy.
 
@@ -34,712 +42,562 @@ class OptionStrategy(ABC):
             option_manager: Option manager for option-specific operations
             portfolio_manager: Portfolio manager for position management
             event_manager: Event manager for event handling
+            broker: Broker instance
+            strategy_manager: StrategyManager instance
         """
-        self.logger = logging.getLogger(f"strategies.{self.__class__.__name__}.{strategy_id}")
+        self.logger = get_logger(f"strategies.{self.__class__.__name__}.{strategy_id}")
         self.id = strategy_id
         self.config = config
         self.data_manager = data_manager
         self.option_manager = option_manager
         self.portfolio_manager = portfolio_manager
         self.event_manager = event_manager
+        self.broker = broker # Store broker if passed
+        self.strategy_manager = strategy_manager
 
         # Strategy state
         self.is_running = False
         self.last_run_time = None
-        self.last_heartbeat = time.time()
-        
+        self.last_heartbeat = time.time() # Initialize heartbeat
+
         # Strategy name and description
         self.name = config.get('name', self.__class__.__name__)
         self.description = config.get('description', '')
-        
+
         # Performance tracking
         self.signals_generated = 0
         self.successful_trades = 0
         self.failed_trades = 0
-        
-        # Data caching
-        self.bar_data = {}  # symbol -> {timeframe -> List[BarEvent]}
-        self.option_data = {}  # option_symbol -> Dict
-        self.max_bars_to_keep = config.get('max_bars', 1000)
-        
-        # Symbol tracking
-        self.used_symbols = set()  # All symbols used by this strategy
-        self.active_subscriptions = set()  # Currently subscribed symbols
-        
+
+        self.max_bars_to_keep = config.get('data', {}).get('max_bars_to_keep', # Adjusted path
+                                         config.get('max_bars', 1000))
+
+
+        # Store instrument_ids (e.g., "NSE:RELIANCE") instead of simple names
+        self.used_symbols: Set[str] = set() # Populated by StrategyManager or dynamic requests
+
         # Timeframe settings
-        self.timeframe = config.get('timeframe', '1m')
-        self.additional_timeframes = set(config.get('additional_timeframes', []))
+        # Ensure 'timeframe' from config is correctly parsed and used as primary
+        self.timeframe = str(config.get('timeframe', '1m')) # Ensure string
+        additional_tfs_cfg = config.get('additional_timeframes', [])
+        if not isinstance(additional_tfs_cfg, list): # Ensure it's a list
+            additional_tfs_cfg = [str(additional_tfs_cfg)] if additional_tfs_cfg else []
+        else:
+            additional_tfs_cfg = [str(tf) for tf in additional_tfs_cfg]
+
+        self.additional_timeframes = set(additional_tfs_cfg)
         self.all_timeframes = {self.timeframe} | self.additional_timeframes
-        
+        if not self.timeframe: # Safety check if primary timeframe is empty
+            self.logger.warning(f"Strategy {self.id}: Primary timeframe is empty or missing in config. Defaulting to '1m'.")
+            self.timeframe = '1m'
+            if '1m' not in self.all_timeframes: self.all_timeframes.add('1m')
+
+
         # Position tracking
-        self.positions = {}  # symbol -> position info
-        
-        # Thread for strategy execution
+        self.positions: Dict[str, Position] = {}  # instrument_id -> Position object
+
+        # Thread for strategy execution (if strategy uses its own loop)
         self.strategy_thread = None
         self.thread_stop_event = threading.Event()
-        
-        # Register for events
-        self._register_event_handlers()
-        
-        self.logger.info(f"Strategy '{self.name}' ({self.id}) initialized")
+
+        # _register_event_handlers() is called by StrategyManager after strategy instance creation
+        # and before strategy.initialize()
+        self.logger.info(f"Strategy \"{self.name}\" ({self.id}) base initialized. Primary TF: {self.timeframe}, All TFs: {self.all_timeframes}")
+
+
+    def initialize(self):
+        """Called by StrategyManager after __init__ and event registration."""
+        self.logger.info(f"Strategy \"{self.name}\" ({self.id}) performing custom initialization.")
+        # Example: Load historical data for initial indicators if needed.
+        # This is also where a strategy might request initial symbols if not purely dynamic.
+        pass
 
     def _register_event_handlers(self):
-        """Register event handlers with the event manager."""
-        # Market data events
+        """
+        Register event handlers with the event manager.
+        This method is called by StrategyManager.
+        """
+        self.logger.info(f"Strategy {self.id}: Registering event handlers.")
+        # Subscribe to events with the strategy's own ID as component_name for targeted delivery (if EM supports it)
+        # or for filtering/logging purposes.
+
+        # MarketDataEvents are for raw ticks. Strategies might need these for options,
+        # or if they do their own bar construction (less common if DataManager handles it).
         self.event_manager.subscribe(
             EventType.MARKET_DATA,
-            self._handle_market_data,
-            component_name=self.id
+            self._handle_market_data, # Internal handler that calls the public on_market_data
+            component_name=self.id # Helps EventManager route if it uses component_name for filtering
         )
-        
-        # Bar events
-        self.event_manager.subscribe(
-            EventType.BAR,
-            self._handle_bar,
-            component_name=self.id
-        )
-        
-        # Position events
+
+        # BarEvents:
+        # The direct subscription to BarEvent by BaseStrategy is REMOVED here.
+        # StrategyManager will be responsible for dispatching BarEvents to strategy.on_bar()
+        # based on its knowledge of which strategy is interested in which symbol/timeframe.
+        # This avoids the duplicate dispatch issue.
+
+        # self.event_manager.subscribe(
+        #     EventType.BAR,
+        #     self._handle_bar, # This would be the source of the redundant call
+        #     component_name=self.id
+        # )
+
+        # PositionEvents inform the strategy about changes to its positions.
         self.event_manager.subscribe(
             EventType.POSITION,
-            self._handle_position,
+            self._handle_position, # Internal handler
             component_name=self.id
         )
-        
-        # Fill events
+
+        # FillEvents confirm order executions.
         self.event_manager.subscribe(
             EventType.FILL,
-            self._handle_fill,
+            self._handle_fill, # Internal handler
             component_name=self.id
         )
-        
-        # Order events
+
+        # OrderEvents provide updates on order status (e.g., accepted, rejected, pending).
         self.event_manager.subscribe(
             EventType.ORDER,
-            self._handle_order,
+            self._handle_order, # Internal handler
             component_name=self.id
         )
-        
-        # # Timer events (NORMAL priority)
-        # if self.config.get('uses_timer', False):
-        #     self.event_manager.subscribe(
-        #         EventType.TIMER,
-        #         self._handle_timer,
-        #         component_name=self.id
 
-        #     )
-        
-        self.logger.info(f"Strategy {self.id} event handlers registered with appropriate priorities")
+        # TimerEvents can be used for strategies that need periodic checks or actions
+        # not tied directly to market data events.
+        if self.config.get('uses_timer', False): # Check config if strategy uses a timer
+            self.event_manager.subscribe(
+                EventType.TIMER,
+                self._handle_timer, # Internal handler
+                component_name=self.id
+            )
+
+        self.logger.info(f"Strategy {self.id} event handlers registered (Note: BarEvent direct subscription removed from BaseStrategy).")
+
 
     def _handle_market_data(self, event: Event):
-        """Handle market data events."""
-        if not isinstance(event, MarketDataEvent):
+        """Internal handler for MarketDataEvent."""
+        if not isinstance(event, MarketDataEvent) or not event.instrument:
             return
-            
-        self.logger.debug(f"Received MarketDataEvent: {event}")
-        # Update last heartbeat
         self.last_heartbeat = time.time()
-            
-        # Check if the event is for a symbol we're monitoring
-        symbol = event.instrument.symbol
-        
-        self.logger.debug(f"symbol: {symbol}, self.used_symbols: {self.used_symbols}")
-        if symbol in self.used_symbols:
-            # If this is an option, update option data cache
-            if self._is_option_symbol(symbol):
-                self._update_option_data(symbol, event.data)
-                
-            # Process the market data in the strategy
-            self.on_market_data(event)
+        instrument_id = event.instrument.instrument_id
+
+        # Strategies should define their logic in on_market_data.
+        # BaseStrategy can provide common filtering if desired, e.g., based on self.used_symbols.
+        # However, for MarketDataEvent, a strategy might be interested in any option it's trading,
+        # even if not explicitly in self.used_symbols (which might track underlyings).
+        # For now, pass all MarketDataEvents if the strategy is the component.
+        # The strategy's on_market_data can then filter further.
+        self.on_market_data(event)
+
 
     def _handle_bar(self, event: Event):
-        """Handle bar events."""
-        if not isinstance(event, BarEvent):
-            return
-            
-        # Update last heartbeat
+        """
+        Internal handler for BarEvent.
+        NOTE: This method will NO LONGER BE CALLED if the direct BarEvent subscription
+        is removed from _register_event_handlers. StrategyManager._on_bar will be the
+        sole dispatcher to strategy.on_bar().
+        """
+        if not isinstance(event, BarEvent) or not event.instrument: return
         self.last_heartbeat = time.time()
-            
-        # Check if the event is for a symbol and timeframe we're monitoring
-        symbol = event.instrument.symbol
+        instrument_id = event.instrument.instrument_id
         timeframe = event.timeframe
-        
-        if symbol in self.used_symbols and timeframe in self.all_timeframes:
-            # Cache the bar data
-            if symbol not in self.bar_data:
-                self.bar_data[symbol] = {}
-                
-            if timeframe not in self.bar_data[symbol]:
-                self.bar_data[symbol][timeframe] = []
-                
-            # Add the new bar and trim if needed
-            self.bar_data[symbol][timeframe].append(event)
-            if len(self.bar_data[symbol][timeframe]) > self.max_bars_to_keep:
-                self.bar_data[symbol][timeframe] = self.bar_data[symbol][timeframe][-self.max_bars_to_keep:]
-                
-            # Process the bar in the strategy
+
+        # This filtering is now primarily handled by StrategyManager before calling on_bar.
+        # If this method were still active, this check would be relevant.
+        if instrument_id in self.used_symbols and timeframe in self.all_timeframes:
             self.on_bar(event)
+        # else:
+            # self.logger.debug(f"Strategy {self.id} received BarEvent for {instrument_id}@{timeframe} but not actively tracking or timeframe mismatch.")
+
 
     def _handle_position(self, event: Event):
-        """Handle position events."""
-        if not isinstance(event, PositionEvent):
+        if not isinstance(event, PositionEvent) or not hasattr(event, "position") or not event.position:
+            self.logger.debug(f"Strategy {self.id} received non-PositionEvent or event with no position data: {type(event)}")
             return
-            
-        # Update positions
-        if hasattr(event, 'position'):
-            position = event.position
-            symbol = position.symbol
-            
-            if symbol in self.used_symbols:
-                self.positions[symbol] = position
-                self.on_position(event)
+        
+        position_obj = event.position
+        if not hasattr(position_obj, 'instrument_id') or not position_obj.instrument_id:
+            self.logger.warning(f"Strategy {self.id} received PositionEvent with invalid position data (missing instrument_id): {event.position}")
+            return
+        
+        position_instrument_id = position_obj.instrument_id
+        if position_obj.quantity == 0:
+            removed_pos = self.positions.pop(position_instrument_id, None)
+            if removed_pos:
+                self.logger.info(f"Strategy {self.id}: Position for {position_instrument_id} (Qty: {removed_pos.quantity}) closed and removed from local cache.")
+        else:
+            self.positions[position_instrument_id] = position_obj
+            self.logger.info(f"Strategy {self.id}: Position for {position_instrument_id} updated in local cache. New Qty: {position_obj.quantity}, Avg Price: {getattr(position_obj, 'average_price', 'N/A')}")
+        
+        self.on_position(event)
+
 
     def _handle_fill(self, event: Event):
-        """Handle fill events."""
-        if not isinstance(event, FillEvent):
-            return
-            
-        # Check if the fill is for one of our orders
-        if hasattr(event, 'order_id') and hasattr(event, 'symbol'):
-            symbol = event.symbol
-            
-            if symbol in self.used_symbols:
-                self.on_fill(event)
+        """Internal handler for FillEvent."""
+        if not isinstance(event, FillEvent) or not hasattr(event, "instrument_id"): return
+        # Strategies usually care about fills for any instrument they might have ordered.
+        # Further filtering can be done in the strategy's on_fill method.
+        self.on_fill(event)
+
 
     def _handle_order(self, event: Event):
-        """Handle order events."""
-        if not isinstance(event, OrderEvent):
+        """Internal handler for OrderEvent."""
+        if not isinstance(event, OrderEvent) or not hasattr(event, "order") or not event.order \
+           or not hasattr(event.order, "instrument_id"):
             return
-            
-        # Check if the order is one of ours
-        if hasattr(event, 'order'):
-            order = event.order
-            symbol = order.symbol
-            
-            if symbol in self.used_symbols:
-                self.on_order(event)
+        # Similar to FillEvent, strategies generally want to see all their order updates.
+        self.on_order(event)
+
 
     def _handle_timer(self, event: Event):
-        """Handle timer events."""
-        if not isinstance(event, TimerEvent):
-            return
-            
+        """Internal handler for TimerEvent."""
+        if not isinstance(event, TimerEvent): return
         self.on_timer(event)
+
 
     def start(self):
         """
         Start the strategy.
+        Called by StrategyManager.
         """
         if self.is_running:
-            self.logger.warning(f"Strategy {self.id} is already running")
+            self.logger.warning(f"Strategy {self.id} is already running.")
             return
-            
+
         self.is_running = True
         self.thread_stop_event.clear()
-        
-        # Create and start the strategy thread
-        self.strategy_thread = threading.Thread(
-            target=self._strategy_thread_func,
-            name=f"Strategy_{self.id}"
-        )
-        self.strategy_thread.daemon = True
-        self.strategy_thread.start()
-        
-        # Call the strategy's on_start method
-        self.on_start()
-        
-        self.logger.info(f"Strategy {self.id} started")
+
+        # If the strategy has its own periodic execution loop (run_iteration)
+        iteration_interval_cfg = self.config.get("iteration_interval_seconds")
+        if iteration_interval_cfg is not None:
+            try:
+                iteration_interval = float(iteration_interval_cfg)
+                if iteration_interval > 0:
+                    self.strategy_thread = threading.Thread(
+                        target=self._strategy_thread_func,
+                        name=f"Strategy_{self.id}_Thread"
+                    )
+                    self.strategy_thread.daemon = True
+                    self.strategy_thread.start()
+                    self.logger.info(f"Strategy {self.id} internal thread started with interval {iteration_interval}s.")
+                else:
+                    self.logger.info(f"Strategy {self.id} iteration_interval_seconds is <= 0, internal thread not started. Will be event-driven.")
+            except ValueError:
+                self.logger.error(f"Strategy {self.id} has invalid iteration_interval_seconds: {iteration_interval_cfg}. Internal thread not started.")
+        else:
+            self.logger.info(f"Strategy {self.id} is purely event-driven (no iteration_interval_seconds configured).")
+
+
+        # Call the strategy's on_start method for any specific startup logic
+        try:
+            self.on_start()
+        except Exception as e:
+            self.logger.error(f"Error during on_start for strategy {self.id}: {e}", exc_info=True)
+            # Decide if strategy should be stopped or marked as failed
+            self.is_running = False # Example: stop if on_start fails
+            return
+
+        self.logger.info(f"Strategy {self.id} started.")
+
 
     def stop(self):
         """
         Stop the strategy.
+        Called by StrategyManager.
         """
         if not self.is_running:
-            self.logger.warning(f"Strategy {self.id} is not running")
+            self.logger.warning(f"Strategy {self.id} is not running.")
             return
-            
-        # Set stop flags
-        self.is_running = False
-        self.thread_stop_event.set()
-        
-        # Wait for the strategy thread to stop
+
+        self.is_running = False # Set flag first
+        self.thread_stop_event.set() # Signal internal thread to stop
+
         if self.strategy_thread and self.strategy_thread.is_alive():
+            self.logger.debug(f"Waiting for strategy {self.id} internal thread to join...")
             self.strategy_thread.join(timeout=5.0)
-            
-        # Call the strategy's on_stop method
-        self.on_stop()
-        
-        self.logger.info(f"Strategy {self.id} stopped")
+            if self.strategy_thread.is_alive():
+                self.logger.warning(f"Strategy {self.id} internal thread did not join in time.")
+            else:
+                self.logger.debug(f"Strategy {self.id} internal thread joined.")
+        self.strategy_thread = None
+
+
+        try:
+            self.on_stop() # Call strategy-specific cleanup
+        except Exception as e:
+            self.logger.error(f"Error during on_stop for strategy {self.id}: {e}", exc_info=True)
+
+        self.logger.info(f"Strategy {self.id} stopped.")
+
 
     def _strategy_thread_func(self):
         """
-        Strategy thread function.
-        Runs the strategy's run_iteration method periodically.
+        Strategy's own periodic execution thread function.
+        Runs the strategy's run_iteration method periodically if configured.
         """
-        self.logger.info(f"Strategy {self.id} thread started")
-        
-        while not self.thread_stop_event.is_set() and self.is_running:
+        iteration_interval = float(self.config.get("iteration_interval_seconds", 1.0)) # Should be validated before starting thread
+        self.logger.info(f"Strategy {self.id} internal execution thread started (interval: {iteration_interval}s).")
+
+        while not self.thread_stop_event.wait(iteration_interval): # wait method returns True if event set, False on timeout
+            if not self.is_running: # Double check running flag
+                break
             try:
-                # Run the strategy iteration
                 self.run_iteration()
-                
-                # Update last run time
-                self.last_run_time = time.time()
-                
-                # Sleep for a bit
-                time.sleep(1)  # Default sleep time
-                
+                self.last_run_time = time.time() # Record last successful iteration
             except Exception as e:
-                self.logger.error(f"Error in strategy {self.id} iteration: {e}")
-                time.sleep(5)  # Sleep longer on error
-                
-        self.logger.info(f"Strategy {self.id} thread stopped")
+                self.logger.error(f"Error in strategy {self.id} run_iteration: {e}", exc_info=True)
+                # Potentially add error handling like temporary pause or max error count
+        self.logger.info(f"Strategy {self.id} internal execution thread stopped.")
+
 
     def run_iteration(self):
         """
         Run a single iteration of the strategy.
-        This method is called periodically by the strategy thread.
+        This method is called periodically by the strategy's internal thread if configured.
+        Strategies that are purely event-driven (reacting to on_bar, on_market_data)
+        might not need to implement this or have an internal thread.
         """
-        # Update heartbeat
-        self.last_heartbeat = time.time()
-        
-        # Default implementation does nothing
+        self.last_heartbeat = time.time() # Update heartbeat if iteration is running
+        # Default implementation does nothing. Override in concrete strategies if needed.
         pass
 
-    def generate_signal(self, symbol: str, signal_type: SignalType, data: Dict[str, Any] = None, priority: EventPriority = EventPriority.NORMAL):
-        """
-        Generate a trading signal with specified priority.
 
-        Args:
-            symbol: Symbol to trade
-            signal_type: Type of signal (BUY, SELL, etc.)
-            data: Additional signal data
-            priority: Priority level of the signal
-        """
-        # Basic signal validation
-        if not symbol:
-            self.logger.error("Cannot generate signal: symbol is required")
+    def generate_signal(self, instrument_id: str, signal_type: SignalType, data: Dict[str, Any] = None, priority: EventPriority = EventPriority.NORMAL):
+        if not instrument_id:
+            self.logger.error("Cannot generate signal: instrument_id is required.")
             return
-            
-        if not signal_type:
-            self.logger.error("Cannot generate signal: signal type is required")
+        if not signal_type: # Assuming SignalType is an Enum
+            self.logger.error("Cannot generate signal: signal_type is required.")
             return
-            
-        # Create signal data
-        signal_data = {
-            'symbol': symbol,
-            'signal_type': signal_type,
-            'strategy_id': self.id,
-            'timestamp': datetime.now(),
-            'data': data or {}
-        }
-        
-        # Create a signal event with specified priority
+
+        instrument_obj = self.data_manager.get_instrument(instrument_id)
+        if not instrument_obj:
+            self.logger.error(f"Cannot generate signal: Instrument not found for id '{instrument_id}'. Signal generation aborted.")
+            # Fallback to create a basic instrument is risky as it might lack crucial details (lot_size, tick_size).
+            # It's better to ensure instruments are properly managed by DataManager/OptionManager.
+            return
+
         signal_event = SignalEvent(
-            timestamp=datetime.now(),
-            instrument=self.data_manager.get_instrument(symbol),
+            timestamp=datetime.now(), # Consider using event timestamp from market data if signal is derived from it
+            instrument=instrument_obj,
             signal_type=signal_type,
             strategy_id=self.id,
-            data=signal_data,
+            data=data or {}, # Ensure data is always a dict
             priority=priority
         )
-        
-        # Publish the signal event
         self.event_manager.publish(signal_event)
-        
-        # Increment signals generated
         self.signals_generated += 1
-        
-        self.logger.info(f"Generated {signal_type} signal for {symbol} with priority {priority.name}")
+        self.logger.info(f"Strategy {self.id} generated {signal_type.value} signal for {instrument_id} (Priority: {priority.name}). Data: {data}")
 
-    def get_bars(self, symbol: str, timeframe: str = None, limit: int = None, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> Optional[pd.DataFrame]:
+
+    def get_bars(self, instrument_id: str, timeframe: str = None, limit: int = None,
+                   start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> Optional[pd.DataFrame]:
         """
-        Get historical bars for a symbol, fetching from data_manager if needed.
-
-        Args:
-            symbol: Symbol to get bars for
-            timeframe: Timeframe of the bars (default: strategy's primary timeframe)
-            limit: Maximum number of bars to return (if start/end not specified)
-            start_time: Optional start datetime for the data range
-            end_time: Optional end datetime for the data range
-
-        Returns:
-            Optional[pd.DataFrame]: DataFrame of bar data or None if unavailable
+        Retrieves historical bar data for a given instrument and timeframe.
+        Delegates to DataManager.
         """
-        # Use the strategy's primary timeframe if none specified
-        if not timeframe:
-            timeframe = self.timeframe
-
-        self.logger.debug(f"Requesting bars for {symbol}@{timeframe} (Limit: {limit}, Start: {start_time}, End: {end_time})")
-
-        # Convert start/end times to timestamps (ms) if provided
-        start_ts = int(start_time.timestamp() * 1000) if start_time else None
-        end_ts = int(end_time.timestamp() * 1000) if end_time else None
-
-        # Determine the number of bars to fetch from data_manager
-        # If start/end time provided, fetch that range. Otherwise, use limit or default.
-        fetch_limit = 0 # Fetch all in range if start/end provided
-        if not start_time and not end_time:
-             fetch_limit = limit if limit is not None else self.max_bars_to_keep
-
-        try:
-            # Fetch data from DataManager
-            historical_data = self.data_manager.get_historical_data(
-                symbol=symbol,
-                timeframe=timeframe,
-                n_bars=fetch_limit, # Use 0 if start/end are set
-                start_time=start_ts,
-                end_time=end_ts
-            )
-
-            if historical_data is not None and not historical_data.empty:
-                self.logger.debug(f"Retrieved {len(historical_data)} bars for {symbol}@{timeframe} from DataManager")
-                # Optional: Update local cache (self.bar_data) if needed, though direct use might be better
-                # For simplicity, we return the DataFrame directly from DataManager
-                return historical_data
-            else:
-                self.logger.warning(f"No historical data found for {symbol}@{timeframe} in DataManager for the requested range.")
-                return None
-
-        except Exception as e:
-            self.logger.error(f"Error fetching bars for {symbol}@{timeframe} from DataManager: {e}")
+        tf_to_use = timeframe if timeframe else self.timeframe
+        if not tf_to_use: # Should not happen if self.timeframe is initialized properly
+            self.logger.error(f"Strategy {self.id}: Cannot get bars for {instrument_id}, no timeframe specified or defaulted.")
             return None
+            
+        self.logger.debug(f"Strategy {self.id} requesting bars for {instrument_id}@{tf_to_use} (Limit: {limit}, Start: {start_time}, End: {end_time})")
+        return self.data_manager.get_historical_data(symbol=instrument_id, timeframe=tf_to_use, n_bars=limit, start_time=start_time, end_time=end_time)
 
-    def get_position(self, symbol: str) -> Optional[Position]:
+
+    def get_position(self, instrument_id: str) -> Optional[Position]:
+        """Retrieves the current position for a given instrument_id from the local cache."""
+        return self.positions.get(instrument_id)
+
+
+    def has_position(self, instrument_id: str) -> bool:
+        """Checks if there is an active position for the given instrument_id."""
+        pos = self.get_position(instrument_id)
+        return pos is not None and pos.quantity != 0
+
+
+    def get_position_side(self, instrument_id: str) -> Optional[str]:
         """
-        Get the current position for a symbol.
-
-        Args:
-            symbol: Symbol to get position for
-
-        Returns:
-            Optional[Position]: Current position or None if no position
+        Get the side ('long', 'short') of the current position for an instrument_id.
+        Returns None if no position or flat.
         """
-        return self.positions.get(symbol)
-
-    def has_position(self, symbol: str) -> bool:
-        """
-        Check if there is an open position for a symbol.
-
-        Args:
-            symbol: Symbol to check
-
-        Returns:
-            bool: True if there is an open position, False otherwise
-        """
-        position = self.get_position(symbol)
-        return position is not None and position.quantity != 0
-
-    def get_position_side(self, symbol: str) -> Optional[str]:
-        """
-        Get the side of the current position for a symbol.
-
-        Args:
-            symbol: Symbol to check
-
-        Returns:
-            Optional[str]: 'long', 'short', or None if no position
-        """
-        position = self.get_position(symbol)
-        
+        position = self.get_position(instrument_id)
         if not position or position.quantity == 0:
             return None
-            
         return 'long' if position.quantity > 0 else 'short'
 
-    def request_symbol(self, symbol: str, exchange: str = None) -> bool:
+
+    def request_symbol(self,
+                       symbol_name: str,
+                       exchange_value: str,
+                       instrument_type_value: str = "EQUITY",
+                       asset_class_value: str = "EQUITY",
+                       timeframes_to_subscribe: Optional[Set[str]] = None,
+                       option_details: Optional[Dict[str, Any]] = None
+                       ) -> bool:
         """
-        Request subscription to a symbol, optionally specifying the exchange.
+        Dynamically requests data subscription for a symbol across specified timeframes.
+        This method allows a strategy to add new symbols to its watchlist during runtime.
+        It communicates with DataManager to ensure the feed is active and the strategy
+        is registered for bar data for the specified timeframes.
 
         Args:
-            symbol: Symbol to subscribe to
-            exchange: (Optional) Exchange for the symbol (e.g., "NSE", "BSE")
+            symbol_name: The trading symbol (e.g., "RELIANCE", "NIFTY23JUL20000CE").
+            exchange_value: The exchange code as a string (e.g., "NSE", "NFO").
+            instrument_type_value: The type of instrument as a string (e.g., "EQUITY", "OPTION", "INDEX").
+            asset_class_value: The asset class as a string (e.g., "EQUITY", "OPTIONS", "INDEX").
+            timeframes_to_subscribe: A set of timeframe strings (e.g., {"1m", "5m"}).
+                                     If None, uses the strategy's `all_timeframes`.
+            option_details: For options, a dictionary with keys like 'option_type',
+                            'strike_price', 'expiry_date' (datetime.date object),
+                            'underlying_symbol_key'.
 
         Returns:
-            bool: True if subscription was successful, False otherwise
-        """
-        # Add to used symbols
-        self.logger.debug(f"request_symbol: symbol, {symbol} exchange, {exchange}")
-        self.used_symbols.add(symbol)
+            bool: True if all requested subscriptions were successful (or already active), False otherwise.
+        """        
+        self.logger.info(f"Strategy {self.id}: Requesting dynamic symbol {exchange_value}:{symbol_name} (Type: {instrument_type_value})")
 
-        # Determine the exchange to use
-        target_exchange = exchange
-        if not target_exchange:
-            # Try to find exchange info from config if not provided
-            main_underlyings = self.config.get("main_config", {}).get("market", {}).get("underlyings", [])
-            found_conf = next((uc for uc in main_underlyings if uc.get("symbol") == symbol), None)
-            if found_conf:
-                target_exchange = found_conf.get("exchange")
-            else:
-                # Fallback to default exchange from main config if still not found
-                target_exchange = self.config.get("main_config", {}).get("market", {}).get("default_exchange", "NSE")
-                self.logger.warning(f"Exchange not specified for {symbol} and not found in config, defaulting to {target_exchange}")
-
-        # Create Instrument object
-        # We need to determine AssetClass and InstrumentType, this might require more info
-        # For now, assume EQUITY or INDEX based on symbol? This is fragile.
-        # Let DataManager handle instrument creation/lookup based on symbol and exchange.
-        # For now, we pass symbol and exchange to a potential new DataManager method.
-
-        # --- Modification needed in DataManager --- 
-        # Assuming DataManager will have a method like subscribe_instrument_by_symbol
-        # success = self.data_manager.subscribe_instrument_by_symbol(symbol, target_exchange)
-        
-        # --- Temporary approach: Pass symbol and exchange to existing subscribe_to_timeframe --- 
-        # This assumes subscribe_to_timeframe can handle instrument lookup/creation
-        success = False
-        instrument = None
         try:
-            # Attempt to get/create instrument via DataManager
-            instrument = self.data_manager.get_instrument(symbol, exchange=target_exchange)
-            if not instrument:
-                 self.logger.error(f"Could not get or create instrument for {symbol} on {target_exchange}")
-                 return False
-                 
-            # Use a potential subscribe_instrument method in DataManager
-            if hasattr(self.data_manager, "subscribe_instrument"):
-                 success = self.data_manager.subscribe_instrument(instrument)
-            else:
-                 # Fallback: Try subscribing via market_data_feed if accessible (not ideal)
-                 if hasattr(self.data_manager, "market_data_feed") and self.data_manager.market_data_feed:
-                     results = self.data_manager.market_data_feed.subscribe_symbols([instrument])
-                     success = results.get(instrument.symbol, False)
-                 else:
-                     self.logger.error("DataManager has no subscribe_instrument method or market_data_feed")
-                     return False
-
-        except Exception as e:
-            self.logger.error(f"Error during instrument creation/subscription for {symbol} on {target_exchange}: {e}")
+            exchange_enum = Exchange(exchange_value.upper())
+            instrument_type_enum = InstrumentType(instrument_type_value.upper())
+            asset_class_enum = AssetClass(asset_class_value.upper())
+        except ValueError as e:
+            self.logger.error(f"Strategy {self.id}: Invalid enum value in request_symbol for {symbol_name}: {e}")
             return False
 
-        # Subscribe to all timeframes for this symbol if underlying subscription was successful
-        if success:
-            self.active_subscriptions.add(symbol) # Should perhaps store instrument key?
-            
-            # Subscribe to all required timeframes for the symbol directly
-            timeframe_success = True
-            for timeframe in self.all_timeframes:
-                # Pass the instrument object to subscribe_to_timeframe
-                tf_sub_success = self.data_manager.subscribe_to_timeframe(
-                    instrument, # Pass the Instrument object
-                    timeframe, 
-                    self.id
-                )
-                if not tf_sub_success:
-                    self.logger.warning(f"Failed to subscribe to timeframe {timeframe} for {instrument.symbol}")
-                    timeframe_success = False
-            
-            if timeframe_success:
-                self.logger.info(f"Subscribed to {instrument.symbol} ({target_exchange}) with timeframes {self.all_timeframes}")
-            else:
-                 self.logger.warning(f"Subscribed to {instrument.symbol} ({target_exchange}), but failed for some timeframes.")
+        instrument_id = f"{exchange_enum.value}:{symbol_name}"
 
-        else:
-            self.logger.error(f"Failed to subscribe to {symbol} on {target_exchange}")
-            
-        return success
-    def request_option(self, index_symbol: str, strike: float, option_type: str) -> bool:
-        """
-        Request subscription to a specific option.
-
-        Args:
-            index_symbol: Index symbol
-            strike: Strike price
-            option_type: Option type ('CE' or 'PE')
-
-        Returns:
-            bool: True if subscription was successful, False otherwise
-        """
-        # This would typically be implemented to use the option manager
-        # For now, we'll just return a placeholder
-        return False
-
-    def _is_option_symbol(self, symbol: str) -> bool:
-        """
-        Check if a symbol is an option symbol.
-
-        Args:
-            symbol: Symbol to check
-
-        Returns:
-            bool: True if symbol is an option, False otherwise
-        """
-        # Simplified check - in a real implementation, this would be more robust
-        return 'C' in symbol or 'P' in symbol
-    
-    def _update_option_data(self, symbol: str, data: Dict[str, Any]):
-        """
-        Update the cached option data.
-        
-        Args:
-            symbol: Option symbol
-            data: Option data
-        """
-        self.option_data[symbol] = data
-        self.logger.info(f"Updated option data for {symbol}: option_data = {self.option_data[symbol]}")
-
-    def get_status(self) -> Dict[str, Any]:
-        """
-        Get the current status of the strategy.
-
-        Returns:
-            Dict[str, Any]: Strategy status information
-        """
-        position_count = 0
-        if self.portfolio_manager:
-             try:
-                  # Assumes portfolio_manager has a way to get positions related to this strategy
-                  # Or just count all positions for simplicity here
-                  all_positions = self.portfolio_manager.get_all_positions()
-                  # Filter positions potentially related to this strategy's symbols
-                  # This is complex without proper linking. Simple count for now.
-                  position_count = len([p for p in all_positions if p.quantity != 0])
-             except Exception as e:
-                  self.logger.warning(f"Could not get position count from PortfolioManager: {e}")
-
-        return {
-            'id': self.id,
-            'name': self.name,
-            'description': self.description,
-            'is_running': self.is_running,
-            'last_run_time': self.last_run_time,
-            'last_heartbeat': self.last_heartbeat,
-            'signals_generated': self.signals_generated,
-            'position_count': position_count,
-            'successful_trades': self.successful_trades,
-            'failed_trades': self.failed_trades,
-            'positions': len(self.positions),
-            'active_subscriptions': len(self.active_subscriptions),
-            'primary_timeframe': self.timeframe,
-            'additional_timeframes': list(self.additional_timeframes),
+        instrument_args = {
+            "symbol": symbol_name, "exchange": exchange_enum,
+            "instrument_type": instrument_type_enum, "asset_class": asset_class_enum,
+            "instrument_id": instrument_id
         }
 
-    def get_required_symbols(self) -> Dict[str, List[str]]:
-        """
-        Get the list of symbols required by this strategy.
-        This is used by the strategy manager   to subscribe to the required symbols.
+        if instrument_type_enum == InstrumentType.OPTION:
+            if not option_details or not all(k in option_details for k in ["option_type", "strike_price", "expiry_date"]):
+                self.logger.error(f"Strategy {self.id}: Missing or incomplete option_details for option {symbol_name} in request_symbol.")
+                return False
+            # Ensure expiry_date is a date object if provided
+            if 'expiry_date' in option_details and isinstance(option_details['expiry_date'], str):
+                try:
+                    option_details['expiry_date'] = datetime.strptime(option_details['expiry_date'], '%Y-%m-%d').date()
+                except ValueError:
+                     self.logger.error(f"Invalid expiry_date string format for {symbol_name}. Use YYYY-MM-DD.")
+                     return False
+            instrument_args.update(option_details)
 
-        Returns:
-            Dict[str, List[str]]: Dictionary mapping timeframes to lists of required symbols
-        """
-        # Convert used_symbols to the required format
-        symbols_by_timeframe = {}
-        
-        # Add primary timeframe symbols
-        symbols_by_timeframe[self.timeframe] = list(self.used_symbols)
-        
-        # Add additional timeframe symbols
-        for timeframe in self.additional_timeframes:
-            symbols_by_timeframe[timeframe] = list(self.used_symbols)
+        try:
+            instrument = Instrument(**instrument_args)
+        except Exception as e:
+            self.logger.error(f"Strategy {self.id}: Failed to create Instrument object for {symbol_name}: {e}", exc_info=True)
+            return False
+
+        target_tfs = timeframes_to_subscribe if timeframes_to_subscribe is not None else self.all_timeframes
+        if not target_tfs:
+            self.logger.warning(f"Strategy {self.id}: No timeframes specified or defaulted for dynamic subscription of {instrument_id}.")
+            return False
+
+        all_requests_successful = True
+        for tf_str in target_tfs:
+            if not tf_str: continue
+            self.logger.info(f"Strategy {self.id}: Requesting DataManager subscription for {instrument.instrument_id} on timeframe {tf_str}")
             
-        return symbols_by_timeframe
-
-    def get_required_options(self) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Get all options required by this strategy.
-        This method should be overridden by derived strategies that need options.
+            success_dm = self.data_manager.subscribe_to_timeframe(instrument=instrument, timeframe=tf_str, strategy_id=self.id)
+            
+            if success_dm:
+                self.used_symbols.add(instrument.instrument_id)
+                self.logger.debug(f"Strategy {self.id}: DataManager confirmed subscription for {instrument.instrument_id}@{tf_str}.")
+            
+                if self.strategy_manager:
+                    if hasattr(self.strategy_manager, 'register_dynamic_subscription'):
+                        self.strategy_manager.register_dynamic_subscription(
+                            strategy_id=self.id,
+                            instrument_id=instrument.instrument_id,
+                            timeframe=tf_str
+                        )
+                        self.logger.info(f"Strategy {self.id}: Notified StrategyManager of dynamic subscription for {instrument.instrument_id}@{tf_str}.")
+                    else:
+                        self.logger.warning(f"Strategy {self.id}: StrategyManager reference found, but it's missing 'register_dynamic_subscription' method.")
+                else:
+                    self.logger.warning(f"Strategy {self.id}: StrategyManager reference not available. Cannot register dynamic subscription with StrategyManager for {instrument.instrument_id}@{tf_str}.")            
+            else:
+                self.logger.error(f"Strategy {self.id}: DataManager failed to subscribe to {instrument.instrument_id}@{tf_str}")
+                all_requests_successful = False
         
-        Returns:
-            Dict[str, List[Dict[str, Any]]]: Dictionary mapping index symbols to lists of option requirements
-            Each option requirement is a dict with keys: strike, option_type, expiry_offset
-        """
-        # Default implementation returns empty dict
-        # Should be overridden by concrete strategy implementations
-        return {}
+        return all_requests_successful
 
+
+    # --- Abstract methods to be implemented by concrete strategies ---
     @abstractmethod
-    def on_market_data(self, event: MarketDataEvent):
-        """
-        Process market data events.
-        Must be implemented by concrete strategy classes.
-
-        Args:
-            event: Market data event
-        """
-        pass
-
     def on_bar(self, event: BarEvent):
         """
-        Process bar events.
-        Override in concrete strategy implementations if needed.
-
-        Args:
-            event: Bar event
+        Called when a new bar is available for a subscribed instrument and timeframe.
+        This is the primary method where strategies implement their trading logic.
         """
-        pass
+        pass # pragma: no cover
 
-    def on_position(self, event: Event):
+    # --- Optional methods that concrete strategies can override ---
+    def on_market_data(self, event: MarketDataEvent):
         """
-        Process position events.
-        Override in concrete strategy implementations if needed.
+        Called when a new market data tick/quote is available.
+        Useful for strategies that need to react to raw ticks,
+        e.g., for options pricing or very high-frequency logic.
+        """
+        pass # pragma: no cover
 
-        Args:
-            event: Position event
-        """
-        pass
+    def on_position(self, event: PositionEvent):
+        """Called when there's an update to the strategy's positions."""
+        pass # pragma: no cover
 
-    def on_fill(self, event: Event):
-        """
-        Process fill events.
-        Override in concrete strategy implementations if needed.
+    def on_fill(self, event: FillEvent):
+        """Called when an order is filled (partially or fully)."""
+        pass # pragma: no cover
 
-        Args:
-            event: Fill event
-        """
-        pass
+    def on_order(self, event: OrderEvent):
+        """Called when there's an update to an order's status."""
+        pass # pragma: no cover
 
-    def on_order(self, event: Event):
+    def on_timer(self, event: TimerEvent):
         """
-        Process order events.
-        Override in concrete strategy implementations if needed.
-
-        Args:
-            event: Order event
+        Called periodically if the strategy is configured with `uses_timer: true`
+        and a Timer service is publishing TimerEvents.
         """
-        pass
-
-    def on_timer(self, event: Event):
-        """
-        Process timer events.
-        Override in concrete strategy implementations if needed.
-
-        Args:
-            event: Timer event
-        """
-        pass
+        pass # pragma: no cover
 
     def on_start(self):
         """
-        Called when the strategy is started.
-        Override in concrete strategy implementations if needed.
+        Called once when the strategy is started by the StrategyManager.
+        Use for one-time setup, loading historical data, or initial symbol requests.
         """
-        pass
+        self.logger.debug(f"Strategy {self.id} on_start() called from BaseStrategy.")
+        pass # pragma: no cover
 
     def on_stop(self):
         """
-        Called when the strategy is stopped.
-        Override in concrete strategy implementations if needed.
+        Called once when the strategy is stopped by the StrategyManager.
+        Use for cleanup, closing open positions, or saving state.
         """
-        pass
+        self.logger.debug(f"Strategy {self.id} on_stop() called from BaseStrategy.")
+        pass # pragma: no cover
 
-    def handle_missing_data(self, symbol: str, required_data_points: int) -> bool:
-        """
-        Handle cases where we don't have enough historical data.
-        
-        Args:
-            symbol: Symbol with missing data
-            required_data_points: Number of data points required
-            
-        Returns:
-            bool: True if we can proceed with the strategy, False if we should wait
-        """
-        # Check if this is an option symbol
-        if self._is_option_symbol(symbol):
-            # Use option manager to check if the option has enough data
-            return self.option_manager.handle_missing_data(symbol, required_data_points)
-            
-        # For regular symbols, check bar data
-        if symbol in self.bar_data and self.timeframe in self.bar_data[symbol]:
-            return len(self.bar_data[symbol][self.timeframe]) >= required_data_points
-            
-        return False
+     # --- Helper methods (examples, can be expanded) ---
+    def _get_instrument_details(self, instrument_id: str) -> Optional[Instrument]:
+        """Helper to get full instrument details from DataManager."""
+        return self.data_manager.get_instrument(instrument_id)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Return current status of the strategy."""
+        # Simplified status, can be expanded
+        return {
+            "id": self.id,
+            "name": self.name,
+            "is_running": self.is_running,
+            "last_run_time": self.last_run_time.isoformat() if self.last_run_time else None,
+            "last_heartbeat": datetime.fromtimestamp(self.last_heartbeat).isoformat(),
+            "signals_generated": self.signals_generated,
+            "used_symbols_count": len(self.used_symbols), # Number of unique instrument_ids this strategy is using
+            "primary_timeframe": self.timeframe,
+            "additional_timeframes": list(self.additional_timeframes),
+            "positions_count": len(self.positions) # Number of open positions held by this strategy
+        }
+

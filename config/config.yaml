@@ -3,7 +3,7 @@
 # System Configuration
 system:
   name: "AlgoTrading Framework"
-  mode: "live"  # Options: "backtest", "live", "paper"
+  mode: "paper"  # Options: "backtest", "live", "paper"
   timezone: "Asia/Kolkata"
   log_level: "DEBUG"  # Options: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
   log_dir: "logs"
@@ -249,6 +249,18 @@ event_manager:
   process_sleep: 0.001
   enable_monitoring: true
   diagnostic_interval: 5
+
+excel_monitor:
+  enabled: true  # Set to true to enable the dashboard, false to disable
+  path: "output/trading_dashboard.xlsx"  # Path to save the Excel dashboard
+  update_interval: 2.0  # Interval in seconds for checking the update queue
+  max_retries: 5  # Max retries for file operations or thread errors
+  retry_delay: 3.0  # Delay in seconds between retries
+  display_rows:
+    orders: 10       # Max number of open orders to display
+    trades: 15       # Max number of executed trades to display
+    positions: 10    # Max number of positions to display
+    equity_points: 20 # Max number of points for the equity curve chart
 
 # --- Instruments --- 
 # instruments:

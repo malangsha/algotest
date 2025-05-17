@@ -24,6 +24,7 @@ from utils.constants import InstrumentType
 from utils.exceptions import ConfigError, InitializationError
 from core.option_manager import OptionManager
 from core.strategy_manager import StrategyManager
+from core.excel_dashboard_monitor import ExcelDashboardMonitor
 from core.logging_manager import get_logger
 
 class UniverseHandler:
@@ -191,10 +192,8 @@ class TradingEngine:
             broker=self.broker,
             config=self.config
         )
-        self.logger.info("Strategy manager initialized")
-        
-        # Set OptionManager in StrategyManager
-        self.strategy_manager.option_manager = self.option_manager
+        self.strategy_manager.set_option_manager(self.option_manager)
+        self.logger.info("Strategy manager initialized")       
         
         # Load strategy configurations
         if self.strategy_config:
@@ -245,7 +244,8 @@ class TradingEngine:
                 try:
                     self.paper_trading_simulator = PaperTradingSimulator(
                         event_manager=self.event_manager,
-                        broker_interface=self.broker # Pass broker to access simulated orders
+                        broker_interface=self.broker, # Pass broker to access simulated orders
+                        config=self.config
                     )
                     self.logger.info("Paper Trading Simulator initialized successfully")
                 except Exception as e:
@@ -253,6 +253,24 @@ class TradingEngine:
             else:
                 self.logger.warning("System mode is 'paper' but active broker does not seem to support paper trading flag.")
 
+        # --- Initialize ExcelDashboardMonitor ---
+        self.excel_dashboard_monitor: Optional[ExcelDashboardMonitor] = None
+        if self.config.get("excel_monitor", {}).get("enabled", False):
+            try:
+                self.excel_dashboard_monitor = ExcelDashboardMonitor(
+                    position_manager=self.position_manager,
+                    config=self.config, # Pass the global config
+                    event_manager=self.event_manager
+                )
+                # ExcelDashboardMonitor starts its own thread if enabled in its __init__
+                self.logger.info("Excel Dashboard Monitor initialized.")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Excel Dashboard Monitor: {e}", exc_info=True)
+                # Continue without dashboard if initialization fails
+                self.excel_dashboard_monitor = None
+        else:
+            self.logger.info("Excel Dashboard Monitor is disabled in configuration.")
+        
         self.logger.info("Trading Engine initialized")
 
     # NOT USED
@@ -613,7 +631,7 @@ class TradingEngine:
         
         # Publish the event
         self.event_manager.publish(event)
-        self.logger.debug(f"Published timer event: elapsed={elapsed:.2f}s")
+        # self.logger.debug(f"Published timer event: elapsed={elapsed:.2f}s")
         
         # Update last heartbeat time (optional, might remove if only using timer)
         self.last_heartbeat_time = time.time()
@@ -709,6 +727,15 @@ class TradingEngine:
                     self.event_manager.stop()
                     return False
                     
+             # --- Start ExcelDashboardMonitor (already started in __init__ if enabled) ---
+            # No explicit start here as its thread is managed internally upon initialization.
+            # We can log its status.
+            if self.excel_dashboard_monitor and self.excel_dashboard_monitor.enabled:
+                self.logger.info("Excel Dashboard Monitor is active.")
+            elif self.excel_dashboard_monitor and not self.excel_dashboard_monitor.enabled:
+                 self.logger.info("Excel Dashboard Monitor was initialized but is not enabled/running.")
+            # --- End ExcelDashboardMonitor Start ---
+
             # Start the main engine thread for timer events
             self.running = True
             if self._main_thread is None or not self._main_thread.is_alive():
@@ -724,6 +751,10 @@ class TradingEngine:
                         self.option_manager.stop_tracking()
                     self.strategy_manager.stop()
                     self.event_manager.stop()
+
+                    # Stop dashboard if it was started
+                    if self.excel_dashboard_monitor and self.excel_dashboard_monitor.enabled:
+                        self.excel_dashboard_monitor.stop()
                     return False
                     
             # Set up event handlers within this engine
@@ -793,6 +824,12 @@ class TradingEngine:
         if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'stop'):
             self.paper_trading_simulator.stop()
             
+        # --- Stop ExcelDashboardMonitor ---
+        if self.excel_dashboard_monitor and self.excel_dashboard_monitor.enabled:
+            self.logger.info("Stopping Excel Dashboard Monitor...")
+            self.excel_dashboard_monitor.stop()
+            self.logger.info("Excel Dashboard Monitor stopped.")        
+
         # Disconnect broker
         if self.broker and hasattr(self.broker, 'disconnect'):
             self.broker.disconnect()
@@ -981,6 +1018,9 @@ class TradingEngine:
             status["options"] = self.option_manager.get_status()
         if hasattr(self, 'strategy_manager') and hasattr(self.strategy_manager, 'get_status'):
             status["strategy_manager"] = self.strategy_manager.get_status()
+        if self.excel_dashboard_monitor:
+            status["excel_dashboard_status"] = "Enabled and Active" if self.excel_dashboard_monitor.enabled and self.excel_dashboard_monitor.running else \
+                                             ("Enabled but Inactive" if self.excel_dashboard_monitor.enabled else "Disabled")    
             
         return status
 

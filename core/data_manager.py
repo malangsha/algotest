@@ -107,11 +107,14 @@ class DataManager:
         # Initialize timeframe management
         self.timeframe_manager = TimeframeManager(max_bars_in_memory=self.tfm_cache_limit)
         self.timeframe_subscriptions = {}
-        for timeframe in TimeframeManager.VALID_TIMEFRAMES:
+        for timeframe in TimeframeManager.SUPPORTED_TIMEFRAMES:
             self.timeframe_subscriptions[timeframe] = {}
             
         # {symbol_key: {timeframe: set(strategy_ids)}}
         self.symbol_subscribers: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
+
+        self.instrument_feed_subscribers_count: Dict[str, int] = defaultdict(int)
+        self.active_subscriptions: Set[str] = set() # Tracks broker-level active feeds
 
         # Persistence mechanism with improved threading
         self._persistence_thread = None
@@ -131,11 +134,8 @@ class DataManager:
         
         # Start tick processing thread
         self.tick_processor_thread = threading.Thread(target=self._process_tick_queue, daemon=True)
-        self.tick_processor_thread.start()
-        
-        # Track active subscriptions
-        self.active_subscriptions: Set[str] = set() 
-        
+        self.tick_processor_thread.start()       
+    
         self.logger.info(f"DataManager initialized. Persistence: {self.persistence_enabled}. TFM Cache: {self.tfm_cache_limit} bars.")
         
     def _setup_persistence(self):
@@ -256,6 +256,7 @@ class DataManager:
                 # Double check after acquiring lock
                 if symbol_key not in self.instruments:
                     self.instruments[symbol_key] = event.instrument
+                    self.logger.info(f"Instrument {symbol_key} added to DataManager store via _on_market_data as feed is active.")
 
         # Add symbol_key to data for downstream convenience
         # This might be redundant if the key is already derived from instrument,
@@ -293,6 +294,7 @@ class DataManager:
                 batch = []
                 time.sleep(0.1)
         # Process remaining after shutdown
+        self.logger.info("Tick processing queue: processing remaining items before stop.")
         if batch: self._process_market_data_batch(batch)
         while not self.tick_queue.empty():
              try:
@@ -317,7 +319,7 @@ class DataManager:
         timeout = self.config.get('symbol_processing_timeout', 3.0)  # Increased from 1.0
         futures = [self.tick_processing_executor.submit(self._process_symbol_events, key, events)
                    for key, events in symbol_event_groups.items()]
-        for future in futures:
+        for future in concurrent.futures.as_completed(futures, timeout=timeout + 1.0): # Add buffer to timeout
             try:
                 future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
@@ -347,7 +349,9 @@ class DataManager:
         """
         try:
             instrument = self.instruments.get(symbol_key)
-            if not instrument: return
+            if not instrument:
+                self.logger.warning(f"Instrument not found for symbol_key {symbol_key} during single event processing.")
+                return
 
             converted_tick_data = event.data
             
@@ -381,7 +385,7 @@ class DataManager:
             tick_for_tfm[MarketDataType.VOLUME.value] = tick_volume
 
             # --- Tick Processing via TimeframeManager ---
-            # Ensure necessary fields for TimeframeManager are present
+            # Ensure necessary fields for TimeframeManager are present            
             if MarketDataType.LAST_PRICE.value in tick_for_tfm and MarketDataType.TIMESTAMP.value in tick_for_tfm:
                 try:
                     # Pass the modified tick data (with calculated volume) to TimeframeManager
@@ -407,7 +411,6 @@ class DataManager:
                                         bar_data.update(greeks_data)
                                         bar_data['implied_volatility'] = implied_vol
 
-                                self.logger.debug(f"bar_data: {bar_data}")
                                 # --- Publish Standard BarEvent ---
                                 self._publish_bar_event(
                                     symbol_key=symbol_key,
@@ -419,7 +422,8 @@ class DataManager:
                 except Exception as e:
                      self.logger.error(f"Error processing tick via TimeframeManager for {symbol_key}: {e}. Tick for TFM: {tick_for_tfm}", exc_info=True)
             else:
-                self.logger.warning(f"Skipping tick for {symbol_key} due to missing price or timestamp in converted data: {tick_for_tfm}")
+                # self.logger.warning(f"Skipping tick for {symbol_key} due to missing price or timestamp in converted data: {tick_for_tfm}")
+                pass
         except Exception as e:
             self.logger.error(f"Error processing market data for {symbol_key}: {str(e)}")
             import traceback
@@ -448,7 +452,9 @@ class DataManager:
 
             try:
                 # Ensure timestamp is an integer if required by event definition
-                bar_timestamp = int(bar_data['timestamp'])
+                # bar_timestamp = int(bar_data['timestamp'])
+                raw_ts = bar_data['timestamp']
+                bar_timestamp = int(raw_ts.timestamp())
 
                 # Create the standard BarEvent
                 bar_event = BarEvent(
@@ -479,9 +485,9 @@ class DataManager:
                 # Alternatively, could add them to a generic 'data' field if BarEvent has one
 
 
-                # Publish the event - EventManager routes it
+                # Publish the event - EventManager routes it                
                 self.event_manager.publish(bar_event)
-                # self.logger.debug(f"Published BarEvent for {symbol_key} @ {timeframe} to {len(subscribers)} subscribers.")
+                # self.logger.debug(f"Published BarEvent for {symbol_key}@{timeframe} to {len(subscribers)} subscribers.")
 
             except KeyError as ke:
                  self.logger.error(f"Missing key in bar_data for {symbol_key}@{timeframe}: {ke}. Bar Data: {bar_data}")
@@ -500,8 +506,15 @@ class DataManager:
         self.logger.debug(f"Instrument: {instrument}")
         try:
             option_price = float(bar_data['close'])
-            timestamp = float(bar_data['timestamp'])
+            # timestamp = float(bar_data['timestamp'])
             
+            raw_ts = bar_data['timestamp']
+            # Convert pandas.Timestamp to float seconds, otherwise cast directly
+            if isinstance(raw_ts, pd.Timestamp):
+                timestamp = raw_ts.timestamp()
+            else:
+                timestamp = float(raw_ts)
+
             # 1. Get Underlying Price
             symbol_key = getattr(instrument, 'symbol_key', None)
             if not symbol_key:
@@ -565,82 +578,170 @@ class DataManager:
             return None
 
     def _get_last_price(self, symbol_key: str) -> Optional[float]:
-        """Gets the last known price from last_tick_data (converted)."""
         converted_tick = self.last_tick_data.get(symbol_key)
         if converted_tick:
-            # Use MarketDataType enum value as the key
             price = converted_tick.get(MarketDataType.LAST_PRICE.value)
             if price is not None:
                 try: return float(price)
-                except (ValueError, TypeError): pass # Logged elsewhere if conversion fails
+                except (ValueError, TypeError): self.logger.error(f"Invalid price format in last_tick_data for {symbol_key}: {price}")
+        self.logger.debug(f"Last price not found for {symbol_key} in _get_last_price.")
         return None
 
     # --- Persistence ---
     def _persistence_loop(self):
-        """Background thread for periodic data persistence."""
         self.logger.info("Persistence loop started.")
         while not self._shutdown_event.wait(self.persistence_interval):
             try:
-                symbols_to_persist = list(self.instruments.keys())
+                symbols_to_persist = list(self.instruments.keys()) # Persist for all known instruments with active feeds or TFM tracking
                 if not symbols_to_persist: continue
-                self.logger.debug(f"Starting periodic persistence check for {len(symbols_to_persist)} symbols...")
-                start_time = time.monotonic()
+                
+                active_tfm_symbols = self.timeframe_manager.get_tracked_symbols_and_timeframes()
+                
+                self.logger.debug(f"Starting periodic persistence check for {len(active_tfm_symbols)} symbol/timeframe pairs...")
+                start_time_loop = time.monotonic()
                 futures = []
                 now = time.time()
-                for symbol_key in symbols_to_persist:
-                    if now - self.last_persistence_time.get(symbol_key, 0) >= self.persistence_interval:
-                         # Primarily persist 1m data, adjust if others needed
-                         future = self.persistence_executor.submit(self._persist_symbol_data, symbol_key, '1m')
-                         futures.append(future)
-                         self.last_persistence_time[symbol_key] = now
+
+                for symbol_key, timeframes in active_tfm_symbols.items():
+                    for timeframe in timeframes:
+                        # Persist if interval passed for this specific symbol/timeframe combo
+                        # This requires more granular last_persistence_time tracking
+                        # For now, using a simpler model based on symbol's overall last persistence.
+                        if now - self.last_persistence_time.get(f"{symbol_key}_{timeframe}", 0) >= self.persistence_interval:
+                             future = self.persistence_executor.submit(self._persist_symbol_data, symbol_key, timeframe)
+                             futures.append(future)
+                             self.last_persistence_time[f"{symbol_key}_{timeframe}"] = now
+                
                 submitted_count = len(futures)
-                for future in futures:
-                    try: future.result(timeout=60)
+                completed_count = 0
+                for future in concurrent.futures.as_completed(futures, timeout=self.persistence_interval):
+                    try: 
+                        future.result(timeout=max(1, self.persistence_interval - (time.monotonic() - start_time_loop) - 5) ) # Dynamic timeout
+                        completed_count +=1
+                    except concurrent.futures.TimeoutError:
+                        self.logger.error(f"Persistence task timed out for one symbol/timeframe.")
                     except Exception as e: self.logger.error(f"Persistence task error: {e}", exc_info=True)
-                elapsed = time.monotonic() - start_time
+                
+                elapsed = time.monotonic() - start_time_loop
                 if submitted_count > 0:
-                     self.logger.info(f"Persistence cycle completed in {elapsed:.2f}s for {submitted_count} tasks.")
+                     self.logger.info(f"Persistence cycle completed in {elapsed:.2f}s. Submitted: {submitted_count}, Completed: {completed_count}.")
             except Exception as e:
                 self.logger.error(f"Error in persistence loop: {e}", exc_info=True)
-                time.sleep(60)
+                time.sleep(60) # Wait longer if major error in loop
         self.logger.info("Persistence loop stopped.")
 
     def _persist_symbol_data(self, symbol_key: str, timeframe: str):
-        """Persists bar data for a symbol/timeframe from TimeframeManager."""
         if not self.persistence_enabled: return
         try:
-            df = self.timeframe_manager.get_bars(symbol_key, timeframe) # Gets cached/buffered data
-            if df is None or df.empty: return
+            # Get *only new* bars from TimeframeManager since last persistence
+            # This requires TFM to have a way to provide diffs or new bars.
+            # For now, get_bars() might return all cached bars. We need to handle duplicates on save.
+            
+            # MODIFIED LINE: Changed n_bars=None to limit=None
+            df = self.timeframe_manager.get_bars(symbol_key, timeframe, limit=None) # Get all available from TFM
+            
+            if df is None or df.empty: 
+                # self.logger.debug(f"No new bars from TFM to persist for {symbol_key}@{timeframe}")
+                return
 
-            df = df.reindex(columns=TimeframeManager.BAR_COLUMNS).copy()
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+            # Ensure standard columns and datetime
+            # Ensure BAR_COLUMNS is accessible, e.g., TimeframeManager.BAR_COLUMNS or define it locally if preferred
+            # For this example, assuming TimeframeManager is imported and BAR_COLUMNS is accessible.
+            # from utils.timeframe_manager import TimeframeManager # Ensure this import exists at the top of data_manager.py
+            
+            # Reindex might fail if df.index is not a DatetimeIndex after get_bars if it was converted back to epoch for some reason
+            # The current TimeframeManager.get_bars returns a DataFrame with a DatetimeIndex.
+            
+            # Make a copy for modification to avoid SettingWithCopyWarning if df is a slice
+            df_copy = df.copy()
+
+            # The BAR_COLUMNS in TimeframeManager includes 'timestamp' which is also the index name after set_index.
+            # If 'timestamp' is already the index, trying to reindex with it in columns might be redundant or cause issues
+            # depending on pandas version. Let's ensure 'timestamp' is a column if it's the index.
+            if 'timestamp' not in df_copy.columns and df_copy.index.name == 'timestamp':
+                df_copy['timestamp'] = df_copy.index.astype(np.int64) // 10**9 # Convert DatetimeIndex to epoch seconds for storage if needed, or keep as datetime
+            
+            # Ensure all BAR_COLUMNS are present, fill missing with NaN or appropriate defaults
+            # This assumes TimeframeManager.BAR_COLUMNS is defined and accessible.
+            # If TimeframeManager.BAR_COLUMNS is ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest']
+            # and df_copy.index is already 'timestamp' (datetime), then 'timestamp' column might be missing.
+            
+            # Let's assume df from get_bars has 'timestamp' as a datetime index and also as a column of epoch seconds.
+            # If get_bars returns df with timestamp as index (datetime) and no separate timestamp column:
+            if 'timestamp' not in df_copy.columns and isinstance(df_copy.index, pd.DatetimeIndex):
+                 df_copy['timestamp_epoch'] = (df_copy.index.astype(np.int64) // 10**9).astype(int) # Epoch seconds
+            elif 'timestamp' in df_copy.columns and pd.api.types.is_datetime64_any_dtype(df_copy['timestamp']):
+                 # If timestamp column is already datetime, convert to epoch for saving if desired, or ensure it's what BAR_COLUMNS expects
+                 df_copy['timestamp_epoch'] = (pd.to_datetime(df_copy['timestamp']).astype(np.int64) // 10**9).astype(int)
+            elif 'timestamp' in df_copy.columns: # Assume it's already epoch if not datetime
+                 df_copy['timestamp_epoch'] = df_copy['timestamp'].astype(int)
+            else: # No timestamp column or index, this is problematic
+                 self.logger.error(f"Timestamp information missing or in unexpected format for {symbol_key}@{timeframe}. Cannot reliably persist.")
+                 return
+
+            # Standardize columns for persistence, using BAR_COLUMNS from TimeframeManager
+            # We need to ensure the DataFrame being saved has these columns.
+            # The 'timestamp' in BAR_COLUMNS refers to the epoch timestamp.
+            
+            # Create a DataFrame for saving with the correct columns.
+            # The original df from get_bars has datetime index. We need epoch for saving as per BAR_COLUMNS.
+            save_df_columns = TimeframeManager.BAR_COLUMNS 
+            df_to_save = pd.DataFrame(index=df_copy.index) # Keep datetime index for grouping by date
+
+            for col in save_df_columns:
+                if col == 'timestamp': # This should be epoch timestamp for saving
+                    df_to_save[col] = df_copy['timestamp_epoch']
+                elif col in df_copy.columns:
+                    df_to_save[col] = df_copy[col]
+                else:
+                    df_to_save[col] = np.nan # Or appropriate default like 0.0 for numeric
+
+            if 'datetime' not in df_to_save.columns: # Ensure datetime column for grouping if index is not datetime
+                if isinstance(df_to_save.index, pd.DatetimeIndex):
+                    df_to_save['datetime'] = df_to_save.index
+                else: # Fallback if index is not datetime (should not happen with current TFM.get_bars)
+                    df_to_save['datetime'] = pd.to_datetime(df_to_save['timestamp'], unit='s')
+
+
             parts = symbol_key.split(':', 1)
             exchange = parts[0] if len(parts) > 1 else 'UNKNOWN_EX'
             pure_symbol = parts[1] if len(parts) > 1 else symbol_key
             safe_symbol = "".join(c if c.isalnum() else "_" for c in pure_symbol)
 
-            date_groups = df.groupby(df['datetime'].dt.date)
+            date_groups = df_to_save.groupby(df_to_save['datetime'].dt.date)
             saved_count = 0
-            for date, date_df in date_groups:
-                date_str = date.strftime('%Y-%m-%d')
+            for date_obj, date_df_group in date_groups:
+                date_str = date_obj.strftime('%Y-%m-%d')
                 persist_dir = os.path.join(self.persistence_path, 'bars', date_str, exchange, timeframe)
                 os.makedirs(persist_dir, exist_ok=True)
                 file_path = os.path.join(persist_dir, f"{safe_symbol}.parquet")
-                # Use timestamp as index for saving
-                save_df = date_df.set_index('timestamp').drop(columns=['datetime'], errors='ignore')
+                
+                # Prepare for saving: set epoch timestamp as index, drop helper datetime column
+                final_save_df = date_df_group.set_index('timestamp').drop(columns=['datetime'], errors='ignore')
+                
                 try:
                     if os.path.exists(file_path):
                         existing_df = pd.read_parquet(file_path)
-                        combined_df = pd.concat([existing_df, save_df])
-                        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                        combined_df.sort_index(inplace=True)
-                        combined_df.to_parquet(file_path, index=True)
+                        # Only append new rows not already in existing_df by index (epoch timestamp)
+                        new_rows_df = final_save_df[~final_save_df.index.isin(existing_df.index)]
+                        if not new_rows_df.empty:
+                            combined_df = pd.concat([existing_df, new_rows_df])
+                            # combined_df = combined_df[~combined_df.index.duplicated(keep='last')] # Should not be needed
+                            combined_df.sort_index(inplace=True)
+                            combined_df.to_parquet(file_path, index=True)
+                            saved_count += len(new_rows_df)
                     else:
-                        save_df.to_parquet(file_path, index=True)
-                    saved_count += len(save_df)
-                except Exception as e: self.logger.error(f"Error saving parquet {file_path}: {e}")
-            # if saved_count > 0: self.logger.debug(f"Persisted {saved_count} {timeframe} bars for {symbol_key}.")
-        except Exception as e: self.logger.error(f"Error persisting {timeframe} data for {symbol_key}: {e}", exc_info=True)
+                        final_save_df.to_parquet(file_path, index=True)
+                        saved_count += len(final_save_df)
+                except Exception as e:
+                    self.logger.error(f"Error saving parquet {file_path} for {symbol_key}@{timeframe} on {date_str}: {e}", exc_info=True)
+            
+            if saved_count > 0:
+                 # self.logger.info(f"Persisted {saved_count} new {timeframe} bars for {symbol_key} (across relevant dates).")
+                 pass
+
+        except Exception as e:
+            self.logger.error(f"Error persisting {timeframe} data for {symbol_key}: {e}", exc_info=True)
  
     def _store_in_redis(self, key: str, data: Dict, timestamp: float):
         """
@@ -691,86 +792,72 @@ class DataManager:
                 self._redis_errors = 1
 
     # --- Data Retrieval ---
-    def get_historical_data(self, symbol_key: str, timeframe: str,
-                            n_bars: Optional[int] = None,
-                            start_time: Optional[Union[datetime, float]] = None,
-                            end_time: Optional[Union[datetime, float]] = None) -> Optional[pd.DataFrame]:
-        """Get historical bars, checking memory then persistence."""
-        df = self.timeframe_manager.get_bars(symbol_key, timeframe)
-        needs_persistence_load = False
-        start_ts = start_time.timestamp() if isinstance(start_time, datetime) else float(start_time) if start_time else None
+    def get_historical_data(self, symbol: str, timeframe: str, n_bars: Optional[int] = None, 
+                            start_time: Optional[Union[datetime, int]] = None, 
+                            end_time: Optional[Union[datetime, int]] = None) -> Optional[pd.DataFrame]:
+        """Fetches historical bar data, prioritizing TimeframeManager's cache, then persistence."""
+        symbol_key = symbol # Assuming symbol is already the key, or convert if it's just symbol name
+        # If symbol is not a key, need a lookup: inst = self.find_instrument(symbol); symbol_key = self._get_symbol_key(inst)
+        
+        self.logger.debug(f"Fetching historical data for {symbol_key}@{timeframe}. n_bars={n_bars}, start={start_time}, end={end_time}")
 
-        if df is None: needs_persistence_load = True
-        elif start_ts and not df.empty and df.index.min() > start_ts: needs_persistence_load = True
-        # Add check if n_bars requires more data than available in memory
-        elif n_bars is not None and n_bars > 0 and (df is None or len(df) < n_bars):
-             needs_persistence_load = True
+        # 1. Try TimeframeManager's in-memory cache first
+        df = self.timeframe_manager.get_bars(symbol_key, timeframe, n_bars, start_time, end_time)
+        if df is not None and not df.empty:
+            self.logger.info(f"Retrieved {len(df)} bars for {symbol_key}@{timeframe} from TimeframeManager cache.")
+            return df.copy() # Return a copy
 
+        # 2. If persistence is enabled and not found in TFM, try loading from disk
+        if self.persistence_enabled:
+            self.logger.debug(f"No/insufficient data in TFM cache for {symbol_key}@{timeframe}. Trying persistence.")
+            # Logic to load from parquet files based on date range derived from start/end/n_bars
+            # This needs to be more sophisticated to handle date ranges and combine daily files.
+            # For simplicity, this example might just load recent data or a specific day if no range.
+            
+            # Placeholder: A more robust loading mechanism is needed here.
+            # For now, let's assume we try to load a recent file if n_bars is given, or all for a range.
+            # This is a simplified example of loading from persistence.
+            try:
+                parts = symbol_key.split(':', 1)
+                exchange = parts[0] if len(parts) > 1 else 'UNKNOWN_EX'
+                pure_symbol = parts[1] if len(parts) > 1 else symbol_key
+                safe_symbol = "".join(c if c.isalnum() else "_" for c in pure_symbol)
 
-        if needs_persistence_load and self.persistence_enabled:
-             persistent_df = self._load_historical_data_from_storage(symbol_key, timeframe, start_time, end_time)
-             if persistent_df is not None:
-                  if df is not None:
-                       # Combine, ensuring consistent columns (preferring TFM columns)
-                       combined_df = pd.concat([persistent_df.reindex(columns=df.columns), df])
-                       df = combined_df[~combined_df.index.duplicated(keep='last')].sort_index()
-                  else: df = persistent_df
-
-        if df is None or df.empty: return None
-        if not df.index.is_monotonic_increasing: df.sort_index(inplace=True)
-
-        # Apply filters
-        if start_ts: df = df[df.index >= start_ts]
-        if end_time:
-            end_ts = end_time.timestamp() if isinstance(end_time, datetime) else float(end_time)
-            df = df[df.index <= end_ts]
-        if n_bars is not None and n_bars > 0: df = df.iloc[-n_bars:]
-        elif n_bars == 0: return pd.DataFrame(columns=df.columns)
-
-        return df.copy() if not df.empty else None
-
-    def _load_historical_data_from_storage(self, symbol_key: str, timeframe: str,
-                                           start_time: Optional[Union[datetime, float]] = None,
-                                           end_time: Optional[Union[datetime, float]] = None) -> Optional[pd.DataFrame]:
-        """Loads historical data from persistent parquet files."""
-        if not self.persistence_enabled: return None
-        dfs = []
-        try:
-            end_dt = datetime.fromtimestamp(end_time) if isinstance(end_time, (int, float)) else end_time if isinstance(end_time, datetime) else datetime.now()
-            start_dt = datetime.fromtimestamp(start_time) if isinstance(start_time, (int, float)) else start_time if isinstance(start_time, datetime) else end_dt - timedelta(days=30) # Default lookback
-
-            parts = symbol_key.split(':', 1)
-            exchange = parts[0] if len(parts) > 1 else 'UNKNOWN_EX'
-            pure_symbol = parts[1] if len(parts) > 1 else symbol_key
-            safe_symbol = "".join(c if c.isalnum() else "_" for c in pure_symbol)
-
-            current_date = start_dt.date()
-            while current_date <= end_dt.date():
-                date_str = current_date.strftime('%Y-%m-%d')
-                file_path = os.path.join(self.persistence_path, 'bars', date_str, exchange, timeframe, f"{safe_symbol}.parquet")
+                # Determine date range to scan (this is complex)
+                # If start_time and end_time are given, iterate through those dates.
+                # If n_bars, try to go back from today.
+                # For this example, let's just try loading for a recent date or a single date if start_time is a date.
+                
+                # This is a very basic example of loading. A real implementation needs to handle date ranges.
+                target_date_str = (start_time if isinstance(start_time, datetime) else datetime.now()).strftime('%Y-%m-%d')
+                file_path = os.path.join(self.persistence_path, 'bars', target_date_str, exchange, timeframe, f"{safe_symbol}.parquet")
+                
                 if os.path.exists(file_path):
-                    try:
-                        daily_df = pd.read_parquet(file_path)
-                        daily_df.index = daily_df.index.astype(float) # Ensure index is float timestamp
-                        dfs.append(daily_df)
-                    except Exception as e: self.logger.error(f"Error reading parquet {file_path}: {e}")
-                current_date += timedelta(days=1)
+                    loaded_df = pd.read_parquet(file_path)
+                    if 'timestamp' not in loaded_df.index.names:
+                        loaded_df = loaded_df.set_index('timestamp', drop=False) # Ensure timestamp is index or column
+                    
+                    # Filter by start/end time if provided
+                    if start_time: 
+                        start_ts = start_time.timestamp() if isinstance(start_time, datetime) else int(start_time)
+                        loaded_df = loaded_df[loaded_df.index >= start_ts]
+                    if end_time:
+                        end_ts = end_time.timestamp() if isinstance(end_time, datetime) else int(end_time)
+                        loaded_df = loaded_df[loaded_df.index <= end_ts]
+                    
+                    if n_bars and not start_time : # if only n_bars is given, take last n_bars
+                        loaded_df = loaded_df.tail(n_bars)
 
-            if not dfs: return None
-            combined_df = pd.concat(dfs).sort_index()
-            # Reindex to standard columns, adding missing ones with NaN
-            combined_df = combined_df.reindex(columns=TimeframeManager.BAR_COLUMNS)
+                    if not loaded_df.empty:
+                        self.logger.info(f"Loaded {len(loaded_df)} bars for {symbol_key}@{timeframe} from persistence file {file_path}")
+                        # Optionally, warm up TimeframeManager with this data
+                        # self.timeframe_manager.warmup_bars(symbol_key, timeframe, loaded_df)
+                        return loaded_df.copy()
+            except Exception as e:
+                self.logger.error(f"Error loading historical data for {symbol_key}@{timeframe} from persistence: {e}", exc_info=True)
 
-            # Filter precisely by timestamp
-            start_ts = start_time.timestamp() if isinstance(start_time, datetime) else float(start_time) if start_time else None
-            end_ts = end_time.timestamp() if isinstance(end_time, datetime) else float(end_time) if end_time else None
-            if start_ts: combined_df = combined_df[combined_df.index >= start_ts]
-            if end_ts: combined_df = combined_df[combined_df.index <= end_ts]
-
-            return combined_df if not combined_df.empty else None
-        except Exception as e:
-            self.logger.error(f"Error loading historical data for {symbol_key} {timeframe}: {e}", exc_info=True)
-            return None
+        self.logger.warning(f"No historical data found for {symbol_key}@{timeframe} after checking cache and persistence.")
+        return None
 
     def get_current_bar(self, symbol_key: str, timeframe: str) -> Optional[Dict[str, Any]]:
         """Gets the currently forming bar from TimeframeManager."""
@@ -781,14 +868,10 @@ class DataManager:
          return self.last_tick_data.get(symbol_key)
     
     def _handle_system_event(self, event: Event):
-        """
-        Handle system events.
-        
-        Args:
-            event: System event
-        """
-        # Check for shutdown events, connection status changes, etc.
-        pass
+        self.logger.debug(f"DataManager received system event: {event}")
+        if hasattr(event, 'data') and isinstance(event.data, dict):
+            if event.data.get('type') == 'SHUTDOWN':
+                self.shutdown()
     
     def _handle_custom_event(self, event: Event):
         """
@@ -880,78 +963,138 @@ class DataManager:
             self.logger.error(f"Error unsubscribing from {symbol}: {str(e)}")
             return False
     
-    # --- Subscription Management ---
-    def subscribe_to_timeframe(self, instrument: Instrument, timeframe: str, strategy_id: str) -> bool:
-        """Subscribe a strategy to a specific instrument and timeframe."""
+    # --- Subscription Management ---   
+    def _subscribe_to_instrument_feed(self, instrument: Instrument) -> bool:
+        """Ensures the raw data feed for the instrument is active."""
         symbol_key = self._get_symbol_key(instrument)
-        if not symbol_key: return False
-        if timeframe not in TimeframeManager.VALID_TIMEFRAMES or timeframe == 'tick':
-            self.logger.error(f"Invalid timeframe for subscription: {timeframe}")
+        if symbol_key.startswith("INVALID:"):
+            self.logger.error(f"Cannot subscribe to feed for invalid instrument: {instrument}")
+            return False
+        
+        with self._get_lock_for_symbol(symbol_key): # Use existing symbol-specific lock
+            if self.instrument_feed_subscribers_count[symbol_key] == 0:
+                if self.market_data_feed:
+                    self.logger.info(f"DataManager: Requesting broker feed subscription for {symbol_key}")
+                    if not self.market_data_feed.subscribe(instrument): # Actual call to FinvasiaFeed etc.
+                        self.logger.error(f"DataManager: Market data feed failed to subscribe to {symbol_key}")
+                        return False
+                    self.active_subscriptions.add(symbol_key)
+                    self.logger.info(f"DataManager: Successfully subscribed to broker feed for {symbol_key}")
+                else: # Simulation or backtesting context, or feed not set yet
+                    self.logger.info(f"DataManager: No live market_data_feed, assuming {symbol_key} is available or will be handled by feed provider.")
+                    # In a real scenario without a feed, this might still return True if we expect data from elsewhere (e.g. historical)
+                    # For now, let's assume it's okay to proceed and mark as active for internal logic.
+                    self.active_subscriptions.add(symbol_key) # Still mark as active for internal logic
+            
+            self.instrument_feed_subscribers_count[symbol_key] += 1
+            if symbol_key not in self.instruments:
+                self.instruments[symbol_key] = instrument # Store instrument object
+            self.logger.debug(f"DataManager: Instrument feed for {symbol_key} now has {self.instrument_feed_subscribers_count[symbol_key]} subscribers.")
+            return True
+
+    def _unsubscribe_from_instrument_feed(self, instrument: Instrument) -> bool:
+        """Disables the raw data feed for the instrument if no longer needed."""
+        symbol_key = self._get_symbol_key(instrument)
+        if symbol_key.startswith("INVALID:"):
+            self.logger.error(f"Cannot unsubscribe from feed for invalid instrument: {instrument}")
+            return False # Or True, as there's nothing to unsubscribe from
+
+        with self._get_lock_for_symbol(symbol_key):
+            if self.instrument_feed_subscribers_count[symbol_key] == 0:
+                self.logger.warning(f"DataManager: Attempted to unsubscribe {symbol_key} from feed, but it has no subscribers recorded.")
+                return True # Already effectively unsubscribed
+
+            self.instrument_feed_subscribers_count[symbol_key] -= 1
+            self.logger.debug(f"DataManager: Instrument feed for {symbol_key} now has {self.instrument_feed_subscribers_count[symbol_key]} subscribers.")
+
+            if self.instrument_feed_subscribers_count[symbol_key] == 0:
+                if self.market_data_feed:
+                    self.logger.info(f"DataManager: Requesting broker feed unsubscription for {symbol_key}")
+                    if not self.market_data_feed.unsubscribe(instrument):
+                        self.logger.error(f"DataManager: Market data feed failed to unsubscribe from {symbol_key}")
+                        # Even if unsubscribe fails at broker, we proceed with internal cleanup
+                        # but might keep the count at 0 to retry or log persistently.
+                        # For now, we proceed with internal state update.
+                    else:
+                         self.logger.info(f"DataManager: Successfully unsubscribed from broker feed for {symbol_key}")
+                    self.active_subscriptions.discard(symbol_key)
+                else:
+                    self.logger.info(f"DataManager: No live market_data_feed, marking {symbol_key} as inactive internally.")
+                    self.active_subscriptions.discard(symbol_key)
+                
+                # Clean up if instrument is no longer needed by anyone for anything
+                # This part needs careful consideration: when to remove from self.instruments?
+                # If only instrument_feed_subscribers_count is zero, but symbol_subscribers still has entries
+                # (e.g. for historical data access), we should not remove from self.instruments.
+                # Let's assume self.instruments cleanup is handled elsewhere or not strictly tied here.
+
+            return True
+
+    def subscribe_to_timeframe(self, instrument: Instrument, timeframe: str, strategy_id: str) -> bool:
+        """Subscribes a strategy to a specific instrument and timeframe for bar data."""
+        symbol_key = self._get_symbol_key(instrument)
+        if symbol_key.startswith("INVALID:"):
+            self.logger.warning(f"Cannot subscribe to timeframe for invalid symbol key: {symbol_key} (Strategy: {strategy_id})")
             return False
 
-        with self.global_lock:
-            first_subscription_for_symbol = symbol_key not in self.active_subscriptions
-            # Add strategy subscription first
-            # self.timeframe_subscriptions[timeframe][strategy_id].add(symbol_key) # This structure seems redundant if we use symbol_subscribers
+        # Step 1: Ensure the raw instrument feed is active (MODIFIED)
+        if not self._subscribe_to_instrument_feed(instrument):
+            self.logger.error(f"Failed to ensure instrument feed for {symbol_key} for strategy {strategy_id} on timeframe {timeframe}. Cannot subscribe to timeframe.")
+            return False
+
+        # Step 2: Proceed with timeframe-specific subscription for the strategy
+        with self._get_lock_for_symbol(symbol_key): # Or a global lock for subscriptions
+            # Add strategy to timeframe subscribers for this symbol
             self.symbol_subscribers[symbol_key][timeframe].add(strategy_id)
-
-            # If it's the first time any strategy needs this symbol, subscribe at broker
-            if first_subscription_for_symbol:
-                 # If we have a market data feed, use it
-                if hasattr(self, 'market_data_feed') \
-                    and self.market_data_feed        \
-                    and self.market_data_feed.subscribe(instrument):
-                    self.active_subscriptions.add(symbol_key)
-                    
-                    # Store instrument object if first time subscribing
-                    if symbol_key not in self.instruments:
-                        self.instruments[symbol_key] = instrument
-                    self.logger.info(f"Subscribed to market data feed for {symbol_key} (Triggered by {strategy_id} for {timeframe})")
-                else: # Broker subscription failed, roll back strategy subscription
-                    # del self.timeframe_subscriptions[timeframe][strategy_id] # Remove if structure removed
-                    self.symbol_subscribers[symbol_key][timeframe].discard(strategy_id)
-                    if not self.symbol_subscribers[symbol_key][timeframe]: del self.symbol_subscribers[symbol_key][timeframe]
-                    if not self.symbol_subscribers[symbol_key]: del self.symbol_subscribers[symbol_key]
-                    self.logger.error(f"Failed broker subscription for {symbol_key}. Cannot add {strategy_id} for {timeframe}.")
-                    return False
-
-        self.logger.info(f"Strategy '{strategy_id}' subscribed to {symbol_key} on timeframe {timeframe}")
-        return True
+            # Ensure TimeframeManager is tracking this symbol/timeframe combination
+            self.timeframe_manager.ensure_timeframe_tracked(symbol_key, timeframe)
+            self.logger.info(f"Strategy '{strategy_id}' subscribed to {symbol_key} @ {timeframe}")
+            return True
 
     def unsubscribe_from_timeframe(self, instrument: Instrument, timeframe: str, strategy_id: str) -> bool:
-        """Unsubscribe a strategy from a specific instrument and timeframe."""
+        """Unsubscribes a strategy from a specific instrument and timeframe."""
         symbol_key = self._get_symbol_key(instrument)
-        if not symbol_key or timeframe not in TimeframeManager.VALID_TIMEFRAMES: 
+        if symbol_key.startswith("INVALID:"):
+            self.logger.warning(f"Cannot unsubscribe from timeframe for invalid symbol key: {symbol_key} (Strategy: {strategy_id})")
             return False
 
-        removed = False
-        with self.global_lock:
-            # Remove strategy subscription from symbol_subscribers
-            if symbol_key in self.symbol_subscribers and timeframe in self.symbol_subscribers[symbol_key]:
-                self.symbol_subscribers[symbol_key][timeframe].discard(strategy_id)
+        with self._get_lock_for_symbol(symbol_key):
+            if timeframe in self.symbol_subscribers[symbol_key] and strategy_id in self.symbol_subscribers[symbol_key][timeframe]:
+                self.symbol_subscribers[symbol_key][timeframe].remove(strategy_id)
+                self.logger.info(f"Strategy 	'{strategy_id}	' unsubscribed from {symbol_key} @ {timeframe}")
+
+                # If this timeframe has no more subscribers for this symbol, clean it up
                 if not self.symbol_subscribers[symbol_key][timeframe]:
                     del self.symbol_subscribers[symbol_key][timeframe]
-                removed = True
+                    # Optionally, tell TimeframeManager to stop tracking if no subscribers for this symbol/timeframe
+                    # self.timeframe_manager.stop_tracking_timeframe(symbol_key, timeframe)
 
-            # Check if any strategy still needs this symbol on any timeframe
-            if symbol_key in self.symbol_subscribers and not self.symbol_subscribers[symbol_key]:
-                # No strategy needs this symbol anymore
-                del self.symbol_subscribers[symbol_key]
-                if symbol_key in self.active_subscriptions:
-                   if self.market_data_feed.unsubscribe(instrument):
-                       self.active_subscriptions.discard(symbol_key)
-                       # Clean up other data for this symbol
-                       if symbol_key in self.instruments: del self.instruments[symbol_key]
-                       if symbol_key in self.last_tick_data: del self.last_tick_data[symbol_key]
-                       if symbol_key in self.last_cumulative_volume: del self.last_cumulative_volume[symbol_key]
-                       # Reset TimeframeManager data for this symbol
-                       self.timeframe_manager.reset(symbol=symbol_key)
-                       self.logger.info(f"Unsubscribed from broker feed for {symbol_key} and cleaned up data.")
-                   else: self.logger.error(f"Failed broker unsubscribe for {symbol_key}.")
+                # If the symbol has no more subscribers across ALL timeframes, then unsubscribe from the raw feed (MODIFIED)
+                if not self.symbol_subscribers[symbol_key]: # Check if the symbol_key dict itself is empty
+                    del self.symbol_subscribers[symbol_key]
+                    self.logger.info(f"No more strategy subscribers for any timeframe on {symbol_key}. Attempting to unsubscribe from instrument feed.")
+                    self._unsubscribe_from_instrument_feed(instrument)
+                return True
+            else:
+                self.logger.warning(f"Strategy {strategy_id} was not subscribed to {symbol_key} @ {timeframe} or timeframe not found.")
+                return False
+    
+    def subscribe_instrument(self, instrument: Instrument) -> bool:
+        """
+        Public method to ensure an instrument's raw data feed is active.
+        Used by components like OptionManager that need tick data directly.
+        This does NOT subscribe a strategy to bar data timeframes.
+        """
+        self.logger.info(f"DataManager: Public request to subscribe instrument feed for {instrument.symbol}")
+        return self._subscribe_to_instrument_feed(instrument)
 
-        if removed: 
-            self.logger.info(f"Strategy '{strategy_id}' unsubscribed from {symbol_key} on {timeframe}")
-        return removed
+    def unsubscribe_instrument(self, instrument: Instrument) -> bool:
+        """
+        Public method to potentially deactivate an instrument's raw data feed if no longer needed by any component
+        that used subscribe_instrument.
+        """
+        self.logger.info(f"DataManager: Public request to unsubscribe instrument feed for {instrument.symbol}")
+        return self._unsubscribe_from_instrument_feed(instrument)
     
     def get_latest_data(self, symbol: str, n: int = 1) -> Optional[List[Dict]]:
         """
@@ -1453,34 +1596,39 @@ class DataManager:
          """ Retrieve the Instrument object for a given symbol key. """
          return self.instruments.get(symbol_key)
     
-    def close(self):
+    def shutdown(self):
         """Shutdown the data manager"""
         try:
             self.logger.info("Shutting down data manager...")
-            
-            # Signal shutdown
             self._shutdown_event.set()
+
+            # Shutdown tick processing queue by putting a sentinel
+            try: self.tick_queue.put(None, timeout=1.0) # Sentinel to stop processor
+            except queue.Full: self.logger.warning("Tick queue full during shutdown, processor might not stop gracefully.")
             
-            # Shutdown thread pool
-            if hasattr(self, 'thread_pool'):
-                self.thread_pool.shutdown(wait=True)
-                self.logger.info("Thread pool shutdown completed")
-            
-            # Wait for threads to finish
-            if hasattr(self, '_processor_thread') and self._processor_thread:
-                self._processor_thread.join(timeout=5)
-                
-            if hasattr(self, '_persistence_thread') and self._persistence_thread:
-                self._persistence_thread.join(timeout=5)
-                
-            if hasattr(self, '_scheduler_thread') and self._scheduler_thread:
-                self._scheduler_thread.join(timeout=5)
-                
-            # Close Redis connection if open
-            if hasattr(self, 'redis_client') and self.redis_client:
-                self.redis_client.close()
-                
-            self.logger.info("Data manager shut down successfully")
+            if self.tick_processor_thread and self.tick_processor_thread.is_alive():
+                self.logger.info("Waiting for tick processor thread to join...")
+                self.tick_processor_thread.join(timeout=5.0)
+                if self.tick_processor_thread.is_alive():
+                     self.logger.warning("Tick processor thread did not join in time.")
+
+            if self.persistence_executor:
+                self.logger.info("Shutting down persistence executor...")
+                self.persistence_executor.shutdown(wait=True)
+
+            if self.tick_processing_executor:
+                self.logger.info("Shutting down tick processing executor...")
+                self.tick_processing_executor.shutdown(wait=True)
+
+            if self._persistence_thread and self._persistence_thread.is_alive():
+                self.logger.info("Waiting for persistence thread to join...")
+                self._persistence_thread.join(timeout=max(1, self.persistence_interval + 5))
+                if self._persistence_thread.is_alive():
+                     self.logger.warning("Persistence thread did not join in time.")
+
+            if self.redis_client:
+                try: self.redis_client.close()
+                except: pass # Ignore errors on close
             
         except Exception as e:
             self.logger.error(f"Error shutting down data manager: {str(e)}")
@@ -1601,167 +1749,93 @@ class DataManager:
             self.logger.error(f"Failed to create instrument for {symbol_str}: {e}")
             return None
 
-# --- Placeholder EventManager ---
-class MockEventManager:
-    def subscribe(self, event_type, handler, component_name): print(f"Subscribed {component_name} to {event_type}")
-    def publish(self, event):
-        print(f"Published Event: Type={event.event_type}, Symbol={getattr(event, 'symbol', 'N/A')}, TF={getattr(event, 'timeframe', 'N/A')}, Data={getattr(event, 'bar_data', getattr(event, 'data', {}))}")
-# --- End Placeholders ---
-
-# Example Usage Snippet
+# Example usage (for testing purposes, not part of the class)
 if __name__ == '__main__':
-    # Mock EventManager and Broker for testing
-    event_manager = MockEventManager()
-    class MockBroker:
-        def subscribe_market_data(self, instrument): print(f"Broker subscribed to {instrument.symbol}"); return True
-        def unsubscribe_market_data(self, instrument): print(f"Broker unsubscribed from {instrument.symbol}"); return True
+    # This section would require a mock EventManager, config, and broker to run.
+    # For now, it's just a placeholder.
+    class MockEventManager:
+        def subscribe(self, *args, **kwargs): pass
+        def publish(self, *args, **kwargs): pass
+
+    class MockMarketDataFeed:
+        def subscribe(self, instrument): 
+            print(f"[MockFeed] Subscribed to {instrument.symbol}")
+            return True
+        def unsubscribe(self, instrument):
+            print(f"[MockFeed] Unsubscribed from {instrument.symbol}")
+            return True
 
     mock_config = {
         'market_data': {
-            'persistence': {'enabled': False}, # Disable persistence for simple test
-            'calculate_greeks': True,
-            'greeks_risk_free_rate': 0.06,
-            'default_volatility': 0.22
+            'persistence': {'enabled': False},
+            'timeframe_manager_cache_limit': 100
         }
     }
-    broker = MockBroker()
+    mock_event_manager = MockEventManager()
+    
+    dm = DataManager(config=mock_config, event_manager=mock_event_manager, broker=None)
+    dm.market_data_feed = MockMarketDataFeed() # Set the feed
 
-    # Initialize DataManager
-    data_manager = DataManager(mock_config, event_manager, broker)
+    # Test Instruments
+    nifty_inst = Instrument(symbol="NIFTY INDEX", exchange=Exchange.NSE, instrument_type=InstrumentType.INDEX, asset_class=AssetClass.EQUITY, instrument_id="NSE:NIFTY INDEX")
+    reliance_inst = Instrument(symbol="RELIANCE", exchange=Exchange.NSE, instrument_type=InstrumentType.EQUITY, asset_class=AssetClass.EQUITY, instrument_id="NSE:RELIANCE")
+    nifty_call_inst = Instrument(symbol="NIFTY23DEC25000CE", exchange=Exchange.NFO, instrument_type=InstrumentType.OPTION, asset_class=AssetClass.EQUITY, option_type="CE", strike_price=25000, expiry_date=datetime(2023,12,28), underlying_symbol_key="NSE:NIFTY INDEX", instrument_id="NFO:NIFTY23DEC25000CE")
 
-    # Example instrument (using token as per Finvasia logs)
-    nifty_idx = Instrument(
-        symbol="NIFTY", # Symbol for reference
-        token="26000",  # Token used in Finvasia feed
-        exchange=Exchange.NSE,
-        instrument_type=InstrumentType.INDEX,
-        asset_class=AssetClass.INDEX,
-        instrument_id="NSE:26000" # Consistent ID
-    )
-    nifty_key = data_manager._get_symbol_key(nifty_idx) # Should produce "NSE:26000"
+    print("\n--- Test 1: Strategy subscribes to timeframe ---")
+    dm.subscribe_to_timeframe(instrument=reliance_inst, timeframe="1m", strategy_id="StrategyA")
+    # Expected: reliance_inst feed subscribed (count=1), StrategyA in symbol_subscribers for NSE:RELIANCE -> 1m
+    print(f"Reliance feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:RELIANCE')}")
+    print(f"StrategyA subscribers for Reliance 1m: {'StrategyA' in dm.symbol_subscribers.get('NSE:RELIANCE',{}).get('1m',{})}")
 
-    nifty_opt = Instrument(
-        symbol="NIFTY25MAY...", # Full symbol if available
-        token="38605",
-        exchange=Exchange.NFO,
-        instrument_type=InstrumentType.OPTION,
-        asset_class=AssetClass.OPTIONS,
-        instrument_id="NFO:38605",        
-        strike=24500, # Example strike
-        expiry_date=datetime(2025, 5, 29), # Example expiry
-        option_type="CALL", # Example type
-        symbol_key="NSE:26000" # Link to underlying
-    )
-    opt_key = data_manager._get_symbol_key(nifty_opt) # Should produce "NFO:38605"
+    print("\n--- Test 2: Another strategy subscribes to same timeframe ---")
+    dm.subscribe_to_timeframe(instrument=reliance_inst, timeframe="1m", strategy_id="StrategyB")
+    # Expected: reliance_inst feed still subscribed (count=2), StrategyB also in symbol_subscribers
+    print(f"Reliance feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:RELIANCE')}")
+    print(f"StrategyB subscribers for Reliance 1m: {'StrategyB' in dm.symbol_subscribers.get('NSE:RELIANCE',{}).get('1m',{})}")
 
+    print("\n--- Test 3: OptionManager subscribes to underlying (NIFTY INDEX) ---")
+    dm.subscribe_instrument(nifty_inst)
+    # Expected: nifty_inst feed subscribed (count=1)
+    print(f"NIFTY INDEX feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:NIFTY INDEX')}")
 
-    # Subscribe strategies
-    data_manager.subscribe_to_timeframe(nifty_idx, '1m', 'StrategyA')
-    data_manager.subscribe_to_timeframe(nifty_opt, '1m', 'StrategyB') # Subscribe option strategy
+    print("\n--- Test 4: Strategy subscribes to NIFTY INDEX timeframe ---")
+    dm.subscribe_to_timeframe(instrument=nifty_inst, timeframe="5m", strategy_id="StrategyC")
+    # Expected: nifty_inst feed still subscribed (count=2), StrategyC in symbol_subscribers for NSE:NIFTY INDEX -> 5m
+    print(f"NIFTY INDEX feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:NIFTY INDEX')}")
+    print(f"StrategyC subscribers for NIFTY INDEX 5m: {'StrategyC' in dm.symbol_subscribers.get('NSE:NIFTY INDEX',{}).get('5m',{})}")
 
+    print("\n--- Test 5: OptionManager subscribes to an option (NIFTY CALL) ---")
+    dm.subscribe_instrument(nifty_call_inst)
+    # Expected: nifty_call_inst feed subscribed (count=1)
+    print(f"NIFTY CALL feed subscribers: {dm.instrument_feed_subscribers_count.get('NFO:NIFTY23DEC25000CE')}")
 
-    # Simulate MarketDataEvents (Ticks - converted format)
-    print("\n--- Simulating Ticks (Converted Format) ---")
-    start_ts = time.time()
+    print("\n--- Test 6: StrategyA unsubscribes from Reliance 1m ---")
+    dm.unsubscribe_from_timeframe(instrument=reliance_inst, timeframe="1m", strategy_id="StrategyA")
+    # Expected: reliance_inst feed still subscribed (count=1), StrategyA removed
+    print(f"Reliance feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:RELIANCE')}")
+    print(f"StrategyA subscribers for Reliance 1m: {'StrategyA' in dm.symbol_subscribers.get('NSE:RELIANCE',{}).get('1m',{})}")
 
-    # Tick 1 for Nifty Index
-    tick1_nifty = MarketDataEvent(
-        event_type=EventType.MARKET_DATA,
-        instrument=nifty_idx,
-        timestamp=start_ts + 5,
-        data={
-            MarketDataType.LAST_PRICE.value: 24269.90,
-            MarketDataType.TIMESTAMP.value: start_ts + 5,
-            # Volume for index is often 0 or not applicable for bar volume
-            MarketDataType.VOLUME.value: 0, # Feed handler puts cumulative here
-            'symbol_key': nifty_key # Added by _on_market_data
-        }
-    )
-    data_manager._on_market_data(tick1_nifty)
-    time.sleep(0.01)
+    print("\n--- Test 7: StrategyB unsubscribes from Reliance 1m ---")
+    dm.unsubscribe_from_timeframe(instrument=reliance_inst, timeframe="1m", strategy_id="StrategyB")
+    # Expected: reliance_inst feed unsubscribed (count=0), symbol_subscribers for NSE:RELIANCE removed
+    print(f"Reliance feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:RELIANCE')}") # Should be 0
+    print(f"Reliance in active_subscriptions: {'NSE:RELIANCE' in dm.active_subscriptions}") # Should be False
+    print(f"Symbol subscribers for Reliance: {dm.symbol_subscribers.get('NSE:RELIANCE')}") # Should be None or empty
 
-    # Tick 1 for Nifty Option
-    tick1_opt = MarketDataEvent(
-        event_type=EventType.MARKET_DATA,
-        instrument=nifty_opt,
-        timestamp=start_ts + 6,
-        data={
-            MarketDataType.LAST_PRICE.value: 208.90,
-            MarketDataType.TIMESTAMP.value: start_ts + 6,
-            MarketDataType.VOLUME.value: 64032750, # Cumulative volume from feed
-            MarketDataType.OPEN_INTEREST.value: 500000, # Example OI
-            'symbol_key': opt_key
-        }
-    )
-    data_manager._on_market_data(tick1_opt)
-    time.sleep(0.01)
+    print("\n--- Test 8: OptionManager unsubscribes from NIFTY CALL ---")
+    dm.unsubscribe_instrument(nifty_call_inst)
+    print(f"NIFTY CALL feed subscribers: {dm.instrument_feed_subscribers_count.get('NFO:NIFTY23DEC25000CE')}") # Should be 0
+    print(f"NIFTY CALL in active_subscriptions: {'NFO:NIFTY23DEC25000CE' in dm.active_subscriptions}") # Should be False
 
-    # Tick 2 for Nifty Index (completes 1m bar if start_ts was near minute start)
-    tick2_nifty = MarketDataEvent(
-        event_type=EventType.MARKET_DATA,
-        instrument=nifty_idx,
-        timestamp=start_ts + 65,
-        data={
-            MarketDataType.LAST_PRICE.value: 24275.00,
-            MarketDataType.TIMESTAMP.value: start_ts + 65,
-            MarketDataType.VOLUME.value: 0,
-            'symbol_key': nifty_key
-        }
-    )
-    data_manager._on_market_data(tick2_nifty)
-    time.sleep(0.01)
+    print("\n--- Test 9: StrategyC unsubscribes from NIFTY INDEX 5m ---")
+    dm.unsubscribe_from_timeframe(instrument=nifty_inst, timeframe="5m", strategy_id="StrategyC")
+    # Expected: NIFTY INDEX feed still subscribed (count=1, due to OptionManager's earlier subscribe_instrument)
+    print(f"NIFTY INDEX feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:NIFTY INDEX')}")
 
-    # Tick 2 for Nifty Option (completes 1m bar)
-    tick2_opt = MarketDataEvent(
-        event_type=EventType.MARKET_DATA,
-        instrument=nifty_opt,
-        timestamp=start_ts + 70,
-        data={
-            MarketDataType.LAST_PRICE.value: 210.00,
-            MarketDataType.TIMESTAMP.value: start_ts + 70,
-            MarketDataType.VOLUME.value: 64035150, # Increased cumulative volume
-            MarketDataType.OPEN_INTEREST.value: 500500, # Changed OI
-            'symbol_key': opt_key
-        }
-    )
-    data_manager._on_market_data(tick2_opt)
-    time.sleep(0.1) # Allow time for processing
+    print("\n--- Test 10: OptionManager unsubscribes from NIFTY INDEX ---")
+    dm.unsubscribe_instrument(nifty_inst)
+    # Expected: NIFTY INDEX feed unsubscribed (count=0)
+    print(f"NIFTY INDEX feed subscribers: {dm.instrument_feed_subscribers_count.get('NSE:NIFTY INDEX')}") # Should be 0
+    print(f"NIFTY INDEX in active_subscriptions: {'NSE:NIFTY INDEX' in dm.active_subscriptions}") # Should be False
 
-
-    # Wait for queue processing (in real app, threads run continuously)
-    print("\nWaiting for queue processing...")
-    # In a real system, you wouldn't join the queue like this.
-    # Instead, you'd query data or rely on published events.
-    # For this example, we simulate waiting.
-    time.sleep(1) # Give threads time to process
-
-
-    print("\n--- Querying Data ---")
-    # Get current bar (might be empty if last tick completed a bar)
-    current_1m_nifty = data_manager.get_current_bar(nifty_key, '1m')
-    print(f"Current 1m bar for {nifty_key}: {current_1m_nifty}")
-    current_1m_opt = data_manager.get_current_bar(opt_key, '1m')
-    print(f"Current 1m bar for {opt_key}: {current_1m_opt}")
-
-
-    # Get historical bars
-    hist_1m_nifty = data_manager.get_historical_data(nifty_key, '1m', n_bars=5)
-    print(f"\nHistorical 1m bars for {nifty_key}:\n{hist_1m_nifty}")
-
-    hist_1m_opt = data_manager.get_historical_data(opt_key, '1m', n_bars=5)
-    print(f"\nHistorical 1m bars for {opt_key}:\n{hist_1m_opt}")
-
-
-    # Get latest tick (converted format)
-    latest_tick_nifty = data_manager.get_latest_tick(nifty_key)
-    print(f"\nLatest Converted Tick for {nifty_key}: {latest_tick_nifty}")
-    latest_tick_opt = data_manager.get_latest_tick(opt_key)
-    print(f"\nLatest Converted Tick for {opt_key}: {latest_tick_opt}")
-
-
-    # Shutdown
-    print("\n--- Shutting Down ---")
-    try:
-        data_manager.close()
-    except Exception as e:
-        print(f"Error during shutdown: {e}")
+    dm.shutdown()

@@ -406,7 +406,7 @@ def main() -> int:
                 config, 
                 strategy_config
             )
-        elif args.mode == 'live':
+        elif args.mode == 'live' or args.mode == 'paper':
             return run_live_mode(
                 config, 
                 strategy_config

@@ -302,7 +302,7 @@ class SymbolCache:
                 # Clean up temporary directory
                 if temp_dir.exists():
                     try:
-                        #shutil.rmtree(temp_dir)
+                        shutil.rmtree(temp_dir)
                         self.logger.debug(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         self.logger.error(f"Error cleaning up temp directory {temp_dir}: {e}")

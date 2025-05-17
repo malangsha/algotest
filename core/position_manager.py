@@ -139,7 +139,7 @@ class PositionManager:
         if 'LAST_PRICE' in data and data['LAST_PRICE'] is not None:
             try:
                 price = float(data['LAST_PRICE'])
-                self.logger.debug(f"Found price {price} in LAST_PRICE for {symbol}")
+                # self.logger.debug(f"Found price {price} in LAST_PRICE for {symbol}")
             except (ValueError, TypeError):
                 self.logger.warning(f"Invalid LAST_PRICE value for {symbol}: {data['LAST_PRICE']}")
                 price = None # Reset price if conversion fails
@@ -162,7 +162,7 @@ class PositionManager:
                 ask = float(data['ASK'])
                 if bid > 0 and ask > 0: # Ensure bid/ask are valid
                     price = (bid + ask) / 2
-                    self.logger.debug(f"Calculated mid price {price} from bid/ask for {symbol}")
+                    # self.logger.debug(f"Calculated mid price {price} from bid/ask for {symbol}")
             except (ValueError, TypeError):
                 self.logger.warning(f"Invalid BID/ASK values for {symbol}: {data['BID']}/{data['ASK']}")
                 price = None
@@ -173,7 +173,7 @@ class PositionManager:
             self.logger.warning(f"Could not extract a valid price for {symbol} from event data: {data}") 
             return
 
-        self.logger.info(f"Updating price for {symbol}: {price}")
+        # self.logger.info(f"Updating price for {symbol}: {price}")
 
         # Update the latest price
         self.latest_prices[instrument] = price

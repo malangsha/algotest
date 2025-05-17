@@ -10,14 +10,17 @@ This module handles option-specific functionality including:
 
 import threading
 from typing import Dict, List, Set, Optional, Tuple, Any
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta as dt_time 
 import time
 import numpy as np
 from functools import lru_cache
+from collections import defaultdict
 
 from models.instrument import Instrument, AssetClass
 from core.event_manager import EventManager
-from utils.constants import OptionType, Exchange, InstrumentType, NSE_INDICES, BSE_INDICES, MarketDataType, SYMBOL_MAPPINGS
+from utils.constants import (OptionType, 
+        Exchange, InstrumentType, NSE_INDICES, 
+        BSE_INDICES, MarketDataType, SYMBOL_MAPPINGS)
 from core.logging_manager import get_logger
 from models.events import MarketDataEvent, OptionsSubscribedEvent
 from core.event_manager import EventType
@@ -45,143 +48,172 @@ class OptionManager:
         self.position_manager = position_manager # Store position manager
         self.config = config
         
-        # Dictionaries to store option data and subscriptions
-        self.underlying_prices = {}  # symbol -> current price
-        self.underlying_subscriptions = set()  # Set of subscribed underlyings
-        self.option_subscriptions = {}  # underlying_symbol -> {option_symbols}
-        self.option_chain_data = {}  # underlying_symbol -> {expiry -> {strike -> {CE/PE -> option_info}}}
+        self.underlying_prices: Dict[str, float] = {}
+        self._subscribed_underlyings: Set[str] = set()
+        # underlying_symbol -> {option_instrument_id -> Instrument object}
+        self.option_subscriptions: Dict[str, Dict[str, Instrument]] = defaultdict(dict) 
+        self.option_chain_data: Dict[str, Dict[Any, Any]] = {}
         
         # ATM strike tracking
-        self.current_atm_strikes = {}  # underlying_symbol -> current ATM strike
-        self.strike_intervals = {}  # underlying_symbol -> strike interval
-        self.atm_ranges = {}  # underlying_symbol -> number of strikes around ATM to maintain
-        
+        self.current_atm_strikes: Dict[str, float] = {}
+        self.strike_intervals: Dict[str, float] = {}
+        self.atm_ranges: Dict[str, int] = {}
+
+        # Hysteresis buffer parameters
+        self.buffer_strikes_factor = config.get('options', {}).get('buffer_strikes_factor', 0.3)  # Default 30% of strike interval
+        self.debounce_ms = config.get('options', {}).get('debounce_ms', 500)  # Default 500ms debounce
+        self.pending_atm_updates: Dict[str, Dict[str, Any]] = {}  # Symbol -> update info
+        self.pending_timers: Dict[str, threading.Timer] = {}  # Symbol -> timer
+
+        # Add cache for constructed option symbols to prevent duplicates
+        self.recently_constructed_symbols: Dict[str, Set[str]] = defaultdict(set)  # underlying -> set of symbols
+        # Add expiry of recently constructed symbols (in seconds)
+        self.symbol_cache_expiry = config.get('options', {}).get('symbol_cache_expiry', 60)  # Default 10 seconds
+        self.symbol_cache_timestamps: Dict[str, Dict[str, float]] = defaultdict(dict)  # underlying -> {symbol -> timestamp}
+
         # Option data cache
-        self.option_data_cache = {}  # option_symbol -> latest data
-        
-        # Lock for thread safety
+        self.option_data_cache: Dict[str, Dict[str, Any]] = {}
         self.lock = threading.RLock()
         
         # Configure LRU cache for frequently used calculations
-        self.get_atm_strike = lru_cache(maxsize=cache_size)(self._get_atm_strike_internal)
-        # self.get_option_symbol = lru_cache(maxsize=cache_size)(self._get_option_symbol)
+        self._get_atm_strike = lru_cache(maxsize=cache_size)(self._get_atm_strike_internal)
         
         # Underlying configurations
         market_config = config.get('market', {})
         underlyings_config = market_config.get('underlyings', [])       
-        
-        # Initialize underlyings dictionary
-        self.underlyings = {}
-
-        # Process underlyings config (improved handling)
+        self.underlyings: Dict[str, Dict[str, Any]] = {}
         self._process_underlyings_config(underlyings_config) 
             
-        # Track subscribed underlyings
-        self._subscribed_underlyings: Set[str] = set()
-       
-        # Commented out for now as we are using the strategy manager to receive market data events
-        self.event_manager.subscribe(EventType.MARKET_DATA, self._on_market_data)
+        self.event_manager.subscribe(EventType.MARKET_DATA, self._on_market_data, component_name="OptionManager")
         
         self.logger.info("Option Manager initialized")
     
     def _process_underlyings_config(self, underlyings_config: List[Dict[str, Any]]):
-        """Helper to process underlying configurations from list."""
         if not isinstance(underlyings_config, list):
             self.logger.error("Underlyings configuration is not a list. Please check config.yaml.")
             return
 
         for underlying_config in underlyings_config:
-            # Handle both old ('symbol') and new ('name') format for the underlying identifier
-            symbol = underlying_config.get('name', underlying_config.get('symbol'))
+            symbol = underlying_config.get("name", underlying_config.get("symbol"))
             if not symbol:
                 self.logger.warning(f"Skipping underlying config without name/symbol: {underlying_config}")
                 continue
 
-            # Extract exchanges with support for both old and new format
-            spot_exchange_str = underlying_config.get('spot_exchange', underlying_config.get('exchange'))
-            option_exchange_str = underlying_config.get('option_exchange', underlying_config.get('derivative_exchange'))
+            spot_exchange_str = underlying_config.get("spot_exchange", underlying_config.get("exchange"))
+            option_exchange_str = underlying_config.get("option_exchange", underlying_config.get("derivative_exchange"))
 
-            # Set default exchanges if not provided, based on known indices
             if not spot_exchange_str:
                 if symbol in NSE_INDICES: spot_exchange_str = Exchange.NSE.value
                 elif symbol in BSE_INDICES: spot_exchange_str = Exchange.BSE.value
-                else: spot_exchange_str = 'NSE' # Default fallback
+                else: spot_exchange_str = "NSE"
             if not option_exchange_str:
                 if symbol in NSE_INDICES: option_exchange_str = Exchange.NFO.value
                 elif symbol in BSE_INDICES: option_exchange_str = Exchange.BFO.value
-                else: option_exchange_str = 'NFO' # Default fallback
-
-            # Convert exchange strings to Enum members
+                else: option_exchange_str = "NFO"
             try:
                 spot_exchange = Exchange(spot_exchange_str)
             except ValueError:
-                self.logger.warning(f"Invalid spot exchange '{spot_exchange_str}' for {symbol}, using fallback.")
+                self.logger.warning(f"Invalid spot exchange 	'{spot_exchange_str}	' for {symbol}, using fallback.")
                 spot_exchange = Exchange.NSE if symbol in NSE_INDICES else Exchange.BSE if symbol in BSE_INDICES else Exchange.NSE
             try:
                 option_exchange = Exchange(option_exchange_str)
             except ValueError:
-                self.logger.warning(f"Invalid option exchange '{option_exchange_str}' for {symbol}, using fallback.")
+                self.logger.warning(f"Invalid option exchange 	'{option_exchange_str}	' for {symbol}, using fallback.")
                 option_exchange = Exchange.NFO if symbol in NSE_INDICES else Exchange.BFO if symbol in BSE_INDICES else Exchange.NFO
 
+            strike_interval = underlying_config.get("strike_interval", 50.0 if "NIFTY" in symbol else 100.0)
+            atm_range = underlying_config.get("atm_range", 1) 
 
-            strike_interval = underlying_config.get('strike_interval', 50)
-            atm_range = underlying_config.get('atm_range', 1) # Default ATM range from logs
-
-            # Store unified config
             self.underlyings[symbol] = {
-                'symbol': symbol,
-                'exchange': spot_exchange,
-                'derivative_exchange': option_exchange,
-                'strike_interval': strike_interval,
-                'atm_range': atm_range,
-                # Copy other potential fields
+                "symbol": symbol,
+                "exchange": spot_exchange,
+                "derivative_exchange": option_exchange,
+                "strike_interval": float(strike_interval),
+                "atm_range": int(atm_range),
                 **{k: v for k, v in underlying_config.items() if k not in
-                   ['name', 'symbol', 'spot_exchange', 'exchange', 'option_exchange', 'derivative_exchange', 'strike_interval', 'atm_range']}
+                   ["name", "symbol", "spot_exchange", "exchange", "option_exchange", "derivative_exchange", "strike_interval", "atm_range"]}
             }
-            # Store strike interval separately for quick lookup
-            self.strike_intervals[symbol] = strike_interval
-            self.atm_ranges[symbol] = atm_range
+            self.strike_intervals[symbol] = float(strike_interval)
+            self.atm_ranges[symbol] = int(atm_range)
+            self.logger.info(f"Configured underlying {symbol} with strike interval {strike_interval}, ATM range {atm_range}, spot exch {spot_exchange.value}, option exch {option_exchange.value}")
 
-            self.logger.info(f"Configured underlying {symbol} with strike interval {strike_interval}, ATM range {atm_range}, exchange {spot_exchange.value}, and derivative exchange {option_exchange.value}")
+    def _cancel_pending_atm_update(self, underlying_symbol: str) -> None:
+       """Cancel any pending ATM update for the given underlying."""
+       with self.lock:
+           timer = self.pending_timers.pop(underlying_symbol, None)
+           if timer:
+               timer.cancel()
+               self.logger.debug(f"Cancelled pending ATM update for {underlying_symbol}")
+           # Also remove from pending updates
+           self.pending_atm_updates.pop(underlying_symbol, None)
+    
+    def _schedule_atm_update(self, underlying_symbol: str, new_atm: float, price: float) -> None:
+       """Schedule an ATM update with debounce logic."""
+       with self.lock:
+           # Cancel any existing timer for this underlying
+           self._cancel_pending_atm_update(underlying_symbol)
+           
+           # Create update info dictionary
+           update_info = {
+               'new_atm': new_atm,
+               'price': price,
+               'timestamp': time.time()
+           }
+           self.pending_atm_updates[underlying_symbol] = update_info
+           
+           # Create and start a new timer
+           timer = threading.Timer(self.debounce_ms / 1000.0, self._process_atm_update, args=[underlying_symbol])
+           timer.daemon = True  # Allow the program to exit even if the timer is still running
+           self.pending_timers[underlying_symbol] = timer
+           timer.start()
+           self.logger.debug(f"Scheduled ATM update for {underlying_symbol} in {self.debounce_ms}ms: {new_atm} (price: {price:.2f})")
+    
+    def _process_atm_update(self, underlying_symbol: str) -> None:
+        """Process the pending ATM update after the debounce period."""
+        with self.lock:
+            # Check if the update is still pending (not cancelled)
+            update_info = self.pending_atm_updates.pop(underlying_symbol, None)
+            if not update_info:
+                return  # Already cancelled or processed
+            
+            # Clean up the timer
+            self.pending_timers.pop(underlying_symbol, None)
+            
+            # Get the cached values
+            new_atm = update_info['new_atm']
+            price = update_info['price']
+            old_atm = self.current_atm_strikes.get(underlying_symbol)
+            
+            # Update the current ATM strike
+            self.logger.info(f"Processing delayed ATM strike change for {underlying_symbol}. "
+                             f"Price: {price:.2f}, Old ATM: {old_atm}, New ATM: {new_atm}")
+            
+            # Store the new ATM strike
+            self.current_atm_strikes[underlying_symbol] = new_atm
+            
+            # Perform the subscription update
+            self._update_atm_subscriptions(underlying_symbol, new_atm, old_atm)
 
     def configure_underlyings(self, underlyings_config: List[Dict[str, Any]]):
-        """
-        Configure underlyings from the provided configuration. (Can be called again if needed)
-
-        Args:
-            underlyings_config: List of underlying configurations.
-        """
         with self.lock:
             self._process_underlyings_config(underlyings_config)
     
     def subscribe_underlying(self, underlying_symbol: str) -> bool:
-        """
-        Subscribe to an underlying for market data.
-
-        Args:
-            underlying_symbol: Underlying symbol (e.g., "NIFTY INDEX") to subscribe to.
-
-        Returns:
-            bool: True if subscription successful or already subscribed, False otherwise.
-        """
+        """Uses DataManager.subscribe_instrument (Item 2.1 from todo.md)"""
         if underlying_symbol in self._subscribed_underlyings:
-            # self.logger.info(f"Already subscribed to underlying {underlying_symbol}")
             return True
-
         try:
             underlying_config = self.underlyings.get(underlying_symbol)
             if not underlying_config:
                 self.logger.error(f"No configuration found for underlying {underlying_symbol}")
                 return False
 
-            exchange = underlying_config.get('exchange') # Should be an Enum now
+            exchange = underlying_config.get("exchange")
             if not isinstance(exchange, Exchange):
                  self.logger.error(f"Invalid exchange configuration for {underlying_symbol}")
                  return False
 
-            # Create instrument for the underlying
-            # Determine instrument type and asset class (basic heuristic)
-            instrument_type = InstrumentType.INDEX if underlying_symbol in NSE_INDICES or underlying_symbol in BSE_INDICES else InstrumentType.EQUITY
+            instrument_type = InstrumentType.INDEX if underlying_symbol in SYMBOL_MAPPINGS.get("indices", []) else InstrumentType.EQUITY
             asset_class = AssetClass.INDEX if instrument_type == InstrumentType.INDEX else AssetClass.EQUITY
 
             instrument = Instrument(
@@ -189,170 +221,228 @@ class OptionManager:
                 exchange=exchange,
                 instrument_type=instrument_type,
                 asset_class=asset_class,
-                # Use DataManager's preferred key format if available, else construct one
-                instrument_id=f"{exchange.value}:{underlying_symbol}"
+                instrument_id=f"{exchange.value}:{underlying_symbol}" # Ensure consistent key format
             )
-
-            # Subscribe using DataManager's generic subscribe method
-            # DataManager needs to handle the actual broker/feed subscription
-            if self.data_manager.subscribe(instrument): # Pass the full Instrument object
+            # MODIFIED: Use DataManager's specific method for instrument feed subscription
+            if self.data_manager.subscribe_instrument(instrument):
                 self._subscribed_underlyings.add(underlying_symbol)
-                self.logger.info(f"Successfully subscribed to underlying {underlying_symbol}")
+                self.logger.info(f"OptionManager: Successfully requested DataManager to subscribe to underlying feed {underlying_symbol}")
                 return True
             else:
-                self.logger.error(f"DataManager failed to subscribe to underlying {underlying_symbol}")
+                self.logger.error(f"OptionManager: DataManager failed to subscribe to underlying feed {underlying_symbol}")
                 return False
-
         except Exception as e:
             self.logger.error(f"Error subscribing to underlying {underlying_symbol}: {e}", exc_info=True)
             return False
             
     def _on_market_data(self, event: MarketDataEvent):
-        """
-        Handle market data events. Filters for relevant underlyings or options.
-
-        Args:
-            event: Market data event
-        """
         if not isinstance(event, MarketDataEvent) or not event.instrument:
-            # self.logger.debug("Received non-market data or event without instrument")
             return
 
         instrument = event.instrument
-        symbol = instrument.symbol # e.g., "NIFTY INDEX" or "NIFTY08MAY25C24350"
-        symbol_key = event.data.get('symbol_key') # e.g., "NSE:NIFTY INDEX" or "NFO:NIFTY08MAY25C24350"
+        symbol = instrument.symbol
+        symbol_key = event.data.get("symbol_key", self.data_manager._get_symbol_key(instrument)) # Ensure symbol_key
 
-        if not symbol_key:
-            self.logger.warning(f"MarketDataEvent for {symbol} missing 'symbol_key'. Cannot process.")
+        if not symbol_key or symbol_key.startswith("INVALID:"):
+            self.logger.warning(f"MarketDataEvent for {symbol} missing valid symbol_key. Cannot process.")
             return
 
-        # self.logger.debug(f"Received MarketDataEvent for {symbol_key}")
-
-        # Check if it's one of the underlyings we are managing
-        if symbol in self._subscribed_underlyings:
-            # Process underlying market data
+        if symbol in self._subscribed_underlyings: # Check against simple symbol name for underlyings
             self._process_underlying_data(symbol, event.data)
-
-        # Check if it's one of the options we have subscribed to
-        elif any(symbol_key in sub_dict for sub_dict in self.option_subscriptions.values()):
-             # Cache the latest option data
+        elif symbol_key in self.option_data_cache: # Check against symbol_key for options
              self.option_data_cache[symbol_key] = event.data
-             # self.logger.debug(f"Updated option cache for {symbol_key}")
-             # Note: We don't trigger ATM updates from option ticks, only underlying ticks.
             
     def _process_underlying_data(self, underlying_symbol: str, data: Dict):
-        """
-        Process market data for a managed underlying. Updates price and checks ATM.
-
-        Args:
-            underlying_symbol: Underlying symbol (e.g., "NIFTY INDEX")
-            data: Market data dictionary (MarketDataEvent.data)
-        """
-        # Extract raw price from the standardized keys
-        raw_price = data.get(
-            MarketDataType.LAST_PRICE.value,
-            data.get('LAST_PRICE', data.get('CLOSE'))
-        )
-        if raw_price is None:
-            return
-
-        # 1) Convert to float (only catch conversion errors here)
+        raw_price = data.get(MarketDataType.LAST_PRICE.value, data.get("LAST_PRICE", data.get("CLOSE")))
+        if raw_price is None: return
         try:
-            # handle strings with commas, ints, floats, etc.
-            if isinstance(raw_price, str):
-                price_clean = raw_price.replace(',', '')
-                price_float = float(price_clean)
-            else:
-                price_float = float(raw_price)
+            price_float = float(str(raw_price).replace(",", ""))
         except (ValueError, TypeError) as conv_err:
-            self.logger.warning(
-                f"Could not convert price {raw_price!r} (type {type(raw_price)}) "
-                f"to float for {underlying_symbol}: {conv_err}"
-            )
+            self.logger.warning(f"Could not convert price {raw_price!r} for {underlying_symbol}: {conv_err}")
             return
-
-        # 2) Now update the underlying price and catch _its_ errors separately
         try:
             self.update_underlying_price(underlying_symbol, price_float)
         except Exception as upd_err:
-            # This is truly an update/ATM‐logic error, not a conversion error
-            self.logger.error(
-                f"Error in update_underlying_price for {underlying_symbol} "
-                f"with price {price_float}: {upd_err}"
-            )
-
-    # def _process_underlying_data(self, underlying_symbol: str, data: Dict):
-    #     """
-    #     Process market data for a managed underlying. Updates price and checks ATM.
-
-    #     Args:
-    #         underlying_symbol: Underlying symbol (e.g., "NIFTY INDEX")
-    #         data: Market data dictionary (MarketDataEvent.data)
-    #     """
-    #     # Use standard MarketDataType keys if available, fallback to original keys
-    #     price = data.get(MarketDataType.LAST_PRICE.value, data.get('LAST_PRICE', data.get('CLOSE')))
-
-    #     if price is not None:
-    #         try:
-    #             # Add explicit type conversion - handle both numeric and string formats
-    #             if isinstance(price, (int, float)):
-    #                 price_float = float(price)
-    #             else:
-    #                 # For string representation, handle comma-separated numbers
-    #                 price_str = str(price).replace(',', '')
-    #                 price_float = float(price_str)
-                
-    #             # Update underlying price cache and check if ATM strike needs updating
-    #             self.update_underlying_price(underlying_symbol, price_float)
-    #         except (ValueError, TypeError) as e:
-    #             self.logger.warning(f"Could not convert price '{price}' (type: {type(price)}) to float for {underlying_symbol}: {e}")
-    #     # else:
-    #         # self.logger.debug(f"No price found in data for {underlying_symbol}: {data.keys()}")
+            self.logger.error(f"Error in update_underlying_price for {underlying_symbol} price {price_float}: {upd_err}", exc_info=True)
             
-    def update_underlying_price(self, underlying_symbol: str, price: float) -> None:
-        """
-        Update the cached underlying price and check if ATM strikes need to be updated.
-        This is the main trigger for subscribing/unsubscribing options.
-
-        Args:
-            underlying_symbol: The underlying symbol (e.g., "NIFTY INDEX")
-            price: The current price of the underlying
-        """
+    def _clean_expired_symbol_cache(self, underlying_symbol: str = None) -> None:
+        """Clean expired symbols from the cache"""
+        now = time.time()
         with self.lock:
+            if underlying_symbol:
+                # Clean only for specific underlying
+                symbols_to_remove = []
+                for symbol, timestamp in self.symbol_cache_timestamps.get(underlying_symbol, {}).items():
+                    if now - timestamp > self.symbol_cache_expiry:
+                        symbols_to_remove.append(symbol)
+
+                for symbol in symbols_to_remove:
+                    self.symbol_cache_timestamps[underlying_symbol].pop(symbol, None)
+                    if symbol in self.recently_constructed_symbols.get(underlying_symbol, set()):
+                        self.recently_constructed_symbols[underlying_symbol].remove(symbol)
+            else:
+                # Clean for all underlyings
+                for underlying in list(self.symbol_cache_timestamps.keys()):
+                    self._clean_expired_symbol_cache(underlying)
+    
+    def update_underlying_price(self, underlying_symbol: str, price: float) -> None:
+        with self.lock:
+            # Clean expired symbols from cache
+            self._clean_expired_symbol_cache(underlying_symbol)
+
             old_price = self.underlying_prices.get(underlying_symbol)
             self.underlying_prices[underlying_symbol] = price
 
             if underlying_symbol not in self.strike_intervals:
-                # self.logger.warning(f"Cannot update ATM for {underlying_symbol}: strike interval not configured")
-                return # Config likely not loaded yet or symbol not managed
+                return
 
             strike_interval = self.strike_intervals[underlying_symbol]
-
-            # Calculate potential new ATM strike
+            buffer_strikes = strike_interval * self.buffer_strikes_factor
             new_atm = self._get_atm_strike_internal(price, strike_interval)
             old_atm = self.current_atm_strikes.get(underlying_symbol)
 
-            # If it's the first price update for this underlying
-            if old_price is None:
-                self.logger.info(f"First price received for {underlying_symbol}: {price:.2f}, ATM strike: {new_atm}")
+            # Initial price or ATM setting (no hysteresis needed)
+            if old_price is None or old_atm is None:
+                self.logger.info(f"Initial ATM strike set for {underlying_symbol}. "
+                                f"Price: {price:.2f}, ATM: {new_atm}")
                 self.current_atm_strikes[underlying_symbol] = new_atm
-                # Trigger initial subscription to ATM options
-                self.subscribe_atm_options(underlying_symbol) # Will publish event if successful
-            # If ATM strike has changed
-            elif old_atm != new_atm:
-                self.logger.info(f"ATM strike for {underlying_symbol} changed from {old_atm} to {new_atm} (Price: {price:.2f})")
-                self.current_atm_strikes[underlying_symbol] = new_atm
-                # Update option subscriptions based on the new ATM strike
-                self.update_atm_options(underlying_symbol) # Will publish event if successful
-    
-    # Renamed to avoid conflict with cached method
+                self._update_atm_subscriptions(underlying_symbol, new_atm, None)
+                return
+
+            # Check if there's a significant ATM change beyond half the strike interval
+            # This preserves the original behavior but adds hysteresis
+            if new_atm != old_atm:
+                # Calculate thresholds for hysteresis
+                upper_threshold = old_atm + buffer_strikes
+                lower_threshold = old_atm - buffer_strikes
+
+                # Check if price has moved beyond the thresholds
+                if (price >= upper_threshold and new_atm > old_atm) or (price <= lower_threshold and new_atm < old_atm):
+                    # Check if we already have a pending update for the same new ATM value
+                    pending_update = self.pending_atm_updates.get(underlying_symbol)
+                    if pending_update and pending_update['new_atm'] == new_atm:
+                        # We already have a pending update for this exact ATM value, ignore this one
+                        self.logger.debug(f"Ignoring duplicate ATM update for {underlying_symbol}. "
+                                         f"Already pending update to {new_atm}")
+                        return
+
+                    # Price has crossed a threshold, schedule an update with debounce
+                    self.logger.debug(f"Threshold crossed for {underlying_symbol}. "
+                                     f"Price: {price:.2f}, Old ATM: {old_atm}, New ATM: {new_atm}, "
+                                     f"Thresholds: [{lower_threshold:.2f}, {upper_threshold:.2f}]")
+                    self._schedule_atm_update(underlying_symbol, new_atm, price)
+                else:
+                    # Price is within thresholds, cancel any pending updates if it reversed direction
+                    pending_update = self.pending_atm_updates.get(underlying_symbol)
+                    if pending_update and ((pending_update['new_atm'] > old_atm and new_atm <= old_atm) or
+                                          (pending_update['new_atm'] < old_atm and new_atm >= old_atm)):
+                        self.logger.debug(f"Price reversed direction for {underlying_symbol}, cancelling pending update")
+                        self._cancel_pending_atm_update(underlying_symbol)
+
     def _get_atm_strike_internal(self, price: float, strike_interval: float) -> float:
-        """Internal method to calculate ATM strike."""
-        if strike_interval <= 0:
-            self.logger.error(f"Invalid strike interval: {strike_interval}")
-            return price # Fallback
+        if strike_interval == 0: return price # Should not happen for options
         return round(price / strike_interval) * strike_interval
 
+    def _update_atm_subscriptions(self, underlying_symbol: str, new_atm_strike: float, old_atm_strike: Optional[float]):
+        """Uses DataManager.subscribe_instrument/unsubscribe_instrument (Item 2.2 from todo.md)"""
+        underlying_config = self.underlyings.get(underlying_symbol)
+        if not underlying_config: return
+
+        atm_range = self.atm_ranges.get(underlying_symbol, 1)
+        strike_interval = self.strike_intervals[underlying_symbol]
+        option_exchange = underlying_config["derivative_exchange"]
+        expiry_offset = underlying_config.get("expiry_offset", 0) # Default to current expiry
+        
+        # Check if data_manager and market_data_feed are available
+        if not hasattr(self.data_manager, 'market_data_feed') or not self.data_manager.market_data_feed:
+            self.logger.error(f"Cannot update ATM options: market data feed not available")
+            return             
+        market_data_feed = self.data_manager.market_data_feed
+        
+        # Use mapped symbol for broker interaction if necessary
+        mapped_underlying = SYMBOL_MAPPINGS.get(underlying_symbol, underlying_symbol)
+        expiry_dates = market_data_feed.get_expiry_dates(mapped_underlying) # Use mapped symbol if needed by feed
+        if not expiry_dates:
+            self.logger.error(f"No expiry dates found for {mapped_underlying}")
+            return None
+        
+        if expiry_offset >= len(expiry_dates):
+            self.logger.warning(f"Expiry offset {expiry_offset} out of range for {mapped_underlying}, using last available")
+            expiry_date = expiry_dates[-1]
+        else:
+            expiry_date = expiry_dates[expiry_offset]
+
+        newly_subscribed_instruments: List[Instrument] = []
+        current_option_keys_for_underlying = set(self.option_subscriptions.get(underlying_symbol, {}).keys())
+        needed_option_keys = set()
+        instrument_type = InstrumentType.OPTION.value
+
+        # Determine strikes to subscribe around the new ATM
+        for i in range(-atm_range, atm_range + 1):
+            strike = new_atm_strike + (i * strike_interval)
+            for option_type in ['CE', 'PE']:  # Call and Put options
+                # Get the broker-specific option symbol                   
+                self.logger.debug(f"calling construct_trading_symbol with symbol: {str(mapped_underlying)}, expriy_date: {expiry_date}, instrument_type: {instrument_type}, option_type: {option_type}, exchange: {str(option_exchange.value)}")           
+                option_instrument =  market_data_feed.construct_trading_symbol(
+                    symbol=str(mapped_underlying),
+                    expiry_date=expiry_date,
+                    instrument_type=instrument_type,
+                    strike=strike,
+                    option_type=option_type,
+                    exchange=str(option_exchange.value)
+                )
+                
+                if not option_instrument:
+                    self.logger.error(f"Failed to construct option symbol for {underlying_symbol} {strike} {option_type}")
+                    return None
+            
+                # Create the Instrument object
+                instrument = Instrument(
+                    symbol=option_instrument, # The actual trading symbol
+                    exchange=option_exchange,
+                    asset_class=AssetClass.OPTIONS,
+                    instrument_type=InstrumentType.OPTION,
+                    underlying_symbol=underlying_symbol, # Original underlying symbol
+                    strike=strike,
+                    option_type=option_type,
+                    expiry_date=expiry_date, # Store expiry date object
+                    # Use DataManager's preferred key format if available, else construct one
+                    instrument_id=f"{option_exchange.value}:{option_instrument}"
+                )
+
+                needed_option_keys.add(instrument.instrument_id)
+                if instrument.instrument_id not in current_option_keys_for_underlying:                    
+                    if self.data_manager.subscribe_instrument(instrument):
+                        self.option_subscriptions.setdefault(underlying_symbol, {})[instrument.instrument_id] = instrument
+                        self.option_data_cache[instrument.instrument_id] = {} # Initialize cache
+                        newly_subscribed_instruments.append(instrument)
+                        self.logger.info(f"OptionManager: Subscribed to new option feed: {instrument.instrument_id}")
+                    else:
+                        self.logger.error(f"OptionManager: DataManager failed to subscribe to option feed: {instrument.instrument_id}")
+        
+        # Unsubscribe from options no longer needed
+        options_to_unsubscribe = current_option_keys_for_underlying - needed_option_keys
+        for option_key_to_remove in list(options_to_unsubscribe): # Iterate over a copy
+            instrument_to_remove = self.option_subscriptions.get(underlying_symbol, {}).pop(option_key_to_remove, None)
+            if instrument_to_remove:
+                # MODIFIED: Use DataManager's specific method for instrument feed unsubscription
+                if self.data_manager.unsubscribe_instrument(instrument_to_remove):
+                    self.logger.info(f"OptionManager: Unsubscribed from option feed: {instrument_to_remove.instrument_id}")
+                    self.option_data_cache.pop(instrument_to_remove.instrument_id, None)
+                else:
+                    self.logger.error(f"OptionManager: DataManager failed to unsubscribe from option feed: {instrument_to_remove.instrument_id}")
+                    # If DM fails, put it back? Or assume DM handles its state?
+                    # For now, we proceed with removing from OM's tracking.
+            else:
+                self.logger.warning(f"Tried to unsubscribe {option_key_to_remove} but it was not in OM's subscriptions for {underlying_symbol}")
+
+        if newly_subscribed_instruments:
+            self.event_manager.publish(OptionsSubscribedEvent(
+                underlying_symbol=underlying_symbol,
+                instruments=newly_subscribed_instruments               
+            ))
+            self.logger.info(f"Published OptionsSubscribedEvent for {underlying_symbol} with {len(newly_subscribed_instruments)} options.")
+    
     # Public method using the cached internal one
     def get_atm_strike(self, underlying_symbol: str) -> Optional[float]:
         """
@@ -369,7 +459,7 @@ class OptionManager:
             strike_interval = self.strike_intervals.get(underlying_symbol)
             if current_price is not None and strike_interval is not None:
                 # Use the cached internal method
-                return self.get_atm_strike(current_price, strike_interval)
+                return self._get_atm_strike(current_price, strike_interval)
             else:
                 # Try direct calculation if available
                  cached_atm = self.current_atm_strikes.get(underlying_symbol)

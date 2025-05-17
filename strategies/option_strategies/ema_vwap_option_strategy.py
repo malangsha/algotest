@@ -1,600 +1,468 @@
 """
-EMA VWAP Option Strategy
+EMA VWAP Option Strategy (Refactored)
 
-This strategy buys Call or Put options based on EMA crossovers and VWAP conditions.
-- For CE: Buy when price is above VWAP and EMA_5 crosses EMA_21 from below, after a 60% retracement to EMA_21
-- For PE: Buy when price is below VWAP and EMA_5 crosses EMA_21 from above, after a 60% retracement to EMA_21
+This strategy buys Call or Put options based on EMA crossovers, VWAP conditions,
+and price retracements, following the structural patterns of HighFrequencyMomentumOptionStrategy.
+
+- Bar Subscription:
+  - Primary Timeframe (e.g., 1m): Used for retracement confirmation and entry trigger.
+  - Context Timeframe (e.g., 5m, from additional_timeframes): Used for EMA crossover and VWAP context.
+- Underlyings: Configurable (e.g., NIFTY, SENSEX).
+
+- Entry Logic (Call):
+  1. Context (Context Timeframe):
+     - Fast EMA crosses above Slow EMA.
+     - Price is above VWAP.
+     - Sets a "Bullish" context and flags "CE Retracement Pending".
+  2. Trigger (Primary Timeframe, if CE Retracement Pending):
+     - Price retraces to touch or dip below the Slow EMA.
+     - Price then closes above the Slow EMA.
+  3. Action: Buy an ATM Call option.
+
+- Entry Logic (Put):
+  1. Context (Context Timeframe):
+     - Fast EMA crosses below Slow EMA.
+     - Price is below VWAP.
+     - Sets a "Bearish" context and flags "PE Retracement Pending".
+  2. Trigger (Primary Timeframe, if PE Retracement Pending):
+     - Price retraces to touch or rise above the Slow EMA.
+     - Price then closes below the Slow EMA.
+  3. Action: Buy an ATM Put option.
+
+- Risk Management (defined in strategy, executed by framework):
+  - Stop-loss: Percentage of option entry premium.
+  - Target Profit: Percentage of option entry premium.
+  - Position Sizing: Base quantity defined; actual sizing by framework.
+
+- Exit Logic (for an active option position):
+  1. Target profit hit (based on option price).
+  2. Stop-loss hit (based on option price).
+  3. End of trading day (all positions squared off).
+  4. Cooldown: After an exit, a cooldown period is initiated for the specific underlying to prevent immediate re-entry.
 """
 
-import logging
-import time
 from datetime import datetime, time as dt_time
-from typing import Dict, List, Any, Optional, Set, Tuple
-import numpy as np
+from typing import Dict, List, Any, Optional, Set
 import pandas as pd
+import numpy as np
 
 from strategies.base_strategy import OptionStrategy
-from models.events import MarketDataEvent, BarEvent, FillEvent
-from models.position import Position
-from utils.constants import SignalType, MarketDataType
-from utils.time_utils import is_market_open, time_in_range
+from models.events import BarEvent, MarketDataEvent, FillEvent
+from models.instrument import Instrument, InstrumentType, AssetClass
+from utils.constants import SignalType, MarketDataType, OptionType, OrderSide, Exchange
 from strategies.strategy_registry import StrategyRegistry
-from models.instrument import Instrument
+from core.logging_manager import get_logger # Assuming get_logger is available
 
 @StrategyRegistry.register('ema_vwap_option_strategy')
 class EmaVwapOptionStrategy(OptionStrategy):
     """
-    EMA VWAP Option Strategy
-
-    Buys CE options when price is above VWAP and EMA_5 crosses above EMA_21,
-    after a 60% retracement to EMA_21.
-    
-    Buys PE options when price is below VWAP and EMA_5 crosses below EMA_21,
-    after a 60% retracement to EMA_21.
+    Refactored EMA VWAP Option Strategy.
     """
 
     def __init__(self, strategy_id: str, config: Dict[str, Any],
-                 data_manager, option_manager, portfolio_manager, event_manager):
+                 data_manager, option_manager, portfolio_manager,
+                 event_manager, broker=None, strategy_manager=None):
         super().__init__(strategy_id, config, data_manager,
-                        option_manager, portfolio_manager, event_manager)
+                         option_manager, portfolio_manager, event_manager, broker, strategy_manager)
 
-        # Extract strategy-specific parameters
         self.params = config.get('parameters', {})
         self.entry_time_str = self.params.get('entry_time', '09:30:00')
         self.exit_time_str = self.params.get('exit_time', '15:15:00')
+        self.fast_ema_period = self.params.get('fast_ema', 5) # Renamed from ema_short_period
+        self.slow_ema_period = self.params.get('slow_ema', 21) # Renamed from ema_long_period
+        self.retracement_percent = self.params.get('retracement_percent', 60) # Retracement threshold
         self.stop_loss_percent = self.params.get('stop_loss_percent', 40)
         self.target_percent = self.params.get('target_percent', 50)
-        self.trail_percent = self.params.get('trail_percent', 0)
-        self.quantity = config.get('execution', {}).get('quantity', 1)
-        
-        # EMA parameters
-        self.ema_short_period = self.params.get('ema_short_period', 5)
-        self.ema_long_period = self.params.get('ema_long_period', 21)
-        self.retracement_threshold = self.params.get('retracement_threshold', 0.6)  # 60% retracement
 
-        # Parse time strings to time objects
+        self.quantity = config.get('execution', {}).get('quantity', 1)
+        self.order_type = config.get('execution', {}).get('order_type', 'MARKET')
+
         self.entry_time = self._parse_time(self.entry_time_str)
         self.exit_time = self._parse_time(self.exit_time_str)
 
-        # Parse underlyings
-        raw = config.get("underlyings", [])
-        self.underlyings = []
-        for u in raw:
-            try:
-                self.underlyings.append(u["name"])
-            except (TypeError, KeyError):
-                self.logger.error(
-                    f"Strategy {strategy_id}: invalid underlying entry {u!r}; expected dict with 'name'."
-                )
+        # Process underlying configurations
+        self.strategy_specific_underlyings_config = config.get("underlyings", [])
+        self.underlying_instrument_ids: List[str] = []
+        self.underlying_details: Dict[str, Dict[str, Any]] = {}
+
+        for u_conf in self.strategy_specific_underlyings_config:
+            name = u_conf.get("name")
+            exchange_str = u_conf.get("spot_exchange")
+            inst_type_str = u_conf.get("instrument_type", "IND" if u_conf.get("index") else "EQ")
+            asset_cls_str = u_conf.get("asset_class", "INDEX" if u_conf.get("index") else "EQUITY")
+
+            if not name or not exchange_str:
+                self.logger.warning(f"Strategy {self.id}: Skipping underlying due to missing name/exchange: {u_conf}")
+                continue
+            
+            instrument_id = f"{exchange_str.upper()}:{name}"
+            self.underlying_instrument_ids.append(instrument_id)
+            self.underlying_details[instrument_id] = {
+                "name": name,
+                "exchange": exchange_str.upper(),
+                "instrument_type": inst_type_str.upper(),
+                "asset_class": asset_cls_str.upper(),
+                "option_exchange": u_conf.get("option_exchange", "NFO").upper()
+            }
 
         self.expiry_offset = config.get('expiry_offset', 0)
 
-        # Data storage for indicators
-        self.data_store = {}  # underlying_symbol -> {'1m': DataFrame, '5m': DataFrame}
-        
-        # Signals tracking
-        self.crossover_signals = {}  # underlying_symbol -> {'ce_signal': bool, 'pe_signal': bool}
-        self.retracement_signals = {}  # underlying_symbol -> {'ce_signal': bool, 'pe_signal': bool}
-        
-        # Position tracking
-        self.active_positions = {}  # symbol_key -> position_info
+        # Data store: instrument_id -> {timeframe: DataFrame}
+        self.data_store: Dict[str, Dict[str, pd.DataFrame]] = {}
+        # Tracks active option positions: option_instrument_id -> position_info
+        self.active_positions: Dict[str, Dict[str, Any]] = {}
+        self.entry_enabled = False
+        self.trade_cooldown: Dict[str, float] = {} # underlying_instrument_id -> timestamp
+        self.cooldown_period_seconds = self.params.get('cooldown_period_seconds', 300) # Default 5 mins
 
-        # State
-        self.entry_enabled = False  # Will be set to True when entry time is reached
+        # State for EMA/VWAP logic per underlying
+        self.crossover_state: Dict[str, str] = {} # underlying_id -> "BULLISH", "BEARISH", None
+        self.retracement_pending: Dict[str, str] = {} # underlying_id -> "CE", "PE", None
 
-        self.logger.info(f"EMA VWAP Option Strategy '{self.id}' initialized. Underlyings: {self.underlyings}, "
-                         f"Entry: {self.entry_time_str}, Exit: {self.exit_time_str}, "
-                         f"SL: {self.stop_loss_percent}%, Target: {self.target_percent}%")
+        self.logger.info(f"EmaVwapOptionStrategy '{self.id}' initialized. Underlyings: {self.underlying_instrument_ids}")
 
     def _parse_time(self, time_str: str) -> dt_time:
-        """Parse time string HH:MM:SS to time object"""
         try:
             return dt_time.fromisoformat(time_str)
         except (ValueError, TypeError):
-            self.logger.error(f"Invalid time format '{time_str}', using default 09:30 or 15:15.")
-            # Provide context-aware defaults
-            if 'entry' in time_str.lower(): return dt_time(9, 30, 0)
-            elif 'exit' in time_str.lower(): return dt_time(15, 15, 0)
-            else: return dt_time(15, 15, 0)  # Default exit
+            self.logger.error(f"Invalid time format '{time_str}'. Using default.")
+            return dt_time(9, 30, 0) if 'entry' in time_str.lower() else dt_time(15, 15, 0)
 
-    def get_required_symbols(self) -> Dict[str, List[str]]:
-        """
-        Return the list of underlying symbols required by this strategy.
-        Strategy needs both 1m and 5m timeframes.
-        """
-        symbols_by_timeframe = {}
-        # We need both 1m and 5m timeframes for the strategy
-        symbols_by_timeframe["1m"] = list(self.underlyings)
-        symbols_by_timeframe["5m"] = list(self.underlyings)
-        
-        self.logger.debug(f"Strategy '{self.id}' requires underlyings: {self.underlyings} on timeframes 1m, 5m")
-        return symbols_by_timeframe
+    def initialize(self):
+        super().initialize()
+        self.logger.info(f"Strategy '{self.id}' custom initialization complete.")
 
     def on_start(self):
-        """Called when the strategy is started by StrategyManager."""
-        # Initialize data storage
-        for underlying in self.underlyings:
-            self.data_store[underlying] = {
-                '1m': pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']),
-                '5m': pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            }
-            self.crossover_signals[underlying] = {'ce_signal': False, 'pe_signal': False}
-            self.retracement_signals[underlying] = {'ce_signal': False, 'pe_signal': False}
-        
-        # Reset entry enabled flag
-        self.entry_enabled = False
+        super().on_start()
+        self.logger.info(f"Strategy '{self.id}' on_start: Requesting subscriptions.")
+        for instrument_id, details in self.underlying_details.items():
+            # Initialize data_store for each underlying and timeframe
+            # This strategy uses the primary timeframe (e.g., 1m) for retracement
+            # and an additional timeframe (e.g., 5m) for crossover/VWAP context.
+            # Ensure these are defined in strategy's config and self.all_timeframes
+            for tf in self.all_timeframes: # self.all_timeframes from BaseStrategy
+                if instrument_id not in self.data_store:
+                    self.data_store[instrument_id] = {}
+                self.data_store[instrument_id][tf] = pd.DataFrame(
+                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
+                             'fast_ema', 'slow_ema', 'vwap']
+                )
+            
+            self.trade_cooldown[instrument_id] = 0
+            self.crossover_state[instrument_id] = None
+            self.retracement_pending[instrument_id] = None
+
+            self.request_symbol(
+                symbol_name=details["name"],
+                exchange_value=details["exchange"],
+                instrument_type_value=details["instrument_type"],
+                asset_class_value=details["asset_class"],
+                timeframes_to_subscribe=self.all_timeframes
+            )
         self.active_positions.clear()
-        
-        self.logger.info(f"EMA VWAP Option Strategy '{self.id}' started. Waiting for market data and entry time {self.entry_time_str}.")
+        self.entry_enabled = False
+        self.logger.info(f"Strategy '{self.id}' started. Entry: {self.entry_time_str}, Exit: {self.exit_time_str}")
 
     def on_market_data(self, event: MarketDataEvent):
-        """Process tick data for options, primarily for checking SL/Target."""
-        if not event.instrument or not event.data:
+        # self.logger.debug(f"Strategy {self.id} received MarketDataEvent for {event.instrument.symbol if event.instrument else 'N/A'}")
+        if not event.instrument or not event.data or not event.instrument.instrument_id:
             return
 
-        symbol_key = event.instrument.instrument_id
-        if not symbol_key:
-            return
-
-        # Check if it's an option we are holding
-        if symbol_key in self.active_positions:
-            # Update price and check exits
-            price = event.data.get(MarketDataType.LAST_PRICE.value)
-            if price is not None:
+        option_instrument_id = event.instrument.instrument_id
+        if option_instrument_id in self.active_positions:
+            price_data = event.data.get(MarketDataType.LAST_PRICE.value)
+            if price_data is not None:
                 try:
-                    current_price = float(price)
-                    self._update_position(symbol_key, current_price)
+                    current_option_price = float(price_data)
+                    self._check_option_exit_conditions(option_instrument_id, current_option_price)
                 except (ValueError, TypeError):
-                    self.logger.warning(f"Invalid price format for {symbol_key}: {price}")
+                    self.logger.warning(f"Invalid option price '{price_data}' for {option_instrument_id}.")
 
     def on_bar(self, event: BarEvent):
-        """
-        Process bar data for indicators calculation and entry/exit logic.
-        This is the main method where the strategy logic is implemented.
-        """
-        if not event.instrument:
+        # self.logger.debug(f"Strategy {self.id} received BarEvent: {event.instrument.symbol if event.instrument else 'N/A'}@{event.timeframe}")
+        if not event.instrument or not event.instrument.instrument_id:
             return
 
-        symbol_key = event.instrument.instrument_id
+        underlying_instrument_id = event.instrument.instrument_id
         timeframe = event.timeframe
-        
-        # Check if it's an underlying we're tracking
-        if symbol_key not in self.underlyings:
+
+        #self.logger.debug(f"instrument_id: {underlying_instrument_id}, self.underlying_instrument_ids: {self.underlying_instrument_ids}, timeframe: {timeframe}, all_timeframes: {self.all_timeframes}")
+        if underlying_instrument_id not in self.underlying_instrument_ids or timeframe not in self.all_timeframes:
+            #self.logger.debug(f"Ignoring BarEvent for {underlying_instrument_id}@{timeframe}.")
             return
-            
-        # Process bar data for 1m and 5m timeframes
-        if timeframe in ['1m', '5m']:
-            self._update_data_store(symbol_key, timeframe, event)
-            self._calculate_indicators(symbol_key, timeframe)
-            
-            # Check the time for entry/exit
-            current_dt = datetime.fromtimestamp(event.timestamp)
-            current_time = current_dt.time()
-            
-            # Enable entry after entry time is reached
-            if not self.entry_enabled and current_time >= self.entry_time:
-                self.entry_enabled = True
-                self.logger.info(f"Entry time {self.entry_time_str} reached. Strategy is now active.")
-            
-            # Check for exit time
-            if current_time >= self.exit_time:
-                if self.active_positions:
-                    self.logger.info(f"Exit time {self.exit_time_str} reached. Exiting all open positions.")
-                    self._exit_all_positions("Time-based exit")
-            
-            # If entry is enabled, check for signals
+
+        self._update_data_store(underlying_instrument_id, timeframe, event)
+        self._calculate_indicators(underlying_instrument_id, timeframe)        
+
+        current_dt = datetime.fromtimestamp(event.timestamp)
+        current_time = current_dt.time()
+
+        self.logger.debug(f"current_time: {current_time}, entry_time: {self.entry_time}, entry_enabled: {self.entry_enabled} ")
+
+        if not self.entry_enabled and current_time >= self.entry_time:
+            self.entry_enabled = True
+            self.logger.info(f"Entry time {self.entry_time_str} reached. Trading active.")
+
+        if current_time >= self.exit_time:
+            if self.active_positions:
+                self.logger.info(f"Exit time {self.exit_time_str} reached. Exiting all positions.")
+                self._exit_all_positions(f"End of day exit at {self.exit_time_str}")
             if self.entry_enabled:
-                if timeframe == '5m':
-                    # Check for crossover signals on 5m timeframe
-                    self._check_crossover_signals(symbol_key)
-                elif timeframe == '1m':
-                    # Check for retracement and entry on 1m timeframe
-                    self._check_retracement_and_enter(symbol_key)
-
-    def _update_data_store(self, symbol: str, timeframe: str, event: BarEvent):
-        """Update the data store with the latest bar data"""
-        if symbol not in self.data_store or timeframe not in self.data_store[symbol]:
+                self.logger.info("Past exit time. Disabling further entries.")
+                self.entry_enabled = False
             return
 
-        # Extract OHLCV data from the bar event
-        bar_data = {
-            'timestamp': event.timestamp,
-            'open': event.open,
-            'high': event.high,
-            'low': event.low,
-            'close': event.close,
-            'volume': event.volume
+        if self.entry_enabled and not self._is_in_cooldown(underlying_instrument_id, event.timestamp):
+            # Use a longer timeframe (e.g., 5m, if configured in additional_timeframes) for crossover & VWAP context
+            # Use primary timeframe (e.g., 1m) for retracement check
+            context_timeframe = list(self.additional_timeframes)[0] if self.additional_timeframes else self.timeframe
+            
+            if timeframe == context_timeframe: # Process context on the designated context timeframe
+                self._check_crossover_and_vwap_context(underlying_instrument_id, context_timeframe)
+            
+            if timeframe == self.timeframe: # Process retracement and entry on primary timeframe
+                 if self.retracement_pending.get(underlying_instrument_id):
+                    self._check_retracement_and_enter(underlying_instrument_id, self.timeframe, current_dt)
+        elif self.entry_enabled:
+             self.logger.debug(f"{underlying_instrument_id} in cooldown. No new entry checks.")
+
+
+    def _is_in_cooldown(self, underlying_instrument_id: str, current_timestamp: float) -> bool:
+        last_exit_time = self.trade_cooldown.get(underlying_instrument_id, 0)
+        return current_timestamp < last_exit_time + self.cooldown_period_seconds
+
+    def _update_data_store(self, instrument_id: str, timeframe: str, event: BarEvent):
+        df = self.data_store[instrument_id][timeframe]
+        new_row_data = {
+            'timestamp': event.timestamp, 'open': event.open_price, 'high': event.high_price,
+            'low': event.low_price, 'close': event.close_price, 'volume': event.volume
         }
+        new_row_df = pd.DataFrame([new_row_data])
+        self.data_store[instrument_id][timeframe] = pd.concat([df, new_row_df], ignore_index=True)
         
-        # Append to dataframe
-        new_row = pd.DataFrame([bar_data])
-        self.data_store[symbol][timeframe] = pd.concat([self.data_store[symbol][timeframe], new_row], ignore_index=True)
-        
-        # Keep only the last 100 bars for efficiency
-        if len(self.data_store[symbol][timeframe]) > 100:
-            self.data_store[symbol][timeframe] = self.data_store[symbol][timeframe].iloc[-100:]
+        max_len = max(self.slow_ema_period, 20) + 50 # Keep enough for VWAP and EMAs
+        if len(self.data_store[instrument_id][timeframe]) > max_len:
+            self.data_store[instrument_id][timeframe] = self.data_store[instrument_id][timeframe].iloc[-max_len:]
 
-    def _calculate_indicators(self, symbol: str, timeframe: str):
-        """Calculate EMA and VWAP indicators for the given symbol and timeframe"""
-        df = self.data_store[symbol][timeframe]
-        if len(df) < self.ema_long_period:
+    def _calculate_indicators(self, instrument_id: str, timeframe: str):
+        df = self.data_store[instrument_id][timeframe]
+        if len(df) < self.slow_ema_period:
             return
-        
-        # Calculate EMAs
-        df['ema_short'] = self._calculate_ema(df['close'], self.ema_short_period)
-        df['ema_long'] = self._calculate_ema(df['close'], self.ema_long_period)
+
+        df['fast_ema'] = df['close'].ewm(span=self.fast_ema_period, adjust=False).mean()
+        df['slow_ema'] = df['close'].ewm(span=self.slow_ema_period, adjust=False).mean()
         
         # Calculate VWAP
-        df['vwap'] = self._calculate_vwap(df)
-        
-        # Update the dataframe in the data store
-        self.data_store[symbol][timeframe] = df
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        price_volume = typical_price * df['volume']
+        # For daily VWAP, reset cumsum at start of day. For rolling, use rolling window.
+        # Simple cumulative VWAP for the loaded data history:
+        df['vwap'] = price_volume.cumsum() / df['volume'].cumsum()
+        df['vwap'].fillna(method='bfill', inplace=True) # Backfill initial NaNs
 
-    def _calculate_ema(self, series, period):
-        """Calculate Exponential Moving Average"""
-        return series.ewm(span=period, adjust=False).mean()
+    def _check_crossover_and_vwap_context(self, underlying_instrument_id: str, timeframe: str):
+        self.logger.debug(f"_check_crossover_and_vwap_context()")
+        df = self.data_store[underlying_instrument_id][timeframe]
+        self.logger.debug(f"df: {df}")
 
-    def _calculate_vwap(self, df):
-        """Calculate Volume Weighted Average Price"""
-        df = df.copy()
-        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
-        df['price_volume'] = df['typical_price'] * df['volume']
-        df['cumulative_price_volume'] = df['price_volume'].cumsum()
-        df['cumulative_volume'] = df['volume'].cumsum()
-        vwap = df['cumulative_price_volume'] / df['cumulative_volume']
-        return vwap
+        if len(df) < 2 or df[['fast_ema', 'slow_ema', 'vwap']].iloc[-1].isnull().any():
+            return
 
-    def _check_crossover_signals(self, symbol: str):
-        """Check for EMA crossover and VWAP conditions on 5m timeframe"""
-        df = self.data_store[symbol]['5m']
-        if len(df) < 2:  # Need at least 2 bars to check for crossover
-            return
-        
-        # Get last two bars for crossover check
-        prev_bar = df.iloc[-2]
-        curr_bar = df.iloc[-1]
-        
-        # Check CE signal conditions: EMA5 crosses above EMA21 and price above VWAP
-        if (prev_bar['ema_short'] <= prev_bar['ema_long'] and 
-            curr_bar['ema_short'] > curr_bar['ema_long'] and 
-            curr_bar['close'] > curr_bar['vwap']):
-            
-            if not self.crossover_signals[symbol]['ce_signal']:  # Only log new signals
-                self.logger.info(f"5m CE signal triggered for {symbol}: EMA5 crossed above EMA21 and price above VWAP")
-            self.crossover_signals[symbol]['ce_signal'] = True
-        
-        # Check PE signal conditions: EMA5 crosses below EMA21 and price below VWAP
-        if (prev_bar['ema_short'] >= prev_bar['ema_long'] and 
-            curr_bar['ema_short'] < curr_bar['ema_long'] and 
-            curr_bar['close'] < curr_bar['vwap']):
-            
-            if not self.crossover_signals[symbol]['pe_signal']:  # Only log new signals
-                self.logger.info(f"5m PE signal triggered for {symbol}: EMA5 crossed below EMA21 and price below VWAP")
-            self.crossover_signals[symbol]['pe_signal'] = True
+        latest = df.iloc[-1]
+        previous = df.iloc[-2]
 
-    def _check_retracement_and_enter(self, symbol: str):
-        """Check for 60% retracement to EMA21 on 1m timeframe and enter positions if conditions met"""
-        # Skip if no crossover signals are active
-        if not self.crossover_signals[symbol]['ce_signal'] and not self.crossover_signals[symbol]['pe_signal']:
-            return
-            
-        df_1m = self.data_store[symbol]['1m']
-        if len(df_1m) < 2:
-            return
-            
-        curr_bar = df_1m.iloc[-1]
-        
-        # Check for CE retracement (if CE signal is active)
-        if self.crossover_signals[symbol]['ce_signal'] and not self.retracement_signals[symbol]['ce_signal']:
-            # For CE, we need price to retrace down toward EMA21 by at least 60%
-            # First, find the high point after the crossover
-            crossover_index = self._find_ce_crossover_point(symbol)
-            if crossover_index is not None:
-                high_after_crossover = df_1m['high'].iloc[crossover_index:].max()
-                ema21_value = curr_bar['ema_long']
-                
-                # Calculate retracement percentage
-                if high_after_crossover > ema21_value:  # Ensure there's room for retracement
-                    retracement_distance = high_after_crossover - curr_bar['close']
-                    full_distance = high_after_crossover - ema21_value
-                    
-                    if full_distance > 0:  # Avoid division by zero
-                        retracement_pct = retracement_distance / full_distance
-                        
-                        if retracement_pct >= self.retracement_threshold:
-                            self.logger.info(f"1m CE retracement signal triggered for {symbol}: "
-                                            f"Price retraced {retracement_pct:.2%} back to EMA21")
-                            self.retracement_signals[symbol]['ce_signal'] = True
-                            self._enter_ce_position(symbol)
-        
-        # Check for PE retracement (if PE signal is active)
-        if self.crossover_signals[symbol]['pe_signal'] and not self.retracement_signals[symbol]['pe_signal']:
-            # For PE, we need price to retrace up toward EMA21 by at least 60%
-            crossover_index = self._find_pe_crossover_point(symbol)
-            if crossover_index is not None:
-                low_after_crossover = df_1m['low'].iloc[crossover_index:].min()
-                ema21_value = curr_bar['ema_long']
-                
-                # Calculate retracement percentage
-                if low_after_crossover < ema21_value:  # Ensure there's room for retracement
-                    retracement_distance = curr_bar['close'] - low_after_crossover
-                    full_distance = ema21_value - low_after_crossover
-                    
-                    if full_distance > 0:  # Avoid division by zero
-                        retracement_pct = retracement_distance / full_distance
-                        
-                        if retracement_pct >= self.retracement_threshold:
-                            self.logger.info(f"1m PE retracement signal triggered for {symbol}: "
-                                            f"Price retraced {retracement_pct:.2%} back to EMA21")
-                            self.retracement_signals[symbol]['pe_signal'] = True
-                            self._enter_pe_position(symbol)
+        self.logger.debug(f"checking fast ema")
+        # Bullish context: Fast EMA crosses above Slow EMA, and price is above VWAP
+        if previous['fast_ema'] <= previous['slow_ema'] and latest['fast_ema'] > latest['slow_ema'] and latest['close'] > latest['vwap']:
+            if self.crossover_state.get(underlying_instrument_id) != "BULLISH":
+                self.logger.info(f"CONTEXT: Bullish for {underlying_instrument_id} on {timeframe}. FastEMA > SlowEMA, Price > VWAP. Pending CE retracement.")
+            self.crossover_state[underlying_instrument_id] = "BULLISH"
+            self.retracement_pending[underlying_instrument_id] = "CE" # Look for CE entry
 
-    def _find_ce_crossover_point(self, symbol: str) -> Optional[int]:
-        """Find the index where EMA5 crossed above EMA21 in the 5m data"""
-        df = self.data_store[symbol]['5m']
-        for i in range(len(df) - 1, 0, -1):
-            if df['ema_short'].iloc[i] > df['ema_long'].iloc[i] and df['ema_short'].iloc[i-1] <= df['ema_long'].iloc[i-1]:
-                return i
-        return None
+        # Bearish context: Fast EMA crosses below Slow EMA, and price is below VWAP
+        elif previous['fast_ema'] >= previous['slow_ema'] and latest['fast_ema'] < latest['slow_ema'] and latest['close'] < latest['vwap']:
+            if self.crossover_state.get(underlying_instrument_id) != "BEARISH":
+                self.logger.info(f"CONTEXT: Bearish for {underlying_instrument_id} on {timeframe}. FastEMA < SlowEMA, Price < VWAP. Pending PE retracement.")
+            self.crossover_state[underlying_instrument_id] = "BEARISH"
+            self.retracement_pending[underlying_instrument_id] = "PE" # Look for PE entry
+        
+        # If conditions no longer met, clear pending retracement
+        elif (self.crossover_state.get(underlying_instrument_id) == "BULLISH" and \
+              (latest['fast_ema'] <= latest['slow_ema'] or latest['close'] <= latest['vwap'])) or \
+             (self.crossover_state.get(underlying_instrument_id) == "BEARISH" and \
+              (latest['fast_ema'] >= latest['slow_ema'] or latest['close'] >= latest['vwap'])):
+            if self.retracement_pending.get(underlying_instrument_id):
+                self.logger.info(f"CONTEXT: Conditions for {self.retracement_pending[underlying_instrument_id]} on {underlying_instrument_id} no longer met. Clearing pending retracement.")
+                self.retracement_pending[underlying_instrument_id] = None
+                self.crossover_state[underlying_instrument_id] = None
 
-    def _find_pe_crossover_point(self, symbol: str) -> Optional[int]:
-        """Find the index where EMA5 crossed below EMA21 in the 5m data"""
-        df = self.data_store[symbol]['5m']
-        for i in range(len(df) - 1, 0, -1):
-            if df['ema_short'].iloc[i] < df['ema_long'].iloc[i] and df['ema_short'].iloc[i-1] >= df['ema_long'].iloc[i-1]:
-                return i
-        return None
 
-    def _enter_ce_position(self, underlying_symbol: str):
-        """Enter a CE (Call) position"""
-        if not self.option_manager:
-            self.logger.error("OptionManager not available. Cannot enter CE position.")
+    def _check_retracement_and_enter(self, underlying_instrument_id: str, timeframe: str, current_dt: datetime):
+        df = self.data_store[underlying_instrument_id][timeframe] # Primary timeframe (e.g., 1m)
+        self.logger.debug(f"retracement: df:  {df}")
+        if len(df) < 1 or df[['slow_ema', 'high', 'low', 'close']].iloc[-1].isnull().any():
+            self.logger.debug(f"df:  {df}")
             return
-            
-        # Get current ATM strike
-        current_price = self.option_manager.underlying_prices.get(underlying_symbol)
-        strike_interval = self.option_manager.strike_intervals.get(underlying_symbol)
+
+        latest = df.iloc[-1]
+        pending_type = self.retracement_pending.get(underlying_instrument_id)
+        self.logger.debug("pending_type: {pending_type}")
+
+        if pending_type == "CE":
+            # Price must retrace towards slow_ema. High of bar that formed crossover to slow_ema.
+            # This logic needs refinement: "60% retracement to EMA21" means from what high/low?
+            # Assuming retracement from a recent high (post-crossover) towards current slow_ema.
+            # For simplicity here: if current low touches or goes below slow_ema.
+            # A more precise retracement calculation would require identifying the swing high after bullish context.
+            if latest['low'] <= latest['slow_ema'] and latest['close'] > latest['slow_ema']: # Touched and bounced
+                self.logger.info(f"RETRACEMENT: CE entry condition met for {underlying_instrument_id} on {timeframe}. Low touched/crossed SlowEMA and closed above.")
+                self._enter_option_position(underlying_instrument_id, SignalType.BUY_CALL, latest['close'], current_dt)
+                self.retracement_pending[underlying_instrument_id] = None # Clear pending state
+                self.crossover_state[underlying_instrument_id] = None
+
+        elif pending_type == "PE":
+            # Assuming retracement from a recent low (post-crossover) towards current slow_ema.
+            if latest['high'] >= latest['slow_ema'] and latest['close'] < latest['slow_ema']: # Touched and bounced
+                self.logger.info(f"RETRACEMENT: PE entry condition met for {underlying_instrument_id} on {timeframe}. High touched/crossed SlowEMA and closed below.")
+                self._enter_option_position(underlying_instrument_id, SignalType.BUY_PUT, latest['close'], current_dt)
+                self.retracement_pending[underlying_instrument_id] = None # Clear pending state
+                self.crossover_state[underlying_instrument_id] = None
+
+    def _enter_option_position(self, underlying_instrument_id: str, signal_type: SignalType, underlying_price: float, current_dt: datetime):
+        # Check if already holding an option for this underlying
+        for opt_key, pos_info in list(self.active_positions.items()):
+            if pos_info.get('underlying_instrument_id') == underlying_instrument_id:
+                self.logger.info(f"Already holding an option for {underlying_instrument_id}. Skipping new entry.")
+                return
+
+        atm_strike = self.option_manager.get_atm_strike(underlying_instrument_id)
+        if atm_strike is None: # Fallback if OM cache is not populated yet
+            underlying_config_main = next((u for u in self.config.get("market", {}).get("underlyings", []) if u["symbol"] == self.underlying_details[underlying_instrument_id]["name"]), None)
+            strike_interval = underlying_config_main.get("strike_interval", 50.0) if underlying_config_main else 50.0
+            atm_strike = round(underlying_price / strike_interval) * strike_interval
+            self.logger.info(f"Using fallback ATM calculation: {atm_strike} for {underlying_instrument_id}")
+
+
+        option_type_enum = OptionType.CALL if signal_type == SignalType.BUY_CALL else OptionType.PUT
+        underlying_simple_name = self.underlying_details[underlying_instrument_id]["name"]
         
-        if current_price is None or strike_interval is None:
-            self.logger.warning(f"Cannot determine ATM strike for {underlying_symbol}: Price or interval missing.")
+        option_instrument = self.option_manager.get_option_instrument(
+            underlying_simple_name, atm_strike, option_type_enum.value, self.expiry_offset
+        )
+
+        if not option_instrument or not option_instrument.instrument_id:
+            self.logger.error(f"Could not get {option_type_enum.value} for {underlying_instrument_id}, strike {atm_strike}.")
             return
-            
-        atm_strike = self.option_manager._get_atm_strike_internal(current_price, strike_interval)
-        self.logger.info(f"Entering CE position for {underlying_symbol}. Current Price: {current_price:.2f}, ATM Strike: {atm_strike}")
-        
-        # Get the CE Instrument
-        ce_instrument = self.option_manager.get_option_instrument(underlying_symbol, atm_strike, "CE", self.expiry_offset)
-        
-        if not ce_instrument:
-            self.logger.error(f"Could not get CE instrument for {underlying_symbol} ATM strike {atm_strike}.")
+
+        option_id_to_trade = option_instrument.instrument_id
+        if option_id_to_trade in self.active_positions:
+             self.logger.info(f"Already holding {option_id_to_trade}. Skipping entry.")
+             return
+
+        option_tick_data = self.data_manager.get_latest_tick(option_id_to_trade)
+        if not option_tick_data or MarketDataType.LAST_PRICE.value not in option_tick_data:
+            self.logger.warning(f"Tick data not available for {option_id_to_trade}. Cannot estimate entry price.")
+            # Optionally, request subscription if not already active
+            # self.request_symbol(option_instrument.symbol, option_instrument.exchange.value, ...)
             return
-            
-        ce_symbol_key = ce_instrument.instrument_id
         
-        # Get latest price for this option
-        ce_data = self.data_manager.get_latest_tick(ce_symbol_key)
-        
-        if not ce_data:
-            self.logger.warning(f"Market data not yet available for {ce_symbol_key}. Skipping entry.")
-            return
-            
-        ce_price = ce_data.get(MarketDataType.LAST_PRICE.value)
-        
-        if ce_price is None:
-            self.logger.warning(f"Last price not found in data for {ce_symbol_key}.")
-            return
-            
-        try:
-            ce_price = float(ce_price)
-        except (ValueError, TypeError):
-            self.logger.error(f"Invalid price format for CE ({ce_price}).")
-            return
-            
-        # Generate BUY signal
-        signal_data = {
-            'quantity': self.quantity,
-            'strategy': self.id,
-            'underlying': underlying_symbol,
-            'atm_strike': atm_strike,
-            'type': 'CE',
-            'price': ce_price
+        entry_price_est = float(option_tick_data[MarketDataType.LAST_PRICE.value])
+
+        self.logger.info(f"Placing {signal_type.name} for {option_id_to_trade} at market (est. {entry_price_est:.2f})")
+        self.generate_signal(
+            instrument_id=option_id_to_trade,
+            signal_type=SignalType.BUY,
+            data={'quantity': self.quantity, 'order_type': self.order_type,
+                  'intended_option_type': option_type_enum.value}
+        )
+        self.active_positions[option_id_to_trade] = {
+            'underlying_instrument_id': underlying_instrument_id,
+            'option_type': option_type_enum.value,
+            'entry_price': entry_price_est, # Will be updated on fill
+            'stop_loss_price': entry_price_est * (1 - self.stop_loss_percent / 100),
+            'target_price': entry_price_est * (1 + self.target_percent / 100),
+            'entry_time': current_dt,
+            'instrument_object': option_instrument,
+            'high_price_since_entry': entry_price_est # For trailing SL if implemented
         }
-        
-        self.generate_signal(ce_instrument.symbol, SignalType.BUY, data=signal_data)
-        
-        # Initialize position tracking
-        self.active_positions[ce_symbol_key] = {
-            'symbol_key': ce_symbol_key,
-            'symbol': ce_instrument.symbol,
-            'underlying': underlying_symbol,
-            'type': 'CE',
-            'entry_price': ce_price,
-            'current_price': ce_price,
-            'high_price': ce_price,
-            'stop_loss': ce_price * (1 - self.stop_loss_percent / 100),
-            'target': ce_price * (1 + self.target_percent / 100),
-            'exited': False
-        }
-        
-        self.logger.info(f"BUY signal generated for CE: {ce_instrument.symbol} @ ~{ce_price:.2f}")
-        
-        # Reset signals for this underlying
-        self.crossover_signals[underlying_symbol]['ce_signal'] = False
-        self.retracement_signals[underlying_symbol]['ce_signal'] = False
-
-    def _enter_pe_position(self, underlying_symbol: str):
-        """Enter a PE (Put) position"""
-        if not self.option_manager:
-            self.logger.error("OptionManager not available. Cannot enter PE position.")
-            return
-            
-        # Get current ATM strike
-        current_price = self.option_manager.underlying_prices.get(underlying_symbol)
-        strike_interval = self.option_manager.strike_intervals.get(underlying_symbol)
-        
-        if current_price is None or strike_interval is None:
-            self.logger.warning(f"Cannot determine ATM strike for {underlying_symbol}: Price or interval missing.")
-            return
-            
-        atm_strike = self.option_manager._get_atm_strike_internal(current_price, strike_interval)
-        self.logger.info(f"Entering PE position for {underlying_symbol}. Current Price: {current_price:.2f}, ATM Strike: {atm_strike}")
-        
-        # Get the PE Instrument
-        pe_instrument = self.option_manager.get_option_instrument(underlying_symbol, atm_strike, "PE", self.expiry_offset)
-        
-        if not pe_instrument:
-            self.logger.error(f"Could not get PE instrument for {underlying_symbol} ATM strike {atm_strike}.")
-            return
-            
-        pe_symbol_key = pe_instrument.instrument_id
-        
-        # Get latest price for this option
-        pe_data = self.data_manager.get_latest_tick(pe_symbol_key)
-        
-        if not pe_data:
-            self.logger.warning(f"Market data not yet available for {pe_symbol_key}. Skipping entry.")
-            return
-            
-        pe_price = pe_data.get(MarketDataType.LAST_PRICE.value)
-        
-        if pe_price is None:
-            self.logger.warning(f"Last price not found in data for {pe_symbol_key}.")
-            return
-            
-        try:
-            pe_price = float(pe_price)
-        except (ValueError, TypeError):
-            self.logger.error(f"Invalid price format for PE ({pe_price}).")
-            return
-            
-        # Generate BUY signal
-        signal_data = {
-            'quantity': self.quantity,
-            'strategy': self.id,
-            'underlying': underlying_symbol,
-            'atm_strike': atm_strike,
-            'type': 'PE',
-            'price': pe_price
-        }
-        
-        self.generate_signal(pe_instrument.symbol, SignalType.BUY, data=signal_data)
-        
-        # Initialize position tracking
-        self.active_positions[pe_symbol_key] = {
-            'symbol_key': pe_symbol_key,
-            'symbol': pe_instrument.symbol,
-            'underlying': underlying_symbol,
-            'type': 'PE',
-            'entry_price': pe_price,
-            'current_price': pe_price,
-            'high_price': pe_price,
-            'stop_loss': pe_price * (1 - self.stop_loss_percent / 100),
-            'target': pe_price * (1 + self.target_percent / 100),
-            'exited': False
-        }
-        
-        self.logger.info(f"BUY signal generated for PE: {pe_instrument.symbol} @ ~{pe_price:.2f}")
-        
-        # Reset signals for this underlying
-        self.crossover_signals[underlying_symbol]['pe_signal'] = False
-        self.retracement_signals[underlying_symbol]['pe_signal'] = False
-
-    def _update_position(self, symbol_key: str, current_price: float):
-        """Update position tracking and check for individual exits (SL/Target)."""
-        if symbol_key not in self.active_positions:
-            return
-            
-        position_info = self.active_positions[symbol_key]
-        
-        # Ignore if already exited
-        if position_info['exited']:
-            return
-            
-        # Update current price
-        position_info['current_price'] = current_price
-        symbol = position_info['symbol']
-        entry_price = position_info['entry_price']
-        
-        # Update high price for trailing stop calculation
-        position_info['high_price'] = max(position_info['high_price'], current_price)
-        
-        # Update trailing stop loss if applicable
-        if self.trail_percent > 0:
-            potential_new_stop = position_info['high_price'] * (1 - self.trail_percent / 100)
-            if potential_new_stop > position_info['stop_loss']:
-                position_info['stop_loss'] = potential_new_stop
-        
-        # Check Exit Conditions
-        exit_reason = None
-        if current_price <= position_info['stop_loss']:
-            exit_reason = "stop_loss"
-        elif current_price >= position_info['target']:
-            exit_reason = "target"
-            
-        if exit_reason:
-            self.logger.info(f"{exit_reason.replace('_',' ').title()} triggered for {symbol} at {current_price:.2f} "
-                           f"(Entry: {entry_price:.2f}, SL: {position_info['stop_loss']:.2f}, Target: {position_info['target']:.2f})")
-            
-            # Generate SELL signal
-            self.generate_signal(symbol, SignalType.SELL, data={
-                'price': current_price,
-                'quantity': self.quantity,
-                'strategy': self.id,
-                'reason': exit_reason,
-                'underlying': position_info['underlying'],
-                'type': position_info['type'],
-                'entry_price': entry_price
-            })
-            
-            # Mark as exited
-            position_info['exited'] = True
-            
-            # Remove from active positions
-            del self.active_positions[symbol_key]
-
-    def _exit_all_positions(self, reason: str):
-        """Exit all currently open positions."""
-        self.logger.info(f"Exiting all active positions. Reason: {reason}")
-        positions_to_exit = list(self.active_positions.keys())
-        
-        for symbol_key in positions_to_exit:
-            position_info = self.active_positions.get(symbol_key)
-            if not position_info or position_info['exited']:
-                continue
-                
-            symbol = position_info['symbol']
-            current_price = position_info['current_price']
-            entry_price = position_info['entry_price']
-            
-            self.logger.info(f"Generating SELL signal for {symbol} at ~{current_price:.2f}. Reason: {reason}")
-            self.generate_signal(symbol, SignalType.SELL, data={
-                'price': current_price,
-                'quantity': self.quantity,
-                'strategy': self.id,
-                'reason': reason,
-                'underlying': position_info['underlying'],
-                'type': position_info['type'],
-                'entry_price': entry_price
-            })
-            
-            # Mark as exited
-            position_info['exited'] = True
-            
-        # Clear all positions
-        self.active_positions.clear()
-        self.logger.info("Finished generating exit signals for all active positions.")
 
     def on_fill(self, event: FillEvent):
-        """Handle fill events to confirm trades."""
-        if hasattr(event, 'symbol') and hasattr(event, 'fill_price') and hasattr(event, 'quantity'):
-            action = "Bought" if event.quantity > 0 else "Sold"
-            self.logger.info(f"Fill received: {action} {abs(event.quantity)} of {event.symbol} @ {event.fill_price:.2f} (Order ID: {event.order_id})")
+        super().on_fill(event) # Base strategy might have logging
+        filled_option_id = event.instrument_id
+        if not filled_option_id or filled_option_id not in self.active_positions:
+            self.logger.debug(f"Fill for {filled_option_id} not relevant to this strategy's active positions.")
+            return
+
+        pos_info = self.active_positions[filled_option_id]
+        if event.order_side == OrderSide.BUY and event.fill_quantity > 0: # Entry fill
+            actual_entry_price = event.fill_price
+            pos_info['entry_price'] = actual_entry_price
+            pos_info['stop_loss_price'] = actual_entry_price * (1 - self.stop_loss_percent / 100)
+            pos_info['target_price'] = actual_entry_price * (1 + self.target_percent / 100)
+            pos_info['filled_quantity'] = pos_info.get('filled_quantity', 0) + event.fill_quantity
+            pos_info['high_price_since_entry'] = actual_entry_price
+            self.logger.info(f"ENTRY FILL for {filled_option_id} @ {actual_entry_price:.2f}. New SL/TP: "
+                             f"{pos_info['stop_loss_price']:.2f}/{pos_info['target_price']:.2f}")
+        elif event.order_side == OrderSide.SELL and event.fill_quantity > 0: # Exit fill
+            self.logger.info(f"EXIT FILL for {filled_option_id} @ {event.fill_price:.2f}. Reason: {event.data.get('reason', 'N/A')}")
+            self._handle_exit_cleanup(filled_option_id)
+
+
+    def _check_option_exit_conditions(self, option_instrument_id: str, current_price: float):
+        if option_instrument_id not in self.active_positions: return
+        pos_info = self.active_positions[option_instrument_id]
+        
+        pos_info['high_price_since_entry'] = max(pos_info.get('high_price_since_entry', current_price), current_price)
+        # Add trailing SL logic if configured (e.g., self.params.get('trail_sl_percent'))
+        # For now, fixed SL/TP
+
+        exit_reason = None
+        if current_price <= pos_info['stop_loss_price']:
+            exit_reason = f"Stop-loss ({pos_info['stop_loss_price']:.2f})"
+        elif current_price >= pos_info['target_price']:
+            exit_reason = f"Target-profit ({pos_info['target_price']:.2f})"
+        
+        if exit_reason:
+            self.logger.info(f"Exiting {option_instrument_id} at {current_price:.2f}. Reason: {exit_reason}")
+            self._exit_position(option_instrument_id, exit_reason)
+
+    def _exit_position(self, option_instrument_id: str, reason: str):
+        if option_instrument_id not in self.active_positions: return
+        
+        pos_info = self.active_positions[option_instrument_id]
+        quantity_to_sell = pos_info.get('filled_quantity', self.quantity)
+        if quantity_to_sell <=0: return
+
+        self.generate_signal(
+            instrument_id=option_instrument_id, signal_type=SignalType.SELL,
+            data={'quantity': quantity_to_sell, 'order_type': self.order_type, 'reason': reason}
+        )
+        # Actual removal from active_positions happens in _handle_exit_cleanup on fill
+
+    def _handle_exit_cleanup(self, option_instrument_id: str):
+        if option_instrument_id in self.active_positions:
+            pos_info = self.active_positions.pop(option_instrument_id)
+            underlying_id = pos_info.get('underlying_instrument_id')
+            if underlying_id:
+                self.trade_cooldown[underlying_id] = datetime.now().timestamp()
+                self.logger.info(f"Position {option_instrument_id} removed. Cooldown for {underlying_id} started.")
+            self.retracement_pending.pop(underlying_id, None) # Clear any pending retracement state for the underlying
+            self.crossover_state.pop(underlying_id, None) # Clear crossover state
+
+    def _exit_all_positions(self, reason: str):
+        self.logger.info(f"Exiting all {len(self.active_positions)} active positions. Reason: {reason}")
+        for opt_id in list(self.active_positions.keys()):
+            self._exit_position(opt_id, reason)
 
     def on_stop(self):
-        """Called when the strategy is stopped by StrategyManager."""
-        # Ensure all positions are exited
-        if self.active_positions:
-            self.logger.warning(f"Strategy '{self.id}' stopping with active positions. Forcing exit.")
-            self._exit_all_positions("Strategy stopped")
-            
-        self.logger.info(f"EMA VWAP Option Strategy '{self.id}' stopped.")
+        super().on_stop()
+        self._exit_all_positions("Strategy stop command")
+        self.data_store.clear()
+        self.active_positions.clear()
+        self.trade_cooldown.clear()
+        self.crossover_state.clear()
+        self.retracement_pending.clear()
+        self.entry_enabled = False
+        self.logger.info(f"Strategy '{self.id}' stopped and cleaned up.")
+
+

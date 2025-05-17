@@ -263,14 +263,7 @@ class EventManager:
         EventType.TIMER: EventPriority.LOW,
         EventType.RISK_BREACH: EventPriority.HIGH,
         EventType.EXECUTION: EventPriority.HIGH,
-        EventType.BAR: EventPriority.NORMAL,
-        TimeframeEventType.BAR_1M: EventPriority.NORMAL,
-        TimeframeEventType.BAR_5M: EventPriority.NORMAL,
-        TimeframeEventType.BAR_15M: EventPriority.NORMAL,
-        TimeframeEventType.BAR_30M: EventPriority.NORMAL,
-        TimeframeEventType.BAR_1H: EventPriority.NORMAL,
-        TimeframeEventType.BAR_4H: EventPriority.NORMAL,
-        TimeframeEventType.BAR_1D: EventPriority.NORMAL        
+        EventType.BAR: EventPriority.NORMAL
     }
     
     def __init__(self, queue_size: int = 5000, process_sleep: float = 0.001, enable_monitoring: bool = True):
@@ -498,7 +491,6 @@ class EventManager:
             return False
             
         event_type_value = event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type)
-        self.logger.debug(f"Publishing event: {event.event_type}: {event_type_value}")
         
         try:
             # Set event priority based on its type

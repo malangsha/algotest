@@ -1,49 +1,51 @@
 # Strategy configurations
 strategies:  
-  atm_straddle:
-    enabled: true
-    type: "atm_straddle_strategy"
-    description: "ATM Straddle strategy that buys CE and PE at ATM strike"
+  # atm_straddle:
+  #   enabled: true
+  #   type: "atm_straddle_strategy"
+  #   description: "ATM Straddle strategy that buys CE and PE at ATM strike"
     
-    # Index and symbol configurations
-    use_options: true
-    underlyings:
-    - name: "NIFTY INDEX"
-      spot_exchange: NSE
-      option_exchange: NFO
-    - name: "SENSEX"
-      spot_exchange: BSE
-      option_exchange: BFO
+  #   # Index and symbol configurations
+  #   use_options: true
+  #   underlyings:
+  #   - name: "NIFTY INDEX"
+  #     index: true
+  #     spot_exchange: NSE
+  #     option_exchange: NFO
+  #   - name: "SENSEX"
+  #     index: true
+  #     spot_exchange: BSE
+  #     option_exchange: BFO
     
-    expiry_offset: 0  # 0=current expiry, 1=next expiry
+  #   expiry_offset: 0  # 0=current expiry, 1=next expiry
     
-    # Timeframe configurations
-    timeframe: "1m"
-    additional_timeframes: ["5m"]
+  #   # Timeframe configurations
+  #   timeframe: "1m"
+  #   additional_timeframes: ["5m"]
     
-    # Entry and exit parameters
-    parameters:
-      entry_time: "09:30:00"
-      exit_time: "15:15:00"
-      stop_loss_percent: 30
-      target_percent: 15
-      trail_points: 0.25
+  #   # Entry and exit parameters
+  #   parameters:
+  #     entry_time: "09:30:00"
+  #     exit_time: "15:15:00"
+  #     stop_loss_percent: 30
+  #     target_percent: 15
+  #     trail_points: 0.25
     
-    # Data requirements
-    data:
-      min_history_bars: 5
-      warmup_bars: 2
+  #   # Data requirements
+  #   data:
+  #     min_history_bars: 5
+  #     warmup_bars: 2
     
-    # Execution settings
-    execution:
-      order_type: "MARKET"
-      quantity: 1
-      slippage_percent: 0.1
+  #   # Execution settings
+  #   execution:
+  #     order_type: "MARKET"
+  #     quantity: 1
+  #     slippage_percent: 0.1
     
-    # Position management
-    risk:
-      max_positions: 1
-      max_risk_per_trade: 2.0  # percentage of portfolio
+  #   # Position management
+  #   risk:
+  #     max_positions: 1
+  #     max_risk_per_trade: 2.0  # percentage of portfolio
 
   # EMA VWAP Option Strategy configuration
   ema_vwap_option:
@@ -55,9 +57,11 @@ strategies:
     use_options: true
     underlyings:
     - name: "NIFTY INDEX"
+      index: true
       spot_exchange: NSE
       option_exchange: NFO
     - name: "SENSEX"
+      index: true
       spot_exchange: BSE
       option_exchange: BFO
     
@@ -73,7 +77,7 @@ strategies:
       exit_time: "15:15:00"
       fast_ema: 5
       slow_ema: 21
-      retracement_percent: 60  # Percentage for retracement back to EMA21
+      retracement_percent: 70  # Percentage for retracement back to EMA21
       stop_loss_percent: 40    # 40% of capital deployed
       target_percent: 50       # 50% of capital deployed
     
@@ -101,9 +105,11 @@ strategies:
     use_options: true
     underlyings:
     - name: "NIFTY INDEX"
+      index: true
       spot_exchange: NSE
       option_exchange: NFO
     - name: "SENSEX"
+      index: true
       spot_exchange: BSE
       option_exchange: BFO
     
@@ -117,12 +123,12 @@ strategies:
       exit_time: "15:15:00"
       stop_loss_percent: 5
       target_percent: 10
-      fast_ema_period: 5
-      slow_ema_period: 20
-      rsi_period: 14
+      fast_ema_period: 3  # 5
+      slow_ema_period: 5 # 20
+      rsi_period: 5 # 14
       rsi_upper_band: 70
       rsi_lower_band: 30
-      breakout_bars: 3
+      breakout_bars: 1 # 3
       cooldown_period_seconds: 300 # 5 minutes
     
     data:
@@ -137,6 +143,146 @@ strategies:
     risk:
       max_positions: 2 # Can hold one CE and one PE, or one per underlying if configured for multiple
       max_risk_per_trade: 1.0  # percentage of portfolio, adjust as per risk appetite for high hit-rate strategy
+
+  # trend_rider_option_buyer:
+  #   enabled: true
+  #   type: "trend_rider_option_buyer_strategy"
+  #   description: "Option buying strategy using EMA crossover and ADX for NIFTY & SENSEX."
+    
+  #   # Define which underlyings this strategy instance will trade.
+  #   # StrategyManager will use this to request data via DataManager for these underlyings.
+  #   underlyings:
+  #   - name: "NIFTY INDEX" # Must match a configured underlying in config.yaml or be discoverable
+  #     index: true
+  #     spot_exchange: "NSE" # Exchange of the underlying
+  #     option_exchange: "NFO" # Exchange for the options
+  #     # instrument_type: "INDEX" # Optional: helps DataManager/OptionManager
+  #     # asset_class: "INDEX"   # Optional: helps DataManager/OptionManager
+  #   - name: "SENSEX"
+  #     index: true
+  #     spot_exchange: "BSE"
+  #     option_exchange: "BFO" # Assuming BFO for SENSEX options
+  #     # instrument_type: "INDEX"
+  #     # asset_class: "INDEX"
+    
+  #   expiry_offset: 0  # 0=current weekly expiry, 1=next weekly expiry, etc.
+    
+  #   # Primary timeframe for indicator calculation and signal generation on underlyings.
+  #   timeframe: "5m" 
+  #   # additional_timeframes: [] # No other timeframes needed by this strategy for underlyings
+
+  #   parameters:
+  #     entry_time: "09:25:00"    # Start trading after initial volatility
+  #     exit_time: "15:10:00"     # Square off before market close
+      
+  #     fast_ema_period: 9
+  #     slow_ema_period: 21
+  #     adx_period: 14
+  #     adx_threshold: 20         # Minimum ADX value to consider a trend strong enough
+      
+  #     stop_loss_percent: 25     # Stop-loss as a percentage of option entry premium
+  #     target_percent: 50        # Target profit as a percentage of option entry premium
+      
+  #     otm_strikes_away: 0       # 0 for ATM, 1 for 1st OTM, etc.
+  #     cooldown_period_seconds: 300 # 5 minutes cooldown for an underlying after an exit
+
+  #   data:
+  #     # min_history_bars: 50 # For EMA and ADX (e.g., 21 for slow_ema + 14 for ADX + buffer)
+  #     # warmup_bars: 35      # Should be less than min_history_bars
+  #     # These are more relevant for backtesting; for live, DataManager handles history.
+  #     # BaseStrategy's max_bars_to_keep will manage DataFrame size in memory.
+  #     max_bars_to_keep: 200 # Max bars to keep in memory per symbol/timeframe
+
+  #   execution:
+  #     order_type: "MARKET"    # Could be "LIMIT" with some slippage logic
+  #     quantity: 1             # Base quantity in lots. Actual trade quantity from Portfolio/Risk Manager.
+  #     # slippage_percent: 0.1 # For backtesting or if order execution logic uses it
+    
+  #   risk: # These are conceptual for the strategy; actual enforcement by RiskManager
+  #     max_positions_per_underlying: 1 # Allow only one option (CE or PE) per underlying at a time
+  #     # max_risk_per_trade_percent: 1.0 # e.g. 1% of capital, for RiskManager to consider
+
+  # gamma_scalping_iv_filter:
+  #   enabled: true
+  #   type: "gamma_scalping_iv_filter_strategy" # Must match the name registered in StrategyRegistry
+  #   description: "Gamma Scalping Straddle with IV filter for NIFTY INDEX"
+    
+  #   timeframe: "15m" # Primary timeframe for underlying analysis
+  #   # additional_timeframes: ["1d"] # If daily data is used for IV/Consolidation and fetched this way
+    
+  #   underlyings: # List of underlyings this strategy instance will trade
+  #     - name: "NIFTY INDEX"
+  #       index: true
+  #       exchange: "NSE" # Spot exchange for the underlying
+  #       option_exchange: "NFO" # Options exchange
+
+  #   parameters:
+  #     iv_percentile_lookback_days: 252
+  #     iv_percentile_threshold: 25.0  # Enter if IV percentile is LESS than this
+  #     bb_period: 20
+  #     bb_std_dev: 2.0
+  #     consolidation_days: 5
+  #     consolidation_max_range_percent: 1.0 # Max daily range % of current price
+  #     atm_strike_proximity_percent: 0.5 # Underlying price must be within 0.5% of ATM strike
+
+  #     profit_target_percent_on_premium: 2.0 # e.g., 2% profit on total premium paid
+  #     stop_loss_percent_on_premium: 15.0  # e.g., 15% loss on total premium paid
+  #     max_holding_period_hours: 24
+
+  #     trade_entry_start_time: '09:30:00' # Start looking for entries
+  #     trade_entry_end_time: '14:30:00'   # Stop looking for new entries (allows time for exit before EOD)
+  #     cooldown_period_minutes: 60 # Cooldown after exiting a straddle on an underlying
+
+  #   execution:
+  #     quantity_per_leg: 1 # Number of lots for Call, and 1 for Put
+
+  #   # Data requirements (can be used by BaseStrategy or for info)
+  #   data:
+  #     min_history_bars_15m: 150 # For BB (20) + Consolidation (5 days * ~26 bars/day)
+  #     min_history_bars_1d: 260 # For IV percentile (252) + Consolidation (5)
+  #     # warmup_bars: ...
+
+  # iv_crush_calendar_condor:
+  #   enabled: true
+  #   type: "iv_crush_calendar_condor_strategy"
+  #   description: "IV Crush Calendar Iron Condor for NIFTY"
+  #   timeframe: "1d" # Daily check for entry logic
+  #   # additional_timeframes: ["1m"] # For MTM of options if needed, handled by MarketDataEvent
+
+  #   underlyings:
+  #     - name: "NIFTY INDEX"
+  #       index: true
+  #       exchange: "NSE"
+  #       option_exchange: "NFO"
+
+  #   parameters:
+  #     iv_skew_threshold_percent: 15.0  # Enter if 7D IV is >15% higher than 21D IV
+  #     sma_period: 20
+  #     sma_band_percent: 1.5 # Spot must be within SMA +/- 1.5%
+      
+  #     short_dte_target: 7   # Target DTE for short options
+  #     long_dte_target: 21   # Target DTE for long options (calendar part)
+      
+  #     short_leg_delta: 16.0 # Delta for short strikes of the 7DTE condor
+  #     long_wing_delta: 8.0  # Delta for long wing strikes of the 7DTE condor
+  #                           # Same strikes used for 21DTE condor but opposite positions
+
+  #     min_credit_to_cost_ratio: 1.2
+  #     estimated_cost_per_leg: 30.0 # Rough estimate per leg (brokerage + slippage)
+
+  #     profit_target_percent_of_max_profit: 60.0 # Exit if PNL reaches 60% of initial net credit
+  #     stop_loss_multiplier_on_credit: 1.5     # Exit if PNL drops to -150% of initial net credit
+  #     exit_before_short_expiry_days: 1        # Exit if 7DTE options have 1 or 0 DTE
+
+  #     daily_check_time: '15:00:00' # Time to perform daily checks and potential entries
+
+  #     vix_instrument_id: "NSE:INDIA VIX" # For VIX based position sizing (simplified)
+  #     base_capital_allocation_percent: 5.0
+  #     max_capital_allocation_percent_low_vix: 7.5
+  #     low_vix_threshold: 15.0
+
+  #   execution:
+  #     quantity_per_spread: 1 # Number of lots for each of the 4 spreads (total 8 legs)
 
   # Iron Butterfly Strategy
   # iron_butterfly:

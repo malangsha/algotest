@@ -54,7 +54,7 @@ class MarketDataFeedBase(ABC):
               if key not in self._instrument_lookup:
                    self.instruments.append(instrument)
                    self._instrument_lookup[key] = instrument
-                   self.logger.info(f"Added instrument {key} to feed tracking.")
+                   # self.logger.info(f"Added instrument {key} to feed tracking.")
               else:
                    # Optionally update the existing instrument object
                    # self._instrument_lookup[key] = instrument
@@ -738,7 +738,7 @@ class FinvasiaFeed(MarketDataFeedBase):
                     return True               
                     
                 response = self.api.subscribe([f"{exchange_str}|{token}"])
-                self.logger.debug(f"Subscription response: {response}")                
+                # self.logger.debug(f"Subscription response: {response}")                
                 # if not isinstance(response, dict) or response.get('stat') != 'Ok':
                 #     self.logger.error(f"Subscription failed: {response}")
                 #     return False
@@ -939,7 +939,7 @@ class FinvasiaFeed(MarketDataFeedBase):
                 if not market_data:
                     return
                 
-                # self.logger.debug(f"market_data: {market_data}")
+                #self.logger.debug(f"market_data: {market_data}")
                 
                 # Create market data event
                 event = MarketDataEvent(

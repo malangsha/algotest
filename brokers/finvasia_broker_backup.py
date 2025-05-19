@@ -722,6 +722,14 @@ class FinvasiaBroker(BrokerInterface):
         except Exception as e:
             self.logger.error(f"Error publishing market data event: {str(e)}")
 
+    def _get_exchange_symbol(self, symbol: str) -> Tuple[str, str]:
+        if ":" in symbol:
+            exchange, trading_symbol = symbol.split(":", 1)
+        else:
+            exchange = ""
+            trading_symbol = symbol
+        return exchange, trading_symbol
+    
     def place_order(self, order: Order) -> str:
         """
         Place a new order with the broker.

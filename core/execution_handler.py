@@ -1,10 +1,7 @@
-#!/usr/bin/env python
 """
 Execution handlers that process orders and submit them to appropriate venues.
 """
-
 import uuid
-import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Union
 from enum import Enum
@@ -14,6 +11,8 @@ from models.events import Event, EventType, OrderEvent
 from models.order import Order, OrderStatus, OrderType
 from utils.constants import OrderSide
 from brokers.broker_interface import BrokerInterface
+from core.logging_manager import get_logger
+
 
 class ExecutionHandler:
     """
@@ -28,7 +27,7 @@ class ExecutionHandler:
             event_manager: The system's EventManager.
             broker_interface: The interface to the broker.
         """
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger(__name__)
         self.event_manager = event_manager
         self.broker_interface = broker_interface
         self._register_event_handlers()

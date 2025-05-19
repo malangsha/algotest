@@ -16,7 +16,7 @@ from models.events import (Event,
 
 from models.order import Order, OrderType
 from models.position import Position
-from utils.constants import (SignalType, OrderSide,
+from utils.constants import (SignalType, OrderSide, 
     Timeframe, EventPriority, Exchange)
 
 from models.instrument import (Instrument,
@@ -179,7 +179,7 @@ class OptionStrategy(ABC):
         if not isinstance(event, MarketDataEvent) or not event.instrument:
             return
         self.last_heartbeat = time.time()
-        instrument_id = event.instrument.instrument_id
+        # instrument_id = event.instrument.instrument_id # Not used directly here
 
         # Strategies should define their logic in on_market_data.
         # BaseStrategy can provide common filtering if desired, e.g., based on self.used_symbols.
@@ -211,30 +211,53 @@ class OptionStrategy(ABC):
 
 
     def _handle_position(self, event: Event):
-        if not isinstance(event, PositionEvent) or not hasattr(event, "position") or not event.position:
-            self.logger.debug(f"Strategy {self.id} received non-PositionEvent or event with no position data: {type(event)}")
+        if not isinstance(event, PositionEvent): # Simplified check, assuming event.position exists if it's a PositionEvent
+            self.logger.debug(f"Strategy {self.id} received non-PositionEvent: {type(event)}")
             return
         
-        position_obj = event.position
-        if not hasattr(position_obj, 'instrument_id') or not position_obj.instrument_id:
-            self.logger.warning(f"Strategy {self.id} received PositionEvent with invalid position data (missing instrument_id): {event.position}")
+        # Assuming event structure from PositionEvent definition
+        # The original code had `event.position` which might be if PositionEvent wraps a Position object.
+        # If PositionEvent *is* the position data, access attributes directly.
+        # Let's assume PositionEvent has attributes like instrument_id, quantity directly.
+        # If event.position is the actual Position object:
+        # position_obj = getattr(event, 'position', None)
+        # if not position_obj or not hasattr(position_obj, 'instrument_id') or not position_obj.instrument_id:
+
+        # Assuming PositionEvent itself has the attributes:
+        position_instrument_id = getattr(event, 'symbol', None) # PositionEvent uses 'symbol' for instrument_id concept
+        quantity = getattr(event, 'quantity', 0)
+
+        if not position_instrument_id:
+            self.logger.warning(f"Strategy {self.id} received PositionEvent with invalid position data (missing symbol/instrument_id): {event}")
             return
         
-        position_instrument_id = position_obj.instrument_id
-        if position_obj.quantity == 0:
+        if quantity == 0:
             removed_pos = self.positions.pop(position_instrument_id, None)
             if removed_pos:
                 self.logger.info(f"Strategy {self.id}: Position for {position_instrument_id} (Qty: {removed_pos.quantity}) closed and removed from local cache.")
         else:
-            self.positions[position_instrument_id] = position_obj
-            self.logger.info(f"Strategy {self.id}: Position for {position_instrument_id} updated in local cache. New Qty: {position_obj.quantity}, Avg Price: {getattr(position_obj, 'average_price', 'N/A')}")
+            # Assuming PositionEvent can be directly stored or converted to a Position object
+            # For simplicity, if PositionEvent has all needed fields, we can store it or its relevant parts.
+            # This might need adjustment based on actual Position and PositionEvent structures.
+            # If event is the Position object itself (passed via event.position):
+            # self.positions[position_instrument_id] = event.position
+            # If PositionEvent is a dataclass with the fields:
+            current_position = Position(
+                symbol=event.symbol,
+                exchange=getattr(event, 'exchange', None), # Add exchange if available
+                quantity=event.quantity,
+                average_price=getattr(event, 'average_price', 0.0),
+                # Add other relevant fields from PositionEvent to Position object
+            )
+            self.positions[position_instrument_id] = current_position
+            self.logger.info(f"Strategy {self.id}: Position for {position_instrument_id} updated in local cache. New Qty: {quantity}, Avg Price: {getattr(event, 'average_price', 'N/A')}")
         
         self.on_position(event)
 
 
     def _handle_fill(self, event: Event):
         """Internal handler for FillEvent."""
-        if not isinstance(event, FillEvent) or not hasattr(event, "instrument_id"): return
+        if not isinstance(event, FillEvent) or not hasattr(event, "symbol"): return # FillEvent uses 'symbol'
         # Strategies usually care about fills for any instrument they might have ordered.
         # Further filtering can be done in the strategy's on_fill method.
         self.on_fill(event)
@@ -242,8 +265,7 @@ class OptionStrategy(ABC):
 
     def _handle_order(self, event: Event):
         """Internal handler for OrderEvent."""
-        if not isinstance(event, OrderEvent) or not hasattr(event, "order") or not event.order \
-           or not hasattr(event.order, "instrument_id"):
+        if not isinstance(event, OrderEvent) or not hasattr(event, "symbol"): # OrderEvent uses 'symbol'
             return
         # Similar to FillEvent, strategies generally want to see all their order updates.
         self.on_order(event)
@@ -363,35 +385,86 @@ class OptionStrategy(ABC):
 
 
     def generate_signal(self, instrument_id: str, signal_type: SignalType, data: Dict[str, Any] = None, priority: EventPriority = EventPriority.NORMAL):
+        """
+        Generates and publishes a SignalEvent.
+
+        Args:
+            instrument_id (str): The unique identifier of the instrument (e.g., "NFO:NIFTY24MAY23000CE").
+            signal_type (SignalType): The type of signal (e.g., SignalType.BUY_CALL).
+            data (Dict[str, Any], optional): Additional data for the signal, typically including
+                                             quantity, order_type, price, etc. Defaults to None.
+            priority (EventPriority, optional): Priority of the event. Defaults to EventPriority.NORMAL.
+        """
         if not instrument_id:
             self.logger.error("Cannot generate signal: instrument_id is required.")
             return
-        if not signal_type: # Assuming SignalType is an Enum
+        if not signal_type:
             self.logger.error("Cannot generate signal: signal_type is required.")
             return
+        
+        data = data or {} # Ensure data is a dict
 
+        # Fetch the full Instrument object using instrument_id
+        # instrument_id is expected to be in "EXCHANGE:SYMBOL" format if DataManager uses that for lookup.
+        # If DataManager expects separate symbol and exchange, this part needs adjustment.
+        # For now, assuming DataManager can resolve instrument_id to an Instrument object.
         instrument_obj = self.data_manager.get_instrument(instrument_id)
         if not instrument_obj:
             self.logger.error(f"Cannot generate signal: Instrument not found for id '{instrument_id}'. Signal generation aborted.")
-            # Fallback to create a basic instrument is risky as it might lack crucial details (lot_size, tick_size).
-            # It's better to ensure instruments are properly managed by DataManager/OptionManager.
             return
 
+        # Extract order parameters from data, with defaults
+        # These should align with SignalEvent fields
+        signal_side = data.get('side', OrderSide.BUY) # Default side if not in data
+        signal_quantity = data.get('quantity')
+        signal_order_type = data.get('order_type', OrderType.MARKET) # Default to MARKET if not specified
+        signal_price = data.get('price') # For LIMIT orders
+        signal_trigger_price = data.get('trigger_price') # For STOP orders
+
+        # Validate required data for order generation
+        if signal_quantity is None:
+            self.logger.error(f"Cannot generate signal for {instrument_id}: 'quantity' missing in data.")
+            return
+        if signal_order_type == OrderType.LIMIT and signal_price is None:
+            self.logger.error(f"Cannot generate LIMIT order signal for {instrument_id}: 'price' missing in data.")
+            return
+        if (signal_order_type == OrderType.STOP or signal_order_type == OrderType.STOP_LIMIT) and signal_trigger_price is None:
+             self.logger.error(f"Cannot generate STOP order signal for {instrument_id}: 'trigger_price' missing in data.")
+             return
+
+
+        # Create the SignalEvent
         signal_event = SignalEvent(
-            symbol=instrument_obj.symbol,
-            exchange=instrument_obj.exchange,
-            signal_type=signal_type,
-            side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            quantity=data['quantity'],
-            price=data['underlying_price_at_signal'],            
-            strategy_id=self.id,
             event_type=EventType.SIGNAL,
-            timestamp=int(datetime.now().timestamp() * 1000) # Consider using event timestamp from market data if signal is derived from it            
+            # FIX: Ensure timestamp is an integer (milliseconds since epoch)
+            timestamp=int(datetime.now().timestamp() * 1000),
+            priority=priority,
+            symbol=instrument_obj.symbol, # Trading symbol part, e.g., "NIFTY24MAY23000CE"
+            exchange=instrument_obj.exchange, # Exchange enum, e.g., Exchange.NFO
+            signal_type=signal_type,
+            # signal_price is the price at which the signal was generated (e.g., underlying price)
+            # data.get('underlying_price_at_signal') was used in simple_test_option_strategy
+            # For a generic signal, this might be the current market price of the instrument itself.
+            signal_price=data.get('underlying_price_at_signal', data.get('signal_price', 0.0)),
+            strategy_id=self.id,
+            # --- Fields for direct order creation from signal ---
+            side=signal_side, # e.g., OrderSide.BUY
+            quantity=signal_quantity,
+            order_type=signal_order_type, # e.g., OrderType.LIMIT
+            price=signal_price, # Price for the order (e.g., limit price for the option)
+            trigger_price=signal_trigger_price,
+            # --- Optional fields ---
+            # expiry, confidence, metadata can be added from data if available
+            metadata=data.get('metadata', {'source_strategy_data': data}) # Store original data in metadata
         )
+
+        # Publish the event
         self.event_manager.publish(signal_event)
         self.signals_generated += 1
-        self.logger.info(f"Strategy {self.id} generated {signal_type.value} signal for {instrument_id} (Priority: {priority.name}). Data: {data}")
+        self.logger.info(f"Strategy {self.id} generated {signal_type.value if hasattr(signal_type, 'value') else signal_type} signal for {instrument_id} "
+                         f"(Symbol: {instrument_obj.symbol}, Exchange: {instrument_obj.exchange.value if hasattr(instrument_obj.exchange, 'value') else instrument_obj.exchange}). "
+                         f"Order Params: Side={signal_side}, Qty={signal_quantity}, Type={signal_order_type}, Price={signal_price}, TrigPrice={signal_trigger_price}. "
+                         f"Priority: {priority.name}.")
 
 
     def get_bars(self, instrument_id: str, timeframe: str = None, limit: int = None,
@@ -406,6 +479,8 @@ class OptionStrategy(ABC):
             return None
             
         self.logger.debug(f"Strategy {self.id} requesting bars for {instrument_id}@{tf_to_use} (Limit: {limit}, Start: {start_time}, End: {end_time})")
+        # Assuming instrument_id is in "EXCHANGE:SYMBOL" format or DataManager can handle it.
+        # If DataManager expects separate symbol and exchange, split instrument_id here.
         return self.data_manager.get_historical_data(symbol=instrument_id, timeframe=tf_to_use, n_bars=limit, start_time=start_time, end_time=end_time)
 
 

@@ -387,7 +387,7 @@ class OptionStrategy(ABC):
             price=data['underlying_price_at_signal'],            
             strategy_id=self.id,
             event_type=EventType.SIGNAL,
-            timestamp=int(datetime.now().timestamp() * 1000) # Consider using event timestamp from market data if signal is derived from it            
+            timestamp=datetime.now() # Consider using event timestamp from market data if signal is derived from it            
         )
         self.event_manager.publish(signal_event)
         self.signals_generated += 1

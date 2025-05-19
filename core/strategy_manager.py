@@ -140,9 +140,9 @@ class StrategyManager:
 
     def _handle_strategy_signal(self, event: Event):
         if not isinstance(event, SignalEvent): return
-        if self.risk_manager and not self.risk_manager.validate_signal(event):
-            self.logger.warning(f"Signal rejected by risk manager: {event}")
-            return
+        # if self.risk_manager and not self.risk_manager.validate_signal(event):
+        #     self.logger.warning(f"Signal rejected by risk manager: {event}")
+        #     return
         self._process_signal(event)
 
     def _on_bar(self, event: BarEvent):

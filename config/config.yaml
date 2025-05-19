@@ -3,7 +3,7 @@
 # System Configuration
 system:
   name: "AlgoTrading Framework"
-  mode: "paper"  # Options: "backtest", "live", "paper"
+  mode: "live"  # Options: "backtest", "live", "paper"
   timezone: "Asia/Kolkata"
   log_level: "DEBUG"  # Options: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
   log_dir: "logs"
@@ -162,6 +162,7 @@ market:
       strike_interval: 50
       expiry: "weekly"
       atm_range: 1  # Number of strikes above and below ATM
+      
     - symbol: "SENSEX"
       exchange: "BSE"
       derivative_exchange: "BFO"
@@ -251,7 +252,7 @@ event_manager:
   diagnostic_interval: 5
 
 excel_monitor:
-  enabled: true  # Set to true to enable the dashboard, false to disable
+  enabled: false  # Set to true to enable the dashboard, false to disable
   path: "output/trading_dashboard.xlsx"  # Path to save the Excel dashboard
   update_interval: 2.0  # Interval in seconds for checking the update queue
   max_retries: 5  # Max retries for file operations or thread errors

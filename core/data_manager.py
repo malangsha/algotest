@@ -714,10 +714,18 @@ class DataManager:
                 date_str = date_obj.strftime('%Y-%m-%d')
                 persist_dir = os.path.join(self.persistence_path, 'bars', date_str, exchange, timeframe)
                 os.makedirs(persist_dir, exist_ok=True)
-                file_path = os.path.join(persist_dir, f"{safe_symbol}.parquet")
-                
-                # Prepare for saving: set epoch timestamp as index, drop helper datetime column
-                final_save_df = date_df_group.set_index('timestamp').drop(columns=['datetime'], errors='ignore')
+                file_path = os.path.join(persist_dir, f"{safe_symbol}.parquet")                
+
+                # Prepare for saving. The goal is to have the primary timestamp identifier in HH:MM format.
+                # The original 'timestamp' column in date_df_group is epoch seconds.
+                # This epoch timestamp was previously used as the index of the stored Parquet file.
+                # We will now convert this to an HH:MM string (in 'Asia/Kolkata' timezone) and use that as the index.
+                temp_df = date_df_group.copy() # Work on a copy
+                # Convert epoch 'timestamp' column to a timezone-aware datetime, then format as HH:MM string.
+                # Assumes 'Asia/Kolkata' is the desired timezone for HH:MM representation, consistent with EnhancedTimeframeManager.
+                temp_df['timestamp_hhmm'] = pd.to_datetime(temp_df['timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.strftime('%H:%M')
+                # Set the new HH:MM string as the index. Drop the original epoch 'timestamp' column and the helper 'datetime' column.
+                final_save_df = temp_df.drop(columns=['timestamp', 'datetime']).set_index('timestamp_hhmm')
                 
                 try:
                     if os.path.exists(file_path):

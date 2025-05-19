@@ -517,6 +517,8 @@ class TradingEngine:
                 self.logger.warning(f"Invalid SignalEvent received: {event}")
                 return
                 
+            # need to handle this event carefully, it will not have any data for ow.
+            return        
             signal_data = event.data # Assuming event.data holds signal details
             self.logger.debug(f"Processing signal event: {signal_data}")
 
@@ -935,6 +937,10 @@ class TradingEngine:
             self.logger.error(f"Cannot place order - engine is not running or paused. Running: {self.running}, Paused: {self.paused}")
             return False
 
+        
+        # again nothing for now, revisit this later
+        return True
+    
         # Validate order through RiskManager first
         if not self.risk_manager.validate_order(order):
              self.logger.warning(f"Order rejected by Risk Manager: {order}")

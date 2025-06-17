@@ -14,11 +14,13 @@ from models.events import Event, EventType, AccountEvent, FillEvent, PositionEve
 from core.event_manager import EventManager
 from core.position_manager import PositionManager
 from utils.constants import OrderSide
+from core.portfolio import Portfolio 
+from core.logging_manager import get_logger
 
 class PerformanceTracker:
     """Tracks and calculates performance metrics for strategies and portfolio"""
 
-    def __init__(self, portfolio, config, event_manager: EventManager = None, position_manager: PositionManager = None):
+    def __init__(self, portfolio: Portfolio, config, event_manager: EventManager = None, position_manager: PositionManager = None):
         """
         Initialize the performance tracker
 
@@ -28,7 +30,7 @@ class PerformanceTracker:
             event_manager: EventManager instance
             position_manager: PositionManager instance
         """
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger(__name__)
         self.portfolio = portfolio
         self.config = config
         self.event_manager = event_manager
@@ -81,8 +83,12 @@ class PerformanceTracker:
         )
         self.logger.info("PerformanceTracker registered with Event Manager")
 
-    def _on_account_event(self, event: AccountEvent):
+    def _on_account_event(self, event: Event):
         """Handle Account events to track portfolio value changes."""
+        if not isinstance(event, AccountEvent):
+            self.logger.warning(f"Invalid account event type received: {type(event)}")
+            return
+        
         if hasattr(event, 'equity') and hasattr(event, 'timestamp'):
             ts = datetime.fromtimestamp(event.timestamp / 1000)
             self.record_portfolio_value(ts, event.equity)
@@ -90,14 +96,18 @@ class PerformanceTracker:
         else:
             self.logger.warning("Received AccountEvent missing equity or timestamp")
 
-    def _on_position_event(self, event: PositionEvent):
+    def _on_position_event(self, event: Event):
         """Handle Position events to record completed trades."""
+        if not isinstance(event, PositionEvent):
+            self.logger.warning(f"Invalid position event type received: {type(event)}")
+            return
+        
         if not self.position_manager:
             self.logger.warning("PositionManager not available, cannot record trades from positions.")
             return
 
-        if not hasattr(event, 'symbol') or not hasattr(event, 'quantity') or not hasattr(event, 'price') or not hasattr(event, 'side'):
-            self.logger.warning("PositionEvent missing required fields for trade recording.")
+        if not hasattr(event, 'symbol'):
+            self.logger.warning("PositionEvent missing symbol for trade recording.")
             return
 
         position = self.position_manager.get_position(event.symbol)
@@ -112,7 +122,7 @@ class PerformanceTracker:
                 self.logger.warning(f"PositionEvent for closed position {event.symbol} missing closing_trade_details.")
 
             trade_quantity = closing_details.get('quantity', 0) if closing_details else 0
-            trade_price = closing_details.get('exit_price', event.average_price) if closing_details else event.average_price
+            trade_price = closing_details.get('exit_price', event.avg_price) if closing_details else event.avg_price
             trade_side = OrderSide.BUY.value if closing_details and closing_details.get('type') == 'CLOSE_SHORT' else OrderSide.SELL.value if closing_details else 'UNKNOWN'
             trade_timestamp = closing_details.get('timestamp', datetime.fromtimestamp(event.timestamp / 1000)) if closing_details else datetime.fromtimestamp(event.timestamp / 1000)
 

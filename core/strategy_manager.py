@@ -173,7 +173,7 @@ class StrategyManager:
         
         # self.logger.debug(f"_on_bar: symbol_key: {symbol_key}, timeframe: {timeframe}, strategies_to_notify: {strategies_to_notify}")
         if strategies_to_notify:
-            self.logger.debug(f"Dispatching BarEvent for {symbol_key}@{timeframe} to {len(strategies_to_notify)} strategies.")
+            # self.logger.debug(f"Dispatching BarEvent for {symbol_key}@{timeframe} to {len(strategies_to_notify)} strategies.")
             # Submit all valid strategies at once
             # No lock needed here for self.strategy_executor.submit, it's thread-safe
             futures = [
@@ -630,7 +630,7 @@ class StrategyManager:
         # Example: self.broker.execute_order_from_signal(signal)
         
         # Publishing to EventManager allows other components (like PortfolioManager) to pick it up.
-        self.event_manager.publish(signal) # Let EM route it based on subscriptions
+        # self.event_manager.publish(signal) # Let EM route it based on subscriptions
 
 
     def shutdown(self):

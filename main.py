@@ -187,8 +187,8 @@ def setup_signal_handlers():
                 # Try different possible shutdown methods
                 if hasattr(current_engine, 'stop') and callable(current_engine.stop):
                     current_engine.stop()
-                elif hasattr(current_engine, 'shutdown') and callable(current_engine.shutdown):
-                    current_engine.shutdown()
+                # elif hasattr(current_engine, 'shutdown') and callable(current_engine.shutdown):
+                #     current_engine.shutdown()
                 else:
                     logger.warning("Engine does not have a stop or shutdown method")
                 logger.info("Trading engine stopped")
@@ -394,7 +394,7 @@ def main() -> int:
             output_dir.mkdir(exist_ok=True, parents=True)
             config.setdefault('system', {})['output_dir'] = str(output_dir)
             logger.info(f"Output directory set to {output_dir}")
-
+      
         # Enable debug mode if requested
         if args.debug:
             config.setdefault('system', {})['debug'] = True
@@ -406,7 +406,7 @@ def main() -> int:
                 config, 
                 strategy_config
             )
-        elif args.mode == 'live' or args.mode == 'paper':
+        elif args.mode == 'live' or args.mode == 'paper' or args.mode == 'simulated':
             return run_live_mode(
                 config, 
                 strategy_config

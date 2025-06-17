@@ -52,8 +52,8 @@ strategies:
       max_bars_to_keep: 250 # Max bars to keep in memory per symbol/timeframe (for underlying data)
 
     execution:
-      order_type: "MARKET"    # Order type for placing trades (MARKET, LIMIT)
-      product_type: "INTRADAY" # MIS/NRML (or your broker's equivalent for intraday)
+      order_type: "LIMIT"    # Order type for placing trades (MARKET, LIMIT)
+      product_type: "NRML" # MIS/NRML (or your broker's equivalent for intraday)
       quantity: 1             # Base quantity in lots for option trades.
       # slippage_percent: 0.1 # For backtesting simulation if your framework supports it
 

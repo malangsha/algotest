@@ -38,7 +38,6 @@ class Position:
         self.last_price: Optional[float] = None
         self.last_update_time: Optional[datetime] = None
         self.last_trade_pnl: Optional[float] = None
-        # Details of the last closing transaction(s)
         self.last_closed_trade_details: Optional[Dict] = None
         
     def __str__(self):

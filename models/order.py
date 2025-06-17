@@ -1,33 +1,19 @@
 from enum import Enum
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+from utils.constants import OrderStatus, OrderType
+
 import uuid
 import logging
 
 logger = logging.getLogger("models.order")
-
-class OrderType(Enum):
-    MARKET = "MARKET"
-    LIMIT = "LIMIT"
-    STOP = "STOP"
-    STOP_LIMIT = "STOP_LIMIT"
-
-class OrderStatus(Enum):
-    CREATED = "CREATED"
-    SUBMITTED = "SUBMITTED"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    PENDING = "PENDING"
-    CANCELED = "CANCELED"
-    CANCELLED = "CANCELLED"  # Alternative spelling for backward compatibility
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
 
 class OrderActionType(Enum):
     CREATE = "CREATE"
     SUBMIT = "SUBMIT"
     CANCEL = "CANCEL"
     MODIFY = "MODIFY"
+    PENDING = "PENDING"
     UPDATE_STATUS = "UPDATE_STATUS"
     UPDATE_FILL = "UPDATE_FILL"
     
@@ -65,46 +51,58 @@ class Order:
         self,
         instrument_id: str,
         quantity: float,
-        side: str,
+        side: str, # BUY or SELL
         order_type: OrderType = OrderType.MARKET,
+        product_type: Optional[str] = None, # e.g., MIS, CNC, NRML
+        exchange: Optional[str] = None, # e.g., NSE, BSE, NFO
         price: Optional[float] = None,
-        stop_price: Optional[float] = None,
-        time_in_force: str = "DAY",
+        stop_price: Optional[float] = None, # Also known as trigger_price for stop orders
+        time_in_force: str = "DAY", # e.g., DAY, IOC, GTC
         strategy_id: Optional[str] = None,
-        params: Optional[Dict[str, Any]] = None,
-        action: Optional[str] = None  # For backward compatibility
+        params: Optional[Dict[str, Any]] = None, # For additional broker-specific or custom parameters
+        action: Optional[str] = None,  # For backward compatibility, 'side' is preferred
+        # client_order_id: Optional[str] = None # Optional: if you want to track a client-provided ID
+        rejection_reason: Optional[str] = None # Added rejection_reason
     ):
         self.order_id = str(uuid.uuid4())
         self.instrument_id = instrument_id
         self.quantity = quantity
-        
+        self.product_type = product_type
+        self.exchange = exchange
+
         # Standardize side and action - side is the canonical parameter
         if side:
-            self.side = side.upper()  # BUY or SELL
-            self.action = side.upper()  # Set action for backward compatibility
+            self.side = side.upper() # Ensure BUY or SELL
+            self.action = self.side  # Set action for backward compatibility
         elif action:
             self.side = action.upper()
-            self.action = action.upper()
+            self.action = self.side
         else:
-            raise OrderValidationError("Either side or action must be provided")
-            
-        self.order_type = order_type
+            raise OrderValidationError("Either 'side' or 'action' (for backward compatibility) must be provided and be 'BUY' or 'SELL'")
+
+        if self.side not in ["BUY", "SELL"]:
+             raise OrderValidationError(f"Invalid side/action: '{self.side}'. Must be 'BUY' or 'SELL'.")
+
+
+        self.order_type = order_type # Should be an instance of OrderType enum
         self.price = price
         self.stop_price = stop_price
         self.time_in_force = time_in_force
         self.strategy_id = strategy_id
         self.params = params or {}
+        # self.client_order_id = client_order_id
 
-        self.status = OrderStatus.CREATED
+        self.status: OrderStatus = OrderStatus.CREATED # Should be an instance of OrderStatus enum
         self.filled_quantity = 0.0
         self.average_fill_price = 0.0
         self.created_at = datetime.now()
-        self.submitted_at = None
-        self.filled_at = None
-        self.canceled_at = None
-        self.broker_order_id = None
+        self.submitted_at: Optional[datetime] = None
+        self.filled_at: Optional[datetime] = None
+        self.canceled_at: Optional[datetime] = None
+        self.broker_order_id: Optional[str] = None
         self.last_updated = self.created_at
-        
+        self.rejection_reason = rejection_reason # Initialize rejection_reason
+
         # Validate the order
         self.validate()
 
@@ -112,36 +110,45 @@ class Order:
         # Handle both string and enum values for order_type and status
         order_type_str = self.order_type.value if hasattr(self.order_type, 'value') else str(self.order_type)
         status_str = self.status.value if hasattr(self.status, 'value') else str(self.status)
-        
+
         return (f"Order(id={self.order_id}, instrument={self.instrument_id}, "
                 f"side={self.side}, qty={self.quantity}, type={order_type_str}, "
-                f"status={status_str})")
-                
+                f"status={status_str}{f', reason={self.rejection_reason}' if self.rejection_reason else ''})")
+
     def validate(self) -> bool:
         """
         Validate that the order has all required fields.
-        
+
         Returns:
             bool: True if valid, raises exception otherwise
         """
-        required_fields = ["order_id", "instrument_id", "quantity", "side", "status"]
-        
+        required_fields = ["order_id", "instrument_id", "quantity", "side", "status", "exchange"]
+
         # Additional validation for specific order types
-        if self.order_type == OrderType.LIMIT and self.price is None:
+        # Assuming OrderType has .value for comparison if it's an enum, or it's directly comparable
+        order_type_value = self.order_type.value if isinstance(self.order_type, Enum) else self.order_type
+
+        if order_type_value == OrderType.LIMIT.value and self.price is None:
             error_msg = "Limit orders must have a price"
             logger.error(error_msg)
             raise OrderValidationError(error_msg)
-            
-        if self.order_type == OrderType.STOP and self.stop_price is None:
-            error_msg = "Stop orders must have a stop price"
+
+        if order_type_value == OrderType.SL.value and self.stop_price is None: # Assuming SL is a string or enum value
+            error_msg = "Stop orders (SL) must have a stop price (trigger_price)"
             logger.error(error_msg)
             raise OrderValidationError(error_msg)
-            
-        if self.order_type == OrderType.STOP_LIMIT and (self.stop_price is None or self.price is None):
-            error_msg = "Stop-limit orders must have both a price and a stop price"
-            logger.error(error_msg)
-            raise OrderValidationError(error_msg)
-            
+
+        if order_type_value == OrderType.SL_M.value and self.stop_price is None: # Assuming SL_M for Stop-Market
+             error_msg = "Stop-Market orders (SL-M) must have a stop price (trigger_price)"
+             logger.error(error_msg)
+             raise OrderValidationError(error_msg)
+        # Note: Original code had SL_M check `self.price is None`.
+        # For SL-M, price is not used to limit execution after trigger.
+        # If SL-M means Stop-Limit, then both price and stop_price are needed.
+        # Clarify if SL_M is Stop-Market or Stop-Limit. If Stop-Limit, original check was:
+        # if order_type_value == OrderType.SL_M.value and (self.stop_price is None or self.price is None):
+        #     error_msg = "Stop-limit orders must have both a price and a stop price"
+
         return validate_order(self, required_fields)
 
     def remaining_quantity(self) -> float:
@@ -156,7 +163,9 @@ class Order:
         """Check if the order is still active in the market"""
         active_statuses = [
             OrderStatus.CREATED,
+            OrderStatus.PENDING, # Added PENDING
             OrderStatus.SUBMITTED,
+            OrderStatus.OPEN, # Added OPEN
             OrderStatus.PARTIALLY_FILLED
         ]
         return self.status in active_statuses
@@ -164,10 +173,10 @@ class Order:
     def update_status(self, new_status: OrderStatus, timestamp: Optional[datetime] = None):
         """Update the order status and relevant timestamps"""
         timestamp = timestamp or datetime.now()
-        
+
         # Log status change
         logger.info(f"Order {self.order_id} status changed: {self.status.value if hasattr(self.status, 'value') else self.status} -> {new_status.value if hasattr(new_status, 'value') else new_status}")
-        
+
         self.status = new_status
         self.last_updated = timestamp
 
@@ -175,12 +184,19 @@ class Order:
             self.submitted_at = timestamp
         elif new_status == OrderStatus.FILLED:
             self.filled_at = timestamp
-        elif new_status == OrderStatus.CANCELED:
+        elif new_status == OrderStatus.CANCELLED: # Corrected from CANCELED
             self.canceled_at = timestamp
+        elif new_status == OrderStatus.REJECTED and not self.rejection_reason: # Set default if not already set
+            self.rejection_reason = "Rejected without specific reason"
+
 
     def update_fill(self, fill_quantity: float, fill_price: float, timestamp: Optional[datetime] = None):
         """Update the order with a new fill"""
         timestamp = timestamp or datetime.now()
+
+        if fill_quantity <= 0:
+            logger.warning(f"Attempted to update fill for order {self.order_id} with non-positive quantity: {fill_quantity}")
+            return
 
         # Calculate the new average fill price
         total_filled_value = (self.average_fill_price * self.filled_quantity) + (fill_price * fill_quantity)
@@ -190,13 +206,15 @@ class Order:
             self.average_fill_price = total_filled_value / self.filled_quantity
 
         # Update status based on fill
-        if abs(self.filled_quantity - self.quantity) < 1e-10:  # Account for floating point errors
+        # Using a small tolerance for float comparison
+        if abs(self.quantity - self.filled_quantity) < 1e-9: # Check if fully filled
             self.update_status(OrderStatus.FILLED, timestamp)
-        elif self.filled_quantity > 0:
+        elif self.filled_quantity > 0: # Partially filled
             self.update_status(OrderStatus.PARTIALLY_FILLED, timestamp)
+        # If filled_quantity is 0 after this (should not happen if fill_quantity > 0), status remains as is or PENDING/SUBMITTED
 
         self.last_updated = timestamp
-        
+
         logger.info(f"Order {self.order_id} filled: {fill_quantity} @ {fill_price}, total filled: {self.filled_quantity}/{self.quantity}")
 
     def to_dict(self) -> Dict[str, Any]:
@@ -207,12 +225,14 @@ class Order:
             "quantity": self.quantity,
             "side": self.side,
             "action": self.side,  # Include action for backward compatibility
-            "order_type": self.order_type.value,
+            "order_type": self.order_type.value if isinstance(self.order_type, Enum) else self.order_type,
+            "product_type": self.product_type,
+            "exchange": self.exchange,
             "price": self.price,
             "stop_price": self.stop_price,
             "time_in_force": self.time_in_force,
             "strategy_id": self.strategy_id,
-            "status": self.status.value,
+            "status": self.status.value if isinstance(self.status, Enum) else self.status,
             "filled_quantity": self.filled_quantity,
             "average_fill_price": self.average_fill_price,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -221,65 +241,81 @@ class Order:
             "canceled_at": self.canceled_at.isoformat() if self.canceled_at else None,
             "broker_order_id": self.broker_order_id,
             "last_updated": self.last_updated.isoformat() if self.last_updated else None,
+            "rejection_reason": self.rejection_reason, # Added rejection_reason
             "params": self.params
         }
-        
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Order':
         """Create an order object from a dictionary"""
-        # Parse enum values
-        order_type_str = data.get("order_type", OrderType.MARKET.value)
-        status_str = data.get("status", OrderStatus.CREATED.value)
-        
-        # Handle order_type
-        if isinstance(order_type_str, str):
-            order_type = OrderType(order_type_str)
-        else:
-            order_type = order_type_str
-            
-        # Handle status
-        if isinstance(status_str, str):
-            status = OrderStatus(status_str)
-        else:
-            status = status_str
-        
+        # Parse enum values safely
+        order_type_val = data.get("order_type")
+        if isinstance(order_type_val, str):
+            order_type_to_use = OrderType(order_type_val)
+        elif isinstance(order_type_val, OrderType):
+            order_type_to_use = order_type_val
+        else: # Default or raise error
+            order_type_to_use = OrderType.MARKET
+            logger.warning(f"Order type '{order_type_val}' not recognized or missing, defaulting to MARKET for order data: {data.get('order_id')}")
+
+
+        status_val = data.get("status")
+        if isinstance(status_val, str):
+            status_to_use = OrderStatus(status_val)
+        elif isinstance(status_val, OrderStatus):
+            status_to_use = status_val
+        else: # Default or raise error
+            status_to_use = OrderStatus.CREATED
+            logger.warning(f"Status '{status_val}' not recognized or missing, defaulting to CREATED for order data: {data.get('order_id')}")
+
+
         # Create the order object
         order = cls(
             instrument_id=data["instrument_id"],
-            quantity=data["quantity"],
-            side=data.get("side") or data.get("action"),
-            order_type=order_type,
+            quantity=float(data["quantity"]),
+            side=data.get("side") or data.get("action"), # Handle potential missing side
+            order_type=order_type_to_use,
+            product_type=data.get("product_type"),
+            exchange=data.get("exchange"),
             price=data.get("price"),
             stop_price=data.get("stop_price"),
             time_in_force=data.get("time_in_force", "DAY"),
             strategy_id=data.get("strategy_id"),
-            params=data.get("params", {})
+            params=data.get("params", {}),
+            rejection_reason=data.get("rejection_reason") # Added rejection_reason
         )
-        
-        # Set other fields
-        order.order_id = data.get("order_id", order.order_id)
-        order.status = status
-        order.filled_quantity = data.get("filled_quantity", 0.0)
-        order.average_fill_price = data.get("average_fill_price", 0.0)
+
+        # Set other fields that are not part of __init__ or need override
+        order.order_id = data.get("order_id", order.order_id) # Keep original if re-hydrating
+        order.status = status_to_use
+        order.filled_quantity = float(data.get("filled_quantity", 0.0))
+        order.average_fill_price = float(data.get("average_fill_price", 0.0))
         order.broker_order_id = data.get("broker_order_id")
-        
+        # order.client_order_id = data.get("client_order_id")
+
+
         # Parse timestamps
-        for field, value in [
-            ("created_at", data.get("created_at")),
-            ("submitted_at", data.get("submitted_at")),
-            ("filled_at", data.get("filled_at")),
-            ("canceled_at", data.get("canceled_at")),
-            ("last_updated", data.get("last_updated"))
-        ]:
-            if value:
-                if isinstance(value, str):
+        for field_name in ["created_at", "submitted_at", "filled_at", "canceled_at", "last_updated"]:
+            ts_val = data.get(field_name)
+            if ts_val:
+                if isinstance(ts_val, str):
                     try:
-                        setattr(order, field, datetime.fromisoformat(value))
-                    except Exception as e:
-                        logger.warning(f"Failed to parse timestamp for {field}: {e}")
+                        setattr(order, field_name, datetime.fromisoformat(ts_val.replace("Z", "+00:00")))
+                    except ValueError:
+                         try: # Attempt another common format if ISO fails
+                            setattr(order, field_name, datetime.strptime(ts_val, "%Y-%m-%d %H:%M:%S.%f%z"))
+                         except ValueError:
+                            logger.warning(f"Failed to parse timestamp string '{ts_val}' for {field_name} in order {order.order_id}")
+                elif isinstance(ts_val, datetime):
+                     setattr(order, field_name, ts_val)
                 else:
-                    setattr(order, field, value)
-        
+                    logger.warning(f"Unsupported timestamp type for {field_name} in order {order.order_id}: {type(ts_val)}")
+
+
+        # Ensure last_updated is set if created_at is
+        if order.created_at and not data.get("last_updated"):
+            order.last_updated = order.created_at
+
         return order
 
 class OrderAction:

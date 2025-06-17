@@ -1,4 +1,15 @@
-import threading
+"""
+Market data feed implementations for live trading.
+
+This module provides various market data feed implementations for live trading,
+including simulated feeds for testing and real-time feeds for production.
+The feeds are responsible for subscribing to market data and forwarding it to
+the trading engine via callbacks.
+
+The module has been updated to support shared session management with brokers
+when both are using the same provider (e.g., Finvasia).
+"""
+
 import time
 import logging
 import json
@@ -9,26 +20,33 @@ import requests
 import uuid
 import os
 import csv
+import pytz
 import pyotp
-from datetime import datetime, timedelta, date
+import threading
+from datetime import datetime, timedelta, date, time as dt_time
 from typing import List, Dict, Any, Optional, Callable, Union, Tuple, Set
 from abc import ABC, abstractmethod
 from enum import Enum
 from NorenRestApiPy.NorenApi import NorenApi
 
 from models.instrument import Instrument, AssetClass
-from utils.constants import MarketDataType, EventType, InstrumentType, OptionType, Exchange
-from models.events import MarketDataEvent, OrderEvent
+from models.events import MarketDataEvent, OrderEvent, ExecutionEvent
+from utils.constants import ( MarketDataType, EventType, InstrumentType, 
+                             OptionType, Exchange, OrderStatus, OrderSide, 
+                             OrderType, EventSource)
 from utils.exceptions import MarketDataException
+from utils.event_utils import EventUtils
 from core.event_manager import EventManager
 from core.logging_manager import get_logger
 from live.feeds.finvasia.symbol_cache import SymbolCache
+from utils.tick_source import ScriptedTickSource
 
 class MarketDataFeedBase(ABC):
     """Base abstract class for market data feeds."""
-    def __init__(self, instruments: List[Instrument], callback: Callable):
+    def __init__(self, instruments: List[Instrument], callback: Callable, event_manager: Optional[EventManager] = None):
         self.logger = get_logger("live.market_data_feed_base")
         self.instruments = instruments if instruments else []
+        
         # Store instruments in a way that allows quick lookup by symbol/exchange
         self._instrument_lookup: Dict[Tuple[str, str], Instrument] = {}
         if instruments:
@@ -37,7 +55,7 @@ class MarketDataFeedBase(ABC):
                        self._instrument_lookup[(inst.symbol, inst.exchange)] = inst
 
         self.callback = callback
-        self.logger = get_logger(self.__class__.__name__)
+        self.event_manager = event_manager # Store event_manager
         self.is_running = False
 
     def get_instrument(self, symbol: str, exchange: str) -> Optional[Instrument]:
@@ -91,395 +109,278 @@ class MarketDataFeedBase(ABC):
     def unsubscribe(self, instrument: Instrument): pass
 
 class SimulatedFeed(MarketDataFeedBase):
-    """Simulated market data feed for testing and development."""
+    """
+    A high-fidelity simulated market data feed that generates ticks for indices
+    based on config and derives option prices in real-time.
+    """
 
-    def __init__(self, instruments: List[Instrument] = None, callback: Callable = None, **kwargs):
-        """
-        Initialize the simulated feed.
-
-        Args:
-            instruments: List of instruments to simulate
-            callback: Callback function for market data events
-            **kwargs: Additional configuration parameters
-        """
-        super().__init__(instruments, callback)
-        self.logger = get_logger("live.simulated_feed")
+    def __init__(self,
+                instruments: Optional[List[Instrument]] = None,
+                callback: Optional[Callable[[Union[MarketDataEvent, OrderEvent, ExecutionEvent]], None]] = None,
+                event_manager: Optional[EventManager] = None,
+                **kwargs
+        ):    
+        super().__init__(instruments, callback, event_manager)        
         
-        # Initialize price tracking
-        self.prices = {}
-        self.underlying_prices = {}
-        self.underlying_volatilities = {}
-        self.last_ohlc_minute_map = {}
+        # --- Configuration & State ---
+        self._tick_interval = kwargs.get("tick_interval", 0.5)
+        self._settings = kwargs.get("indices", [])        
+        self.index_configs: Dict[str, Dict] = {
+            index['name']: index for index in self._settings
+        }    
+        self.logger.info(f"Loaded {len(self.index_configs)} index configurations for simulation.")
+
+        # --- Simulation Components ---
+        self._tick_sources: Dict[str, ScriptedTickSource] = {}
+        self.underlying_to_options: Dict[str, Set[Instrument]] = {name: set() for name in self.index_configs}
+        self.last_prices: Dict[str, float] = {
+            name: config['spot_price'] for name, config in self.index_configs.items()
+        }
         
-        # Initialize initial prices from settings
-        self.initial_prices = kwargs.get('initial_prices', {})
+        self.timezone = pytz.timezone('Asia/Kolkata')
+        self.symbol_cache = SymbolCache()
+        self._simulation_clock: Optional[float] = None
         
-        # Initialize price data for each instrument
-        for instrument in instruments:
-            symbol = instrument.symbol
-            initial_price = self.initial_prices.get(symbol, random.uniform(10, 1000))
-            self.underlying_prices[symbol] = initial_price
-            self.underlying_volatilities[symbol] = random.uniform(0.001, 0.05)
-            
-            # Initialize price data structure
-            self.prices[symbol] = {
-                'current': initial_price,
-                'previous': initial_price,
-                'bid': initial_price * 0.999,
-                'ask': initial_price * 1.001,
-                'volume': 0,
-                'tick_volume': 0,
-                'open': initial_price,
-                'high': initial_price,
-                'low': initial_price,
-                'close': initial_price,
-                'timestamp': time.time()
-            }
-        
-        # Simulation parameters
-        self.tick_interval = kwargs.get('tick_interval', 1.0)
-        self.volatility = kwargs.get('volatility', 0.02)
-        self.price_jump_probability = kwargs.get('price_jump_probability', 0.01)
-        self.max_price_jump = kwargs.get('max_price_jump', 0.05)
-        
-        # Simulation state
-        self.is_running = False
-        self.simulation_thread = None
-
-    def start(self):
-        """Start the simulated feed."""
-        if self.is_running:
-            self.logger.warning("Simulated feed is already running")
-            return
-
-        self.is_running = True
-        self.simulation_thread = threading.Thread(target=self._simulation_loop)
-        self.simulation_thread.daemon = True
-        self.simulation_thread.start()
-        self.logger.info("Simulated feed started")
-
-    def stop(self):
-        """Stop the simulated feed."""
-        if not self.is_running:
-            self.logger.warning("Simulated feed is not running")
-            return
-
-        self.is_running = False
-        if self.simulation_thread and self.simulation_thread.is_alive():
-            self.simulation_thread.join(timeout=2.0)
-            if self.simulation_thread.is_alive():
-                self.simulation_thread._stop()
-                self.simulation_thread = None
-
-        # Clear all data structures
-        self.prices.clear()
-        self.underlying_prices.clear()
-        self.underlying_volatilities.clear()
-        self.last_ohlc_minute_map.clear()
-        self.logger.info("Simulated feed stopped")
-
-    def _simulation_loop(self):
-        """Main simulation loop that periodically updates prices and sends events."""
-        while self.is_running:
-            try:
-                time.sleep(self.tick_interval)
-                if not self.is_running:  # Check again after sleep
-                    break
-                self._update_underlying_prices()
-                if not self.is_running:  # Check after price update
-                    break
-                self._send_market_data_events()
-            except Exception as e:
-                self.logger.error(f"Error in simulation loop: {str(e)}")
-                break  # Exit loop on error
-
-    def _update_underlying_prices(self):
-        """Update prices for all underlying assets."""
-        for symbol, price in self.underlying_prices.items():
-            try:
-                base_volatility = self.underlying_volatilities.get(symbol, self.volatility)
-                
-                # Regular price movement - random walk with drift
-                volatility = base_volatility * price
-                drift = 0.0001 * price
-                price_change = random.normalvariate(drift, volatility)
-                
-                # Apply price change
-                new_price = max(0.01, price + price_change)
-                
-                # Update prices dictionary
-                self.prices[symbol]['previous'] = price
-                self.prices[symbol]['current'] = new_price
-                
-                # Update bid/ask
-                spread = new_price * 0.001
-                self.prices[symbol]['bid'] = new_price - spread
-                self.prices[symbol]['ask'] = new_price + spread
-                
-                # Update volume
-                vol_change = abs(price_change) / price
-                self.prices[symbol]['volume'] += int(random.normalvariate(1000, 500) * (1 + 10 * vol_change))
-                self.prices[symbol]['tick_volume'] = int(random.normalvariate(10, 5) * (1 + 10 * vol_change))
-                
-                # Update OHLC
-                current_minute = datetime.now().strftime('%Y-%m-%d %H:%M')
-                if symbol not in self.last_ohlc_minute_map or self.last_ohlc_minute_map[symbol] != current_minute:
-                    self.last_ohlc_minute_map[symbol] = current_minute
-                    self.prices[symbol]['open'] = new_price
-                    self.prices[symbol]['high'] = new_price
-                    self.prices[symbol]['low'] = new_price
-                else:
-                    self.prices[symbol]['high'] = max(self.prices[symbol]['high'], new_price)
-                    self.prices[symbol]['low'] = min(self.prices[symbol]['low'], new_price)
-                
-                self.prices[symbol]['close'] = new_price
-                self.underlying_prices[symbol] = new_price
-                
-            except Exception as e:
-                self.logger.error(f"Error updating prices for {symbol}: {str(e)}")
-                continue
-
-    def _send_market_data_events(self):
-        """Send market data events for all subscribed instruments."""
-        for instrument in self.instruments:
-            symbol = instrument.symbol
-            if symbol not in self.prices:
-                continue
-                
-            price_data = self.prices[symbol]
-            market_data = {
-                'symbol': symbol,
-                'exchange': instrument.exchange,
-                'last_price': price_data['current'],
-                'bid': price_data['bid'],
-                'ask': price_data['ask'],
-                'volume': price_data['volume'],
-                'timestamp': int(time.time() * 1000)
-            }
-            
-            event = MarketDataEvent(
-                event_type=EventType.MARKET_DATA,
-                timestamp=int(time.time() * 1000),
-                instrument=instrument,
-                data=market_data,
-                data_type=MarketDataType.TICK
-            )
-            
-            if self.callback:
-                try:
-                    self.callback(event)
-                except Exception as e:
-                     self.logger.error(f"Error in market data callback for {symbol}: {e}", exc_info=True)
-
-    def subscribe(self, instrument: Instrument):
-        """Subscribe to market data for an instrument."""
-        if instrument not in self.instruments:
-            self.instruments.append(instrument)
-            symbol = instrument.symbol
-            initial_price = self.initial_prices.get(symbol, 100.0)
-            
-            self.prices[symbol] = {
-                'current': initial_price,
-                'previous': initial_price,
-                'bid': initial_price * 0.999,
-                'ask': initial_price * 1.001,
-                'volume': 0,
-                'tick_volume': 0,
-                'open': initial_price,
-                'high': initial_price,
-                'low': initial_price,
-                'close': initial_price,
-                'timestamp': time.time()
-            }
-            
-            self.underlying_prices[symbol] = initial_price
-            self.underlying_volatilities[symbol] = self.volatility
-            self.logger.info(f"Added {symbol} to simulation")
-
-    def unsubscribe(self, instrument: Instrument):
-        """Unsubscribe from an instrument."""
-        if instrument in self.instruments:
-            self.instruments.remove(instrument)
-            symbol = instrument.symbol
-            
-            # Clean up all price data for this instrument
-            if symbol in self.prices:
-                del self.prices[symbol]
-            if symbol in self.underlying_prices:
-                del self.underlying_prices[symbol]
-            if symbol in self.underlying_volatilities:
-                del self.underlying_volatilities[symbol]
-            if symbol in self.last_ohlc_minute_map:
-                del self.last_ohlc_minute_map[symbol]
-                
-            self.logger.info(f"Unsubscribed from instrument: {symbol}")
-
-    def generate_crossover_scenario(self, symbol: str, duration: int = 100, crossover_at: int = 50, trend_strength: float = 0.01):
-        """
-        Generate a specific price scenario to cause a moving average crossover.
-        
-        Args:
-            symbol: The symbol to generate scenario for
-            duration: Total number of data points to generate
-            crossover_at: At which point the trend should change (index)
-            trend_strength: How strong the trend should be (percentage change per tick)
-        """
-        if symbol not in self.prices:
-            self.logger.warning(f"Symbol {symbol} not found in prices")
-            return
-            
-        # Get current price
-        current_price = self.prices[symbol]['current']
-        
-        # Simulate a trend reversal that will cause a MA crossover
-        # First downtrend, then uptrend
-        prices = []
-        
-        # Initialize with current price
-        price = current_price
-        
-        # Generate scenario
-        for i in range(duration):
-            # Before crossover point - downtrend
-            if i < crossover_at:
-                # Downtrend with some noise
-                change = -trend_strength * price * (1 + 0.5 * random.normalvariate(0, 1))
-            else:
-                # After crossover point - uptrend
-                change = trend_strength * price * (1 + 0.5 * random.normalvariate(0, 1))
-                
-            # Apply change
-            price = max(0.01, price + change)
-            prices.append(price)
-            
-            # Update price data
-            self.prices[symbol]['previous'] = self.prices[symbol]['current']
-            self.prices[symbol]['current'] = price
-            
-            # Update bid/ask
-            spread = price * 0.001  # 0.1% spread
-            self.prices[symbol]['bid'] = price - spread
-            self.prices[symbol]['ask'] = price + spread
-            
-            # Update OHLC
-            # If this is the first price in a series, it's the open
-            if i == 0 or (i % 5 == 0):  # Create a new bar every 5 ticks for faster MA calculation
-                self.prices[symbol]['open'] = price
-                self.prices[symbol]['high'] = price
-                self.prices[symbol]['low'] = price
-            else:
-                # Update high and low
-                self.prices[symbol]['high'] = max(self.prices[symbol]['high'], price)
-                self.prices[symbol]['low'] = min(self.prices[symbol]['low'], price)
-            
-            # Always update close
-            self.prices[symbol]['close'] = price
-            
-            # Update volume
-            self.prices[symbol]['volume'] += int(random.normalvariate(1000, 500))
-            self.prices[symbol]['tick_volume'] = int(random.normalvariate(10, 5))
-            
-            # Update timestamp
-            self.prices[symbol]['timestamp'] = time.time()
-            
-            # Send a market data event for this update
-            for instrument in self.instruments:
-                if instrument.symbol == symbol:
-                    self._send_market_data_events()
-                    time.sleep(self.tick_interval)  # Wait between events
-                    break
-                    
-        self.logger.info(f"Generated crossover scenario for {symbol}: {len(prices)} price points")
-        return prices
-
-    # Add a new method that can be called to trigger a specific test scenario
-    def trigger_test_scenario(self, scenario_type: str = "moving_average_crossover"):
-        """
-        Trigger a specific test scenario.
-        
-        Args:
-            scenario_type: Type of scenario to trigger
-        """
-        if scenario_type == "moving_average_crossover":
-            # For each instrument, generate a crossover scenario
-            for instrument in self.instruments:
-                self.generate_crossover_scenario(instrument.symbol)
-                self.logger.info(f"Triggered MA crossover scenario for {instrument.symbol}")
+        # --- Event Handling ---
+        if self.event_manager:
+            self.logger.info("Registering for SIMULATED_ORDER_UPDATE and MARKET_DATA events.")
+            self.event_manager.subscribe(EventType.SIMULATED_ORDER_UPDATE, self._on_order_event, component_name="SimulatedFeed")
+            self.event_manager.subscribe(EventType.MARKET_DATA, self._on_underlying_tick, component_name="SimulatedFeed")            
         else:
-            self.logger.warning(f"Unknown scenario type: {scenario_type}")
+            self.logger.warning("EventManager not provided. Cannot process orders or generate option prices.")
 
-    def _convert_tick_to_market_data(self, tick):
-        """
-        Convert Finvasia tick format to our standard market data format.
+    def _initialize_simulation_clock(self):
+        """Initializes the simulation clock to a realistic market start time."""
+        now_ist = datetime.now(self.timezone)
+        market_open_time = dt_time(9, 15)
+
+        # Start simulation on today's date if before market close, otherwise next weekday
+        sim_date = now_ist.date()
+        if now_ist.time() > dt_time(15, 30):
+            sim_date += timedelta(days=1)
+
+        # Advance to the next weekday if the calculated date is a weekend
+        while sim_date.weekday() >= 5: # 5 = Saturday, 6 = Sunday
+            sim_date += timedelta(days=1)       
+
+        start_datetime = self.timezone.localize(datetime.combine(sim_date, market_open_time))
+        self._simulation_clock = start_datetime.timestamp()
+
+    def start(self) -> bool:
+        """Creates and starts a tick source for each configured index."""
+        if self.is_running:
+            self.logger.warning("Simulated feed is already running.")
+            return True
+
+        self._initialize_simulation_clock()
+        if self._simulation_clock:
+            self.logger.info(f"Tick source started. Simulation clock starts at: {datetime.fromtimestamp(self._simulation_clock, self.timezone).isoformat()}")
+
+        self.logger.info("Starting SimulatedFeed...")
+        if not self.index_configs:
+            self.logger.error("No index configurations in settings. Cannot start simulation.")
+            return False
+
+        for name, config in self.index_configs.items():
+            try:
+                source = ScriptedTickSource(
+                    event_manager=self.event_manager,
+                    scenario=config.get("scenario", "random_walk"),
+                    initial_price=config.get("spot_price", 100),
+                    tick_interval=self._tick_interval,  # Corrected here
+                )
+                source.start()
+                self._tick_sources[name] = source
+                self.logger.info(f"Started tick source for '{name}' with scenario '{config['scenario']}'.")
+            except Exception as e:
+                self.logger.error(f"Failed to start tick source for '{name}': {e}", exc_info=True)
+                self.stop()
+                return False       
         
-        Args:
-            tick: Finvasia tick data
-            
-        Returns:
-            dict: Standardized market data
-        """
-        try:
-            market_data = {}
-            
-            # Extract basic price data
-            if 'lp' in tick:
-                market_data[MarketDataType.LAST_PRICE.value] = float(tick['lp'])
-                
-            # Extract bid/ask
-            if 'bp' in tick and 'sp' in tick:
-                market_data[MarketDataType.BID.value] = float(tick['bp'])
-                market_data[MarketDataType.ASK.value] = float(tick['sp'])
-                
-            # Extract volumes
-            if 'v' in tick:
-                market_data[MarketDataType.VOLUME.value] = float(tick['v'])
-                
-            # Extract OHLC if available
-            ohlc_data = {}
-            if 'o' in tick:
-                ohlc_data['open'] = float(tick['o'])
-            if 'h' in tick:
-                ohlc_data['high'] = float(tick['h'])
-            if 'l' in tick:
-                ohlc_data['low'] = float(tick['l'])
-            if 'c' in tick:
-                ohlc_data['close'] = float(tick['c'])
-                
-            # Only add OHLC if we have at least one value
-            if ohlc_data:
-                market_data[MarketDataType.OHLC.value] = ohlc_data
-                
-            # Add timestamp
-            market_data[MarketDataType.TIMESTAMP.value] = time.time()
-            
-            return market_data
-            
-        except Exception as e:
-            self.logger.error(f"Error converting tick to market data: {str(e)}")
-            self.logger.debug(f"Raw tick data: {tick}")
-            return None
+        self.is_running = True
+        return True
 
-# --- Updated FinvasiaFeed Class ---
+    def stop(self) -> bool:
+        """Stops all running tick sources."""
+        if not self.is_running: return True
+        self.logger.info("Stopping SimulatedFeed...")
+        for source in self._tick_sources.values():
+            source.stop()
+        self._tick_sources.clear()
+        self.is_running = False
+        self.logger.info("SimulatedFeed stopped.")
+        return True
+
+    def _get_underlying_name(self, instrument: Instrument) -> Optional[str]:
+        """Determines the underlying index name for an instrument."""
+        for index_name in self.index_configs:
+            if instrument.symbol == index_name: return index_name
+            simple_index_name = index_name.split(' ')[0]
+            if instrument.symbol.startswith(simple_index_name): return index_name
+        self.logger.warning(f"Could not determine underlying for instrument: {instrument.symbol}")
+        return None
+
+    def subscribe(self, instrument: Instrument) -> bool:
+        """Subscribes to an instrument, starting ticks for its underlying index."""
+        if not self.is_running: return False
+
+        underlying_name = self._get_underlying_name(instrument)
+        if not underlying_name: return False
+
+        source = self._tick_sources.get(underlying_name)
+        if not source: return False
+
+        if instrument.asset_class == AssetClass.OPTIONS:
+            self.underlying_to_options[underlying_name].add(instrument)
+            self.logger.info(f"Tracking option {instrument.symbol} under {underlying_name}.")
+
+        underlying_instrument = Instrument(
+            symbol=underlying_name, 
+            exchange=self.index_configs[underlying_name]['exchange'], 
+            asset_class=AssetClass.INDEX
+        )
+        source.subscribe(underlying_instrument)
+        
+        self.add_instrument(instrument)
+        return True
+
+    def unsubscribe(self, instrument: Instrument) -> bool:
+        """Unsubscribes from an instrument and stops underlying ticks if no longer needed."""
+        underlying_name = self._get_underlying_name(instrument)
+        if not underlying_name: return False
+            
+        if instrument.asset_class == AssetClass.OPTIONS:
+            self.underlying_to_options[underlying_name].discard(instrument)
+            self.logger.info(f"Stopped tracking option {instrument.symbol}.")
+        
+        is_index_itself_subscribed = any(
+            inst.symbol == underlying_name for inst in self.instruments if inst != instrument
+        )
+        
+        if not self.underlying_to_options[underlying_name] and not is_index_itself_subscribed:
+             source = self._tick_sources.get(underlying_name)
+             if source:
+                underlying_instrument = Instrument(symbol=underlying_name, exchange=self.index_configs[underlying_name]['exchange'], asset_class=AssetClass.INDEX)
+                source.unsubscribe(underlying_instrument)
+                self.logger.info(f"Unsubscribed from underlying '{underlying_name}' as no more instruments depend on it.")
+
+        self.remove_instrument(instrument)
+        return True
+
+    def _on_underlying_tick(self, event: MarketDataEvent):
+        """Listens to index ticks and generates derived ticks for subscribed options."""
+        instrument = event.instrument
+        if instrument.asset_class != AssetClass.INDEX or instrument.symbol not in self._tick_sources:
+            return
+        
+        underlying_name = instrument.symbol
+        new_spot_price = event.data.get(MarketDataType.LAST_PRICE.value)
+        if new_spot_price is None: return
+
+        price_change = new_spot_price - self.last_prices.get(underlying_name, new_spot_price)
+        self.last_prices[underlying_name] = new_spot_price
+        self.last_prices[instrument.symbol] = new_spot_price # Also store by exact symbol
+
+        for option_instrument in self.underlying_to_options.get(underlying_name, []):
+            self._generate_and_publish_option_tick(option_instrument, new_spot_price, price_change)
+            
+    def _generate_and_publish_option_tick(self, option: Instrument, spot_price: float, change: float):
+        """Calculates a simulated option price and publishes a MarketDataEvent."""
+        # Simplified option pricing using delta
+        moneyness = spot_price - option.strike
+        if option.option_type == OptionType.PUT: moneyness *= -1
+
+        delta = 0.5 + (moneyness / spot_price) * 5
+        delta = max(0.01, min(0.99, delta))
+        if option.option_type == OptionType.PUT: delta -= 1
+
+        prev_price = self.last_prices.get(option.symbol, max(0.05, spot_price - option.strike if option.option_type == OptionType.CALL else option.strike - spot_price))
+        new_price = max(0.05, prev_price + (change * delta))
+        self.last_prices[option.symbol] = new_price
+
+        tick_data = {
+            MarketDataType.TIMESTAMP.value: self._simulation_clock,
+            MarketDataType.LAST_PRICE.value: new_price,
+            MarketDataType.BID.value: new_price * 0.995,
+            MarketDataType.ASK.value: new_price * 1.005,
+        }
+
+        event = MarketDataEvent(
+            event_type=EventType.MARKET_DATA, timestamp=tick_data[MarketDataType.TIMESTAMP.value],
+            instrument=option, data=tick_data, data_type=MarketDataType.TICK
+        )
+        # self.logger.debug(f"MarketDataEvent: {event}")
+        if self.callback: self.callback(event)
+        
+    def _on_order_event(self, event: OrderEvent):
+        """Handles simulated order updates to mimic broker execution."""
+        self.logger.info(f"Received simulated order event for Order ID: {event.order_id}")
+        
+        status = OrderStatus.FILLED
+        exec_type = "FILL"
+        last_price = self.last_prices.get(event.instrument.symbol)
+
+        if event.order_type == OrderType.LIMIT and last_price:
+            if (event.side == OrderSide.BUY and event.price < last_price) or \
+               (event.side == OrderSide.SELL and event.price > last_price):
+                status = OrderStatus.OPEN
+                exec_type = "BROKER_OPEN"
+        
+        self.logger.info(f"Simulating execution for Order ID {event.order_id}: Status={status}")
+        
+        is_filled = status == OrderStatus.FILLED
+        exec_event = ExecutionEvent(
+            order_id=event.order_id, broker_order_id=event.broker_order_id or f"sim-{uuid.uuid4()}",
+            symbol=event.instrument.symbol, exchange=event.instrument.exchange, side=event.side,
+            quantity=event.quantity, order_type=event.order_type, status=status,
+            price=event.price, trigger_price=event.trigger_price,
+            execution_id=f"sim-exec-{uuid.uuid4()}", execution_time=time.time(), execution_type=exec_type,
+            cumulative_filled_quantity=event.quantity if is_filled else 0,
+            average_price=event.price if is_filled else 0,
+            last_filled_quantity=event.quantity if is_filled else 0,
+            last_filled_price=event.price if is_filled else 0,
+            timestamp=time.time(), event_type=EventType.EXECUTION, source=EventSource.MARKET_DATA_FEED
+        )
+
+        if self.event_manager: self.event_manager.publish(exec_event)
+
+    def subscribe_symbols(self, instruments: List[Instrument]) -> Dict[str, bool]:
+        """Subscribes to a list of instruments."""
+        return {inst.instrument_id: self.subscribe(inst) for inst in instruments}
+
+    def unsubscribe_symbols(self, instruments: List[Instrument]) -> Dict[str, bool]:
+        """Unsubscribes from a list of instruments."""
+        return {inst.instrument_id: self.unsubscribe(inst) for inst in instruments}
+
+# --- FinvasiaFeed Class  ---
 class FinvasiaFeed(MarketDataFeedBase):
     """
-    (Integrated) Finvasia WebSocket feed implementation.
-    Uses actual Instrument, MarketDataEvent, MarketDataType, EventType definitions.
+    Finvasia WebSocket feed implementation with session manager support.
+    
+    This class has been updated to support shared session management with the broker
+    when both are using the same provider (Finvasia).
     """
-
     def __init__(
         self,
         instruments: List[Instrument],
-        callback: Callable[[MarketDataEvent], None],
-        user_id: str,
-        password: str,
-        api_key: str,
+        callback: Callable[[Union[MarketDataEvent, OrderEvent, ExecutionEvent]], None],
+        event_manager: Optional[EventManager] = None,
+        user_id: str = None,
+        password: str = None,
+        api_key: str = None,
         imei: str = None,
         twofa: str = None,
         vc: str = None,
         api_url: str = "https://api.shoonya.com/NorenWClientTP/",
         ws_url: str = "wss://api.shoonya.com/NorenWSTP/",
-        debug: bool = False
+        debug: bool = False,
+        session_manager = None  # New parameter for session manager
     ):
+        # super().__init__(instruments, callback, event_manager) 
+        # self.logger = get_logger("live.finvasia_feed")
+        # if debug:
+        #    self.logger.setLevel(logging.DEBUG)
+
         self.logger = get_logger("live.finvasia_feed")
         if debug:
             self.logger.setLevel(logging.DEBUG)
@@ -487,10 +388,18 @@ class FinvasiaFeed(MarketDataFeedBase):
         self._stop_reconnect_event = threading.Event()
         self._reconnect_thread = None
         
+        # assign event manager
+        self.event_manager = event_manager
+
         # State tracking
         self.is_connected = False
         self.is_authenticated = False
         self.session_token = None
+        
+        # Session manager support
+        self._session_manager = session_manager
+        if session_manager:
+            self.logger.info("Using shared session manager for authentication")
         
         # Reconnection attributes
         self._reconnect_attempts = 0
@@ -506,12 +415,10 @@ class FinvasiaFeed(MarketDataFeedBase):
         self._auth_lock = threading.Lock()
         self._sub_lock = threading.Lock()
 
-        super().__init__(instruments, callback)
-        
+        super().__init__(instruments, callback, self.event_manager)
         self.logger = get_logger("live.finvasia_feed")
-        if debug:
-            self.logger.setLevel(logging.DEBUG)
-            
+        
+        
         # Store credentials
         self.user_id = user_id
         self.password = password
@@ -526,7 +433,35 @@ class FinvasiaFeed(MarketDataFeedBase):
         # Initialize symbol cache
         self.symbol_cache = SymbolCache()
 
+        # Register for session manager callbacks if provided
+        if self._session_manager and hasattr(self._session_manager, 'register_refresh_callback'):
+            self._session_manager.register_refresh_callback(self._on_session_refresh)
+            self.logger.info("Registered for session refresh callbacks")
+
         self.logger.info("FinvasiaFeed Class initialized")
+    
+    def _on_session_refresh(self, session):
+        """
+        Callback for session refresh events from the session manager.
+        
+        Args:
+            session: Updated session object
+        """
+        self.logger.info("Session refresh callback received")
+        
+        # Update session token
+        with self._auth_lock:
+            self.session_token = session.token
+            self.user_id = session.user_id
+            self.password = session.password
+            self.is_authenticated = True
+        
+        # Reconnect WebSocket with new token if currently connected
+        if self.is_connected:
+            self.logger.info("Reconnecting WebSocket with new session token")
+            self.disconnect()
+            time.sleep(1)  # Brief pause
+            self.connect()
     
     @property
     def is_running(self):
@@ -606,12 +541,36 @@ class FinvasiaFeed(MarketDataFeedBase):
         return True
     
     def authenticate(self) -> bool:
-        """Authenticate with Finvasia API."""
+        """
+        Authenticate with Finvasia API.
+        
+        If a session manager is provided, use it for authentication.
+        Otherwise, authenticate directly with the API.
+        
+        Returns:
+            bool: True if authentication successful, False otherwise
+        """
         with self._auth_lock:
             if self.is_authenticated:
                 return True
-                
+            
             try:
+               # If using session manager, get session from there
+                if self._session_manager:
+                    session = self._session_manager.get_session()
+                    if session and session.token and session.user_id and session.password:
+                        self.session_token = session.token
+                        self.user_id = session.user_id # Ensure feed has correct user_id
+                        self.password = session.password # Ensure feed has correct password
+                        self.is_authenticated = True
+                        self.logger.info("Authentication successful using session manager")
+                        return True
+                    else:
+                        self.logger.error("Failed to get valid session from session manager")
+                        return False
+                
+                # Otherwise, authenticate directly
+                self.logger.info("Attempting direct authentication...")
                 # Generate TOTP
                 twofa_token = pyotp.TOTP(self.twofa_key).now() if self.twofa_key else ""
                 
@@ -628,7 +587,7 @@ class FinvasiaFeed(MarketDataFeedBase):
                 if isinstance(response, dict) and response.get('stat') == 'Ok':
                     self.session_token = response.get('susertoken')
                     self.is_authenticated = True
-                    self.logger.info("Authentication successful")
+                    self.logger.info("Authentication successful with direct API login")
                     return True
                     
                 self.logger.error(f"Authentication failed: {response}")
@@ -667,18 +626,38 @@ class FinvasiaFeed(MarketDataFeedBase):
             self.api.on_disconnect = self._on_disconnect
             self.api.on_error = self._on_error
             self.api.on_open = self._on_open
-            self.api.on_close = self._on_close # This is important
-            self.api.on_ticks = self._on_market_data
-            # self.api.on_order_update = self._on_order_update # If you handle order updates
+            self.api.on_close = self._on_close 
+            self.api.on_ticks = self._on_market_data            
 
             self.logger.info("Starting WebSocket connection with NorenApi...")
-            self.is_connected = False # Reset connection status before attempting
+            self.is_connected = False # Reset connection status before attempting            
+            
+            session_set_successfully = False
+            if self._session_manager:
+                session = self._session_manager.get_session()
+                if session and session.user_id and session.password and session.token:
+                    self.logger.info(f"Setting session for user {session.user_id} using Session Manager")
+                    self.api.set_session(userid=session.user_id, password=session.password, usertoken=session.token)
+                    session_set_successfully = True
+                else:
+                    self.logger.error("Failed to get complete session details from Session Manager. Cannot set session.")
+            else:
+                # Use credentials stored directly in the feed instance
+                if self.user_id and self.password and self.session_token:
+                    self.logger.info(f"Setting session for user {self.user_id} using direct credentials")
+                    self.api.set_session(userid=self.user_id, password=self.password, usertoken=self.session_token)
+                    session_set_successfully = True
+                else:
+                     self.logger.error("Missing credentials or session token for direct session setting. Cannot set session.")
+            
+            if not session_set_successfully:
+                return False 
+            
             self.api.start_websocket(
-                order_update_callback=self._on_order_update if hasattr(self, '_on_order_update') else None,
+                order_update_callback=self._on_order_update,
                 subscribe_callback=self._on_market_data,
                 socket_open_callback=self._on_open,
-                socket_close_callback=self._on_close
-                # error_callback=self._on_error # Check NorenApi documentation if it supports this
+                socket_close_callback=self._on_close                
             )
             
             # Wait for connection status to be updated by _on_open
@@ -689,16 +668,13 @@ class FinvasiaFeed(MarketDataFeedBase):
             while not self.is_connected and (time.time() - start_time) < connection_timeout:
                 if self._stop_reconnect_event.is_set():
                     self.logger.info("Connection attempt aborted as feed is stopping.")
-                    self.api.close_websocket() # Ensure cleanup
+                    self.api.close_websocket()
                     return False
                 time.sleep(0.1)
                 
             if not self.is_connected:
                 self.logger.error(f"WebSocket connection timeout after {connection_timeout} seconds. _on_open was not called.")
-                self.api.close_websocket() # Attempt to clean up the failed connection
-                # _on_close might be called by NorenApi if handshake fails, triggering reconnect.
-                # If not, we might want to trigger it manually or call _attempt_reconnect here.
-                # For now, rely on NorenApi's _on_close or a subsequent _attempt_reconnect call.
+                self.api.close_websocket()                
                 return False
             
             self.logger.info("WebSocket connection process initiated successfully. _on_open confirmed connection.")
@@ -707,12 +683,19 @@ class FinvasiaFeed(MarketDataFeedBase):
 
         except Exception as e:
             self.logger.error(f"Exception during WebSocket connection: {e}", exc_info=True)
-            self.api.close_websocket() # Ensure cleanup on exception
-            self.is_connected = False  # Update state
-            # This exception might also lead to _on_close being called by the library.
-            # If not, consider calling _attempt_reconnect here after a small delay.
-            # self._attempt_reconnect() # Or let _on_close handle it if it's called.
+            self.api.close_websocket()
+            self.is_connected = False             
             return False
+    
+    def disconnect(self):
+        """Disconnect from the WebSocket feed."""
+        try:
+            self.api.close_websocket()
+        except Exception as e:
+            self.logger.warning(f"Error during WebSocket disconnect: {e}")
+        
+        self.is_connected = False
+        self.logger.info("WebSocket disconnected")
     
     def subscribe(self, instrument: Instrument): # instrument: Instrument
         """Subscribe to market data for an instrument. Uses full 'exchange|token' string."""
@@ -799,128 +782,80 @@ class FinvasiaFeed(MarketDataFeedBase):
         if self._stop_reconnect_event.is_set():
             self.logger.info("Reconnection suppressed via _on_disconnect as feed is stopping.")
             return
-
+            
+        # Attempt reconnection
         self._attempt_reconnect()
-        
+    
     def _on_error(self, error):
-        """Handle WebSocket error."""
+        """Handle WebSocket error callback."""
         self.logger.error(f"WebSocket error: {error}")
         
+        # Check if error indicates session expiry
+        if isinstance(error, str) and ('session' in error.lower() and ('expired' in error.lower() or 'invalid' in error.lower())):
+            self.logger.warning("Session appears to be expired based on WebSocket error. Attempting to refresh.")
+            self._refresh_session()
+    
     def _on_open(self):
-        """Handle WebSocket open event."""
-        self.logger.info("WebSocket connection opened successfully.")
+        """Handle WebSocket open callback."""
+        self.logger.info("WebSocket connection opened")
         self.is_connected = True
-        self._reconnect_attempts = 0 # Reset reconnect counter on successful connection
-        self.is_authenticated = True
-
-        # Resubscribe to all tracked instruments
+        self._reconnect_attempts = 0  # Reset reconnection counter on successful connection
+        
+        # Resubscribe to all previously subscribed instruments
         if self._subscribed_tokens:
-            self.logger.info(f"Resubscribing to {len(self._subscribed_tokens)} existing instrument strings after (re)connection...")
+            self.logger.info(f"Resubscribing to {len(self._subscribed_tokens)} instruments")
             with self._sub_lock:
-                tokens_to_resubscribe = list(self._subscribed_tokens)
-                if tokens_to_resubscribe:
-                    self.logger.debug(f"Attempting to resubscribe to: {tokens_to_resubscribe}")
-                    response = self.api.subscribe(tokens_to_resubscribe)
-                    self.logger.debug(f"Resubscription API response: {response}")                    
-        else:
-            self.logger.info("No existing subscriptions to resubscribe to on WebSocket open.")
+                subscriptions = []
+                for token in self._subscribed_tokens:
+                    symbol = self._token_to_symbol.get(token)
+                    if symbol:
+                        for instrument in self.instruments:
+                            if instrument.symbol == symbol:
+                                exchange_str = instrument.exchange.value if isinstance(instrument.exchange, Exchange) else str(instrument.exchange)
+                                subscriptions.append(f"{exchange_str}|{token}")
+                                break
+                
+                if subscriptions:
+                    try:
+                        self.api.subscribe(subscriptions)
+                        self.logger.info(f"Resubscribed to {len(subscriptions)} instruments")
+                    except Exception as e:
+                        self.logger.error(f"Error during resubscription: {e}")
     
     def _on_close(self, code=None, reason=None):
-        """Handle WebSocket close event. This is called by the underlying websocket library."""
-        self.logger.warning(f"WebSocket _on_close received. Code: {code}, Reason: '{reason}'. Current connected state: {self.is_connected}")
-        
-        was_connected = self.is_connected
+        """Handle WebSocket close callback."""
+        self.logger.warning(f"WebSocket connection closed: code={code}, reason={reason}")
         self.is_connected = False
-
+        
         if self._stop_reconnect_event.is_set():
-            self.logger.info("Reconnection suppressed as feed is stopping or has been stopped.")
-            return        
-        
-        if was_connected:
-            self.logger.warning(f"WebSocket connection lost (was connected). Code: {code}, Reason: '{reason}'")
-        else:
-            # This could happen if connect() fails and _on_close is called before _on_open.
-            self.logger.warning(f"WebSocket failed to establish connection or closed prematurely. Code: {code}, Reason: '{reason}'")
-        
-        # The 504 Gateway Timeout will trigger this.
-        # NorenApi might also trigger close for other reasons.
-        self._attempt_reconnect()    
-        
-    def _attempt_reconnect(self):
-        """Manages the logic and scheduling of reconnection attempts."""
-        if self._stop_reconnect_event.is_set():
-            self.logger.info("Reconnect attempt skipped: feed stopping.")
+            self.logger.info("Reconnection suppressed via _on_close as feed is stopping.")
             return
-
-        if self._reconnect_attempts < self._max_reconnect_attempts:
-            self._reconnect_attempts += 1
-            # Exponential backoff, capped at 60 seconds
-            delay = min(self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)), 60)
             
-            self.logger.info(f"Attempting WebSocket reconnection in {delay:.2f} seconds (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts}).")
-            
-            # Ensure only one reconnect thread is active
-            if self._reconnect_thread and self._reconnect_thread.is_alive():
-                self.logger.debug("Previous reconnect thread still alive. Not starting a new one yet.")
-                return 
-
-            self._reconnect_thread = threading.Thread(target=self._run_reconnect, args=(delay,))
-            self._reconnect_thread.daemon = True # Allow program to exit even if thread is running
-            self._reconnect_thread.start()
-        else:
-            self.logger.error(f"Maximum reconnect attempts ({self._max_reconnect_attempts}) reached. Will not try to reconnect automatically.")
-            # Optionally, notify someone or take other actions for permanent failure.
-
-    def _run_reconnect(self, delay: float):
-        """Worker method for reconnection, executed in a separate thread."""
-        try:
-            self.logger.debug(f"Reconnect thread started, sleeping for {delay:.2f} seconds.")
-            
-            if self._stop_reconnect_event.wait(timeout=delay): 
-                self.logger.info("Reconnect cancelled during sleep as feed is stopping.")
-                return
-                
-            if self._stop_reconnect_event.is_set(): 
-                self.logger.info("Reconnect cancelled after sleep as feed is stopping.")
-                return
-
-            self.logger.info("Executing reconnection...")
-            
-            # Re-authenticate if not authenticated. Connection might have dropped session.
-            # Or, Finvasia might require re-login after certain types of disconnects.
-            # This depends on API behavior. For now, assume connect() handles auth if needed.
-            # if not self.is_authenticated:
-            #    self.logger.info("Authentication lost or not established. Re-authenticating before reconnect.")
-            #    if not self.authenticate():
-            #        self.logger.error("Re-authentication failed during reconnect sequence.")
-            #        # Potentially trigger another _attempt_reconnect or give up
-            #        return
-            if not self.connect(): 
-                self.logger.error("Reconnection attempt failed (connect call returned False).")
-                # connect() failure might trigger _on_close, which calls _attempt_reconnect again.
-                # This is okay as _reconnect_attempts counter will manage it.
-            else:
-                # If connect() is successful, _on_open is called, which resets _reconnect_attempts.
-                self.logger.info("Reconnection attempt initiated by connect() call. Waiting for _on_open confirmation.")
-        except Exception as e:
-            self.logger.error(f"Exception in _run_reconnect thread: {e}", exc_info=True)
-        finally:
-            # Ensure thread object is cleared if it's this thread finishing
-            if self._reconnect_thread is threading.current_thread():
-                self._reconnect_thread = None
-
+        # Attempt reconnection
+        self._attempt_reconnect()
+    
     def _on_market_data(self, ticks):
-        """Handle market data ticks."""
+        """
+        Handle market data callback from WebSocket.
+        
+        Args:
+            ticks: List of tick data from Finvasia
+        """
         if not isinstance(ticks, list):
             ticks = [ticks]
             
         for tick in ticks:
             try:
+                # self.logger.debug(f"tick: {tick}")
+
+                # Extract token and exchange
                 token = tick.get('tk')
+                # exchange = tick.get('e')
+                
                 if not token:
                     continue
                     
-                # self.logger.debug(f"tick: {tick}")
+                # Get symbol from token
                 symbol = self._token_to_symbol.get(token)
                 if not symbol:
                     continue
@@ -930,47 +865,174 @@ class FinvasiaFeed(MarketDataFeedBase):
                 if isinstance(exchange, str):
                     exchange = Exchange[exchange]
 
+                
                 instrument = self.get_instrument(symbol, exchange)
                 if not instrument:
                     self.logger.error(f"Instrument not found for {symbol}")
                     return
-                
-                market_data = self._convert_tick_to_market_data(tick)             
+                    
+                # Convert tick to market data
+                market_data = self._convert_tick_to_market_data(tick)
                 if not market_data:
-                    return
-                
-                #self.logger.debug(f"market_data: {market_data}")
-                
-                # Create market data event
+                    continue
+
+                # self.logger.debug(f"market_data: {market_data}")
+                    
+                # Create event
                 event = MarketDataEvent(
+                    event_type=EventType.MARKET_DATA,
+                    timestamp=market_data.get('TIMESTAMP', time.time()),
                     instrument=instrument,
                     data=market_data,
-                    timestamp=market_data.get('TIMESTAMP', time.time()),
-                    event_type=EventType.MARKET_DATA
+                    data_type=MarketDataType.TICK
                 )
                 
-                # Call the callback
-                self.callback(event)
-                
+                # Send event to callback
+                if self.callback:
+                    self.callback(event)
+                    
             except Exception as e:
-                self.logger.error(f"Error processing tick: {e}")
-        
-    def _on_order_update(self, order_data):
-        """Handle order updates."""
+                self.logger.error(f"Error processing market data: {e}")
+    
+    def _on_order_update(self, order_data: Dict[str, Any]):
+        self.logger.debug(f"Raw Order update from Finvasia WS: {order_data}")
+        if not self.event_manager:
+            self.logger.error("EventManager not available in FinvasiaFeed. Cannot publish ExecutionEvent for order updates.")
+            return
+
         try:
-            # Create order event
-            event = OrderEvent(
-                order_id=order_data.get('norenordno'),
-                status=order_data.get('status'),
-                data=order_data,
-                timestamp=datetime.now()
-            )
+            self.logger.debug(f"MDF order update, order_data: {order_data}")
+            api_status = order_data.get('status', '').upper()
+            broker_order_id = order_data.get('norenordno')            
             
-            # Call the callback
-            self.callback(event)
+            if not broker_order_id:
+                self.logger.warning(f"Order update missing 'norenordno' (broker_order_id): {order_data}")
+                return
+
+            # Validate broker order ID
+            if not EventUtils.validate_broker_order_id(broker_order_id):
+                self.logger.error(f"Invalid broker order ID format: {broker_order_id}")
+                return
+    
+            # Common fields for ExecutionEvent
+            event_time = time.time()
+            exec_id = f"exec-{uuid.uuid4()}"
+            parsed_symbol = order_data.get('tsym', 'UNKNOWN_SYMBOL')
+            parsed_exchange_str = order_data.get('exch', 'NSE').upper()
+            order_instrument_id = f"{parsed_exchange_str}:{parsed_symbol}"
+            order_id = order_data.get('remarks', '').partition('=')[2] or None
+
+            try:
+                parsed_exchange = Exchange(parsed_exchange_str)
+            except ValueError:
+                self.logger.warning(f"Unknown exchange '{parsed_exchange_str}' in order update. Defaulting to NSE.")
+                parsed_exchange = Exchange.NSE
+
+            trantype = order_data.get('trantype', '')
+            parsed_side = OrderSide.BUY if trantype == 'B' else (OrderSide.SELL if trantype == 'S' else None)
             
+            prctyp = order_data.get('prctyp', '')
+            parsed_order_type = None
+            if prctyp == 'MKT': parsed_order_type = OrderType.MARKET
+            elif prctyp == 'LMT': parsed_order_type = OrderType.LIMIT    
+            elif prctyp == 'SL-LMT': parsed_order_type = OrderType.SL
+            elif prctyp == 'SL-MKT': parsed_order_type = OrderType.SL_M
+            
+            parsed_quantity = float(order_data.get('qty', 0.0))
+            parsed_price = float(order_data.get('prc', 0.0))
+            parsed_trigger_price = float(order_data.get('trgprc', 0.0)) if order_data.get('trgprc') else None
+
+            if api_status == 'REJECTED':
+                exec_type='BROKER_REJECT'
+                rejection_reason = order_data.get('rejreason', 'Unknown rejection reason from broker')
+                self.logger.info(f"Broker Order ID {broker_order_id} is {api_status}. Reason: {rejection_reason}")                
+                self.logger.info(f"Simulating the OrderFILL on BROKER REJECT")
+                
+                # exec_event = ExecutionEvent(
+                #     order_id=order_id, 
+                #     broker_order_id=broker_order_id, symbol=order_instrument_id,
+                #     exchange=parsed_exchange, side=parsed_side, quantity=parsed_quantity,
+                #     order_type=parsed_order_type, status=OrderStatus.REJECTED, price=parsed_price,
+                #     trigger_price=parsed_trigger_price, rejection_reason=rejection_reason,
+                #     execution_id=exec_id, execution_time=event_time, execution_type=exec_type,
+                #     filled_quantity=0.0, average_price=0.0, timestamp=event_time,
+                #     event_type=EventType.EXECUTION, source=EventSource.MARKET_DATA_FEED
+                # )
+
+                filled_qty = 75
+                avg_price = parsed_price
+                if parsed_exchange == Exchange.BFO:
+                    filled_qty = 20
+
+                exec_event = ExecutionEvent(
+                    order_id=order_id,
+                    broker_order_id=broker_order_id, symbol=order_instrument_id,
+                    exchange=parsed_exchange, side=parsed_side, quantity=parsed_quantity, # Original order quantity
+                    order_type=parsed_order_type, status=OrderStatus.FILLED, price=parsed_price, # Original order price
+                    trigger_price=parsed_trigger_price,
+                    execution_id=exec_id, execution_time=event_time, execution_type="FILL",
+                    cumulative_filled_quantity=filled_qty, # Cumulative filled for this order
+                    average_price=avg_price, # Average fill price for this order
+                    last_filled_quantity=filled_qty, # Assuming 'COMPLETE' means one fill event for the full quantity or remaining
+                    last_filled_price=avg_price,     # Use average price as last fill price for simplicity here
+                    commission=float(order_data.get('brkVal', 0.0)), # Example: if broker value is commission
+                    timestamp=event_time,
+                    event_type=EventType.EXECUTION, source=EventSource.MARKET_DATA_FEED
+                )
+
+                self.event_manager.publish(exec_event)
+                self.logger.info(f"Published REJECTED ExecutionEvent for Broker Order ID: {broker_order_id}")
+
+            elif api_status == 'COMPLETE': # This means FILLED
+                filled_qty = float(order_data.get('fillshares', parsed_quantity)) # If fillshares not present, assume full qty for COMPLETE
+                avg_price = float(order_data.get('avgprc', parsed_price)) # Use order price if avgprc not present
+                
+                self.logger.info(f"Broker Order ID {broker_order_id} COMPLETE (FILLED). Qty: {filled_qty}, AvgPx: {avg_price}")
+                
+                exec_event = ExecutionEvent(
+                    order_id=order_id,
+                    broker_order_id=broker_order_id, symbol=order_instrument_id,
+                    exchange=parsed_exchange, side=parsed_side, quantity=parsed_quantity, # Original order quantity
+                    order_type=parsed_order_type, status=OrderStatus.FILLED, price=parsed_price, # Original order price
+                    trigger_price=parsed_trigger_price,
+                    execution_id=exec_id, execution_time=event_time, execution_type="FILL",
+                    cumulative_filled_quantity=filled_qty, # Cumulative filled for this order
+                    average_price=avg_price, # Average fill price for this order
+                    last_filled_quantity=filled_qty, # Assuming 'COMPLETE' means one fill event for the full quantity or remaining
+                    last_filled_price=avg_price,     # Use average price as last fill price for simplicity here
+                    commission=float(order_data.get('brkVal', 0.0)), # Example: if broker value is commission
+                    timestamp=event_time,
+                    event_type=EventType.EXECUTION, source=EventSource.MARKET_DATA_FEED
+                )                
+                self.event_manager.publish(exec_event)
+                self.logger.info(f"Published FILLED ExecutionEvent for Broker Order ID: {broker_order_id}")
+            
+            elif api_status == 'OPEN' or 'PENDING' in api_status:
+                # For OPEN or PENDING statuses, we might want to publish an ExecutionEvent
+                # to confirm the order is now active or pending at the broker.
+                current_status = OrderStatus.OPEN if api_status == 'OPEN' else OrderStatus.PENDING
+                exec_type = "BROKER_OPEN" if current_status == OrderStatus.OPEN else "BROKER_PENDING"
+
+                self.logger.info(f"Broker Order ID {broker_order_id} is {api_status}. Publishing {exec_type} ExecutionEvent.")
+                exec_event = ExecutionEvent(
+                    order_id=order_id, 
+                    broker_order_id=broker_order_id, symbol=order_instrument_id,
+                    exchange=parsed_exchange, side=parsed_side, quantity=parsed_quantity,
+                    order_type=parsed_order_type, status=current_status, price=parsed_price,
+                    trigger_price=parsed_trigger_price,
+                    execution_id=exec_id, execution_time=event_time, execution_type=exec_type,
+                    timestamp=event_time,
+                    event_type=EventType.EXECUTION, source=EventSource.MARKET_DATA_FEED
+                )                 
+                self.event_manager.publish(exec_event)
+                self.logger.info(f"Published OPEN or ExecutionEvent for Broker Order ID: {broker_order_id}")
+
+            else:
+                self.logger.debug(f"Processing other order update for Broker Order ID {broker_order_id}: {order_data}")
+
         except Exception as e:
-            self.logger.error(f"Error processing order update: {e}")
+            self.logger.error(f"Error processing order update from WebSocket: {e}", exc_info=True)
+            self.logger.debug(f"Problematic order_data: {order_data}")
     
     def _convert_tick_to_market_data(self, tick: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """ Convert Finvasia tick format to standard dict using MarketDataType enum values. """
@@ -1042,245 +1104,243 @@ class FinvasiaFeed(MarketDataFeedBase):
              self.logger.error(f"Unexpected error converting tick: {e}", exc_info=True)
              self.logger.debug(f"Raw tick data causing error: {tick}")
              return None
+        
+    def _attempt_reconnect(self):
+        """Attempt to reconnect to the WebSocket feed."""
+        if self._stop_reconnect_event.is_set():
+            self.logger.info("Reconnection suppressed as feed is stopping.")
+            return
+            
+        if self._reconnect_thread and self._reconnect_thread.is_alive():
+            self.logger.info("Reconnection already in progress.")
+            return
+            
+        self._reconnect_thread = threading.Thread(target=self._reconnect_loop)
+        self._reconnect_thread.daemon = True
+        self._reconnect_thread.start()
     
-    def disconnect(self):
-        """Gracefully disconnects from Finvasia feed and cleans up resources."""
-        self.logger.info("Disconnecting from Finvasia feed...")
-        self._stop_reconnect_event.set()
-
-        try:
-            # Unsubscribe from all symbols
-            if self._subscribed_tokens:
-                with self._sub_lock:
-                    tokens_to_unsubscribe = list(self._subscribed_tokens)
-                    if tokens_to_unsubscribe:
-                        self.logger.info(f"Unsubscribing from {len(tokens_to_unsubscribe)} instrument strings during disconnect.")
-                        # Check if API allows unsubscribe when not connected, or if it needs connection.
-                        # If API requires connection, this might only be effective if called while connected.
-                        if self.is_connected: # Only try to tell API if connected
-                           self.api.unsubscribe(tokens_to_unsubscribe)
-                    # Clear local tracking regardless of API success
-                    self._subscribed_tokens.clear()
-                    self._token_to_symbol.clear()
-                    self._symbol_to_token.clear()
+    def _reconnect_loop(self):
+        """Reconnection loop that attempts to reconnect with exponential backoff."""
+        while not self._stop_reconnect_event.is_set() and self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            delay = min(30, self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)))
             
-            # Stop WebSocket            
-            if self.is_connected:
-                self.logger.info("Closing WebSocket connection via NorenApi...")
-                self.api.close_websocket() # This should handle NorenApi's internal state            
-                self.is_connected = False # Explicitly set state
-
-            # Clear authentication
-            if self.is_authenticated:
-                self.logger.info("Logging out from Finvasia API.")
-                try:
-                    logout_response = self.api.logout()
-                    self.logger.debug(f"Logout API response: {logout_response}")
-                except Exception as e:
-                    self.logger.error(f"Exception during logout: {e}")
+            self.logger.info(f"Reconnection attempt {self._reconnect_attempts}/{self._max_reconnect_attempts} in {delay} seconds")
             
-            self.is_authenticated = False
-            self.session_token = None
+            # Wait for delay
+            start_time = time.time()
+            while time.time() - start_time < delay:
+                if self._stop_reconnect_event.is_set():
+                    self.logger.info("Reconnection aborted as feed is stopping.")
+                    return
+                time.sleep(0.1)
+            
+            # Check if session needs refresh
+            if not self.is_authenticated or self._should_refresh_session():
+                self.logger.info("Refreshing session before reconnection attempt")
+                if not self._refresh_session():
+                    self.logger.error("Session refresh failed. Continuing with reconnection attempt.")
+            
+            # Attempt to connect
+            if self.connect():
+                self.logger.info("Reconnection successful")
+                return
                 
-            self.logger.info("Successfully disconnected and cleaned up Finvasia feed.")
+            self.logger.warning(f"Reconnection attempt {self._reconnect_attempts} failed")
+            
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            self.logger.error(f"Maximum reconnection attempts ({self._max_reconnect_attempts}) reached. Giving up.")
+    
+    def _should_refresh_session(self):
+        """Check if session should be refreshed."""
+        # For simplicity, always refresh on reconnection
+        return True
+    
+    def _refresh_session(self):
+        """
+        Refresh the session token.
+        
+        If using session manager, refresh through it.
+        Otherwise, re-authenticate directly.
+        
+        Returns:
+            bool: True if refresh successful, False otherwise
+        """
+        try:
+            # If using session manager, refresh through it
+            if self._session_manager:
+                self.logger.info("Attempting session refresh via Session Manager...")
+                session = self._session_manager.refresh_session()
+                if session and session.token:
+                    # Update feed's credentials from the refreshed session
+                    with self._auth_lock:
+                        self.session_token = session.token
+                        self.user_id = session.user_id
+                        self.password = session.password
+                        self.is_authenticated = True
+                    self.logger.info("Session refreshed through session manager")
+                    return True
+                else:
+                    self.logger.error("Failed to refresh session through session manager")
+                    return False
+            
+            # Otherwise, re-authenticate directly
+            self.logger.info("Attempting direct re-authentication...")
+            return self.authenticate()
             
         except Exception as e:
-            self.logger.error(f"Error during disconnect procedure: {e}", exc_info=True)
-        finally:
-            # Ensure states are reset
-            self.is_connected = False
-            self.is_authenticated = False
-            self.logger.debug("FinvasiaFeed disconnect final state: is_connected=False, is_authenticated=False")
+            self.logger.error(f"Error refreshing session: {e}", exc_info=True)
+            return False
     
-    def __del__(self):
-        """Cleanup on object destruction."""
-        # Ensure logger exists or use print for __del__ if logger might be gone
-        log_func = self.logger.info if hasattr(self, 'logger') and self.logger else print
-        log_func("FinvasiaFeed instance being deleted. Ensuring disconnection.")
-        
-        # Call stop() only if essential attributes for it are present
-        # Check for _stop_reconnect_event as a proxy for successful enough __init__
-        if hasattr(self, '_stop_reconnect_event'):
-            self.stop()
-        else:
-            log_func("FinvasiaFeed __del__: Bypassing stop() due to likely partial initialization.")
-            # Minimal cleanup if stop() cannot be called:
-            if hasattr(self, 'api') and self.api:
-                try:
-                    log_func("FinvasiaFeed __del__: Attempting direct api.close_websocket()")
-                    self.api.close_websocket()
-                except Exception as e:
-                    log_func(f"FinvasiaFeed __del__: Error in direct websocket close: {e}")
-
 class MarketDataFeed:
     """
-    Unified interface for different market data feed implementations.
-    Supports different broker feeds through a common interface.
+    Factory class for creating market data feeds.
+    
+    This class creates and manages market data feeds based on the specified feed type.
+    It has been updated to support shared session management with brokers when both
+    are using the same provider (e.g., Finvasia).
     """
     
-    def __init__(self, feed_type: str, broker: Any, instruments: List[Instrument] = [], event_manager: EventManager = None, settings: Dict = None):
+    def __init__(self, feed_type: str, broker=None, instruments: List[Instrument] = None, 
+                 event_manager: EventManager = None, settings: Dict[str, Any] = None):
         """
-        Initialize a market data feed of the specified type.
-
+        Initialize the market data feed.
+        
         Args:
-            feed_type: Type of feed (websocket, rest, simulated)
-            broker: Broker instance
+            feed_type: Type of feed to create (e.g., 'simulated', 'finvasia')
+            broker: Broker instance for integration
             instruments: List of instruments to subscribe to
-            event_manager: EventManager instance
-            settings: Dictionary containing feed-specific settings
+            event_manager: Event manager for publishing events
+            settings: Additional settings for the feed
         """
-        self.logger = get_logger("live.market_data_feed")        
+        self.logger = get_logger("live.market_data_feed")
         self.feed_type = feed_type.lower()
         self.broker = broker
-        self.instruments = instruments
-        self.feed = None
+        self.instruments = instruments or []
         self.event_manager = event_manager
-        self.settings = settings if settings is not None else {}
+        self.settings = settings or {}
+        self.feed = None      
         
         # Initialize subscribed symbols cache
-        self._subscribed_symbols = set()
+        self._subscribed_symbols = set()       
         
-        # Register with event manager
-        self._register_with_event_manager()
-
-    def _register_with_event_manager(self):
-        """Register with event manager to publish market data events."""
-        # No need to subscribe to anything here since we're the publisher
-        self.logger.info("Registered with Event Manager for publishing market data events")
-
-    def start(self):
-        """Start the market data feed."""
-        if self.feed:
-            self.feed.start()
-            return
-        
-        # Log the instruments we're going to subscribe to
-        self.logger.info(f"Starting market data feed for {len(self.instruments)} instruments:")
-        for instrument in self.instruments:
-            self.logger.info(f"  - {instrument.exchange}:{instrument.symbol}")
-        
-        if self.feed_type == 'simulated':
-            # Get the appropriate parameters for SimulatedFeed
-            websocket_url = self.settings.get('websocket_url', '')  
-            api_key = self.settings.get('api_key', '')
-            client_id = self.settings.get('client_id', '')
-            password = self.settings.get('password', '')
-            # Pass all settings to SimulatedFeed constructor
-            # SimulatedFeed needs to accept **kwargs or specific args from settings
-            
-            try:
-                self.feed = SimulatedFeed(
-                    instruments=self.instruments,
-                    callback=self._handle_market_data,
-                    **self.settings # Pass all settings directly
-                )
-                self.logger.info("Created SimulatedFeed with appropriate parameters")
-            except Exception as e:
-                self.logger.error(f"Failed to create SimulatedFeed: {e}")
-                raise RuntimeError(f"Failed to create SimulatedFeed: {e}")
-
-        elif self.feed_type == 'finvasia_ws':
-            # Extract Finvasia-specific settings from broker config
-            user_id = self.settings.get('user_id')
-            password = self.settings.get('password')
-            api_key = self.settings.get('api_key')
-            imei = self.settings.get('imei', '')
-            twofa = self.settings.get('twofa', '')
-            vc = self.settings.get('vc', '')
-            api_url = self.settings.get('api_url', "https://api.shoonya.com/NorenWClientTP/")
-            ws_url = self.settings.get('websocket_url', "wss://api.shoonya.com/NorenWSTP/")
-            debug = self.settings.get('debug', False)
-            
-            # Validate required parameters
-            if not user_id or not password or not api_key:
-                self.logger.error("Missing required Finvasia credentials. Need user_id, password, and api_key.")
-                return            
-            
-            # Create the FinvasiaFeed instance
-            self.feed = FinvasiaFeed(
-                instruments=self.instruments,
-                callback=self._handle_market_data,
-                user_id=user_id,
-                password=password,
-                api_key=api_key,
-                imei=imei,
-                twofa=twofa,
-                vc=vc,
-                api_url=api_url,
-                ws_url=ws_url,
-                debug=debug
-            )
-
-            # Persistence is configured using settings passed
-            if self.settings.get("enable_persistence", False) and hasattr(self.feed, 'enable_persistence'):
-                persistence_path = self.settings.get("persistence_path", "./data/ticks")
-                persistence_interval = self.settings.get("persistence_interval", 300)
-                self.logger.info(f"Enabling persistence for Finvasia feed. Path: {persistence_path}, Interval: {persistence_interval}s")
-                self.feed.enable_persistence(
-                    enabled=True,
-                    interval=persistence_interval,
-                    path=persistence_path
-                )
-            
-            # Set maximum ticks in memory if configured
-            max_ticks = self.settings.get('max_ticks_in_memory', 10000)
-            if hasattr(self.feed, 'set_max_ticks_in_memory'):
-                self.feed.set_max_ticks_in_memory(max_ticks)
-
-        else:
-            raise ValueError(f"Unsupported feed type: {self.feed_type}")
-
-        # Start the feed immediately after creation
-        if self.feed:
-            self.feed.start()
-        else:
-            self.logger.error(f"Failed to create feed of type {self.feed_type}")
-
-    def stop(self):
-        """Stop the market data feed."""
-        if self.feed:
-            self.feed.stop()
-
-    def _handle_market_data(self, event: MarketDataEvent):
-        """
-        Handle incoming market data events.
-        
-        Args:
-            event: Market data event containing tick data
-        """
+    def _create_feed(self):
+        """Create the appropriate feed based on feed_type."""
         try:
-             # Properly classify the data type based on content
-            data = event.data
-
-            # Determine the most specific data type
-            if MarketDataType.OHLC in data:
-                # This is bar/candle data
-                event.data_type = MarketDataType.BAR
-            elif MarketDataType.LAST_PRICE in data and (MarketDataType.BID in data or MarketDataType.ASK in data):
-                # This has bid/ask so it's a quote
-                event.data_type = MarketDataType.QUOTE
-            elif MarketDataType.LAST_PRICE in data:
-                # This is a simple tick/trade
-                event.data_type = MarketDataType.TICK
-
-            # Forward to broker for processing
-            if hasattr(self.broker, 'on_market_data'):
-                self.broker.on_market_data(event)
-
-            # Log event at debug level
-            # self.logger.debug(f"Received market data event: {event}")
-
-            # Forward to event manager for system-wide distribution         
-            if hasattr(self, 'event_manager') and self.event_manager:
-                # self.logger.debug(f"Distributing market data event to event manager: {event}")
-                self.event_manager.publish(event)
-            elif hasattr(self, 'callback') and callable(self.callback):
-                # self.logger.debug(f"Distributing market data event via callback: {event}")
-                self.callback(event)
-
+            if self.feed_type == 'simulated':
+                self.feed = self._create_simulated_feed()
+            elif 'finvasia' in self.feed_type:
+                self.feed = self._create_finvasia_feed()
+            else:
+                self.logger.error(f"Unknown feed type: {self.feed_type}")
+                raise ValueError(f"Unknown feed type: {self.feed_type}")
+                
+            self.logger.info(f"Created {self.feed_type} feed")
+            
         except Exception as e:
-            self.logger.error(f"Error handling market data event: {e}", exc_info=True)
+            self.logger.error(f"Error creating feed: {e}")
+            raise
+            
+    def _create_simulated_feed(self):
+        """Create a simulated feed."""
+        return SimulatedFeed(
+            instruments=self.instruments,
+            callback=self._on_market_data,
+            event_manager=self.event_manager,
+            **self.settings
+        )
+        
+    def _create_finvasia_feed(self):
+        """
+        Create a Finvasia feed.
+        
+        If a session manager is provided in settings, use it for authentication.
+        Otherwise, use credentials from settings or broker.
+        """
+        # Check if session manager is provided
+        session_manager = self.settings.get('session_manager')
+        if session_manager:
+            self.logger.info("Using shared session manager for Finvasia feed")
+            
+            return FinvasiaFeed(
+                instruments=self.instruments,
+                callback=self._on_market_data,
+                event_manager=self.event_manager,
+                user_id=self.settings.get('user_id'),
+                password=self.settings.get('password'),
+                api_key=self.settings.get('api_key'),
+                imei=self.settings.get('imei'),
+                twofa=self.settings.get('twofa'),
+                vc=self.settings.get('vc'),
+                api_url=self.settings.get('api_url', 'https://api.shoonya.com/NorenWClientTP/'),
+                ws_url=self.settings.get('websocket_url', 'wss://api.shoonya.com/NorenWSTP/'),
+                debug=self.settings.get('debug', False),
+                session_manager=session_manager
+            )
+        
+        # Otherwise, use credentials from settings or broker
+        user_id = self.settings.get('user_id') or (self.broker.user_id if hasattr(self.broker, 'user_id') else None)
+        password = self.settings.get('password') or (self.broker.password if hasattr(self.broker, 'password') else None)
+        api_key = self.settings.get('api_key') or (self.broker.api_key if hasattr(self.broker, 'api_key') else None)
+        twofa = self.settings.get('twofa') or (self.broker.twofa if hasattr(self.broker, 'twofa') else None)
+        vc = self.settings.get('vc') or (self.broker.vc if hasattr(self.broker, 'vc') else None)
+        imei = self.settings.get('imei') or (self.broker.imei if hasattr(self.broker, 'imei') else None)
+        api_url = self.settings.get('api_url') or (self.broker.api_url if hasattr(self.broker, 'api_url') else 'https://api.shoonya.com/NorenWClientTP/')
+        ws_url = self.settings.get('websocket_url') or (self.broker.ws_url if hasattr(self.broker, 'ws_url') else 'wss://api.shoonya.com/NorenWSTP/')
+        
+        self.logger.info("Using direct authentication for Finvasia feed")
+        
+        return FinvasiaFeed(
+            instruments=self.instruments,
+            callback=self._on_market_data,
+            event_manager=self.event_manager,
+            user_id=user_id,
+            password=password,
+            api_key=api_key,
+            imei=imei,
+            twofa=twofa,
+            vc=vc,
+            api_url=api_url,
+            ws_url=ws_url,
+            debug=self.settings.get('debug', False)
+        )
+        
+    def _on_market_data(self, event: MarketDataEvent):
+        try:
+            if isinstance(event, MarketDataEvent):
+                data = event.data
+                if MarketDataType.OHLC in data: event.data_type = MarketDataType.BAR
+                elif MarketDataType.LAST_PRICE in data and (MarketDataType.BID in data or MarketDataType.ASK in data):
+                    event.data_type = MarketDataType.QUOTE
+                elif MarketDataType.LAST_PRICE in data: event.data_type = MarketDataType.TICK
+            elif not (isinstance(event, OrderEvent) or isinstance(event, ExecutionEvent)):
+                self.logger.warning(f"Received unexpected event type: {type(event)}")
+                return
 
+            if self.event_manager:
+                self.event_manager.publish(event)
+            else: 
+                self.logger.warning("No EventManager in MarketDataFeed factory to publish event.")
+        except Exception as e:
+            self.logger.error(f"Error handling market data/order event: {e}", exc_info=True)
+    
+    def start(self):
+        """Start the feed."""
+        if self.feed:
+            return self.feed.start()
+        
+        self._create_feed()
+        if self.feed:
+            return self.feed.start()
+
+        return False
+        
+    def stop(self):
+        """Stop the feed."""
+        if self.feed:
+            return self.feed.stop()
+        return False
+        
     def subscribe(self, instrument: Instrument):
         """
         Subscribe to market data for an instrument.
@@ -1319,7 +1379,7 @@ class MarketDataFeed:
         except Exception as e:
             self.logger.error(f"Error subscribing to {instrument.symbol}: {e}")
             return False
-
+        
     def unsubscribe(self, instrument: Instrument):
         """
         Unsubscribe from market data for an instrument.
@@ -1353,326 +1413,156 @@ class MarketDataFeed:
             self.logger.error(f"Error unsubscribing from {instrument.symbol}: {e}")
             return False
 
-    def construct_trading_symbol(self, symbol: str, 
-                                 strike: float, option_type: str, 
-                                 expiry_date: str,
-                                 instrument_type: str,
-                                 exchange: str) -> str:
-        """
-        Get the broker-specific option symbol for the given parameters
-        
-        Args:
-            symbol: The underlying symbol (e.g., 'NIFTY')
-            strike: Strike price
-            option_type: Option type ('CE' or 'PE')
-            expiry_date: Expiry date
-            
-        Returns:
-            str: The broker-specific option symbol
-        """       
-        
-        if not self.feed:
-            self.logger.error("Feed not initialized, cannot get symbol")
+    def construct_trading_symbol(self, symbol: str, strike: float, option_type: str, 
+                                 expiry_date_str: str, instrument_type_str: str, 
+                                 exchange_str: str) -> str: 
+        if not self.feed or not hasattr(self.feed, 'symbol_cache'):
+            self.logger.error("Feed not initialized or does not support symbol construction (no symbol_cache).")
+            try:
+                dt_expiry = datetime.strptime(expiry_date_str, '%Y-%m-%d').strftime("%d%b%y").upper()
+                return f"{symbol.upper()}{dt_expiry}{int(strike) if strike.is_integer() else strike}{option_type.upper()}"
+            except Exception: return ""
+        try:
+            constructed_sym = self.feed.symbol_cache.construct_trading_symbol(
+                name=symbol, expiry_date_str=expiry_date_str,
+                instrument_type=instrument_type_str, option_type=option_type,
+                strike=strike, exchange=exchange_str
+            )
+            if constructed_sym:
+                #self.logger.info(f"Constructed option symbol via FinvasiaFeed cache: {constructed_sym}")
+                return constructed_sym
+            self.logger.warning(f"Option not found in FinvasiaFeed cache: {symbol} {expiry_date_str} {strike} {option_type}")
+            return ""
+        except Exception as e:
+            self.logger.error(f"Error constructing option symbol via FinvasiaFeed: {e}", exc_info=True)
             return ""
             
-        # For Finvasia feed, use the symbol cache
-        if hasattr(self.feed, 'symbol_cache'):
-            try:
-                option_symbol = self.feed.symbol_cache.construct_trading_symbol(
-                    name=symbol,
-                    expiry_date_str=expiry_date,
-                    instrument_type=instrument_type,
-                    option_type=option_type,
-                    strike=strike,
-                    exchange=exchange)
-                
-                if option_symbol:
-                    self.logger.info(f"Constructed option symbol: {option_symbol}")
-                    return option_symbol
-                    
-                self.logger.warning(f"Option not found in cache: {symbol} {expiry_date} {strike} {option_type}")
-                return ""
-            except Exception as e:
-                self.logger.error(f"Error constructing option symbol: {e}")
-                return ""
-        else:
-            # Generic fallback format if no special cache/lookup is available
-            expiry_str = expiry_date.strftime("%d%b%y").upper()
-            return f"{symbol}{expiry_str}{strike}{option_type}"
-            
-    def get_expiry_dates(self, symbol: str) -> List[date]:
+    def get_symbol_info(self, trading_symbol: str, exchange: Union[str, Enum]) -> Optional[Dict[str, float]]:
         """
-        Get available expiry dates for an underlying
-        
+        Get symbol information including lotsize and tick_size.
+
         Args:
-            underlying_symbol: The underlying symbol (e.g., 'NIFTY')
-            
+            trading_symbol: The trading symbol to lookup
+            exchange: Exchange name (string or Enum)
+
         Returns:
-            List[date]: List of available expiry dates
-        """        
+            Dict with 'lotsize' and 'tick_size' keys, or None if error occurred
+            Empty dict if symbol not found but no error
+        """
+        if not self.feed or not hasattr(self.feed, 'symbol_cache'):
+            self.logger.error("Feed not initialized or does not support symbol lookup (no symbol_cache).")
+            return None
+
+        exchange_str = exchange.value if isinstance(exchange, Enum) else str(exchange)
+
+        if not (hasattr(self.feed, 'symbol_cache') and self.feed.symbol_cache):
+            self.logger.warning("Symbol cache not available in the current feed to retrieve symbol info.")
+            return None
+
+        try:
+            symbol_info = self.feed.symbol_cache.lookup_symbol(trading_symbol, exchange_str.upper())
+
+            if not symbol_info:
+                self.logger.warning(f"Symbol info not found in cache for: {trading_symbol} on exchange: {exchange_str}")
+                return {}
+
+            result = {}
+
+            # Handle lotsize
+            lotsize_val = symbol_info.get('lotsize')
+            if lotsize_val is not None and lotsize_val != '':
+                try:
+                    result['lotsize'] = float(lotsize_val)
+                    # self.logger.debug(f"Retrieved lot size for {trading_symbol}: {result['lotsize']}")
+                except ValueError:
+                    self.logger.error(f"Could not convert lot size '{lotsize_val}' to float for {trading_symbol}")
+                    result['lotsize'] = 1.0  # Default fallback
+            else:
+                self.logger.warning(f"Lot size is None or empty for {trading_symbol}. Using default.")
+                result['lotsize'] = 1.0
+
+            # Handle tick_size
+            tick_size_val = symbol_info.get('tick_size') or symbol_info.get('ticksize')  # Handle both possible keys
+            if tick_size_val is not None and tick_size_val != '':
+                try:
+                    result['ticksize'] = float(tick_size_val)
+                    # self.logger.debug(f"Retrieved tick size for {trading_symbol}: {result['ticksize']}")
+                except ValueError:
+                    self.logger.error(f"Could not convert tick size '{tick_size_val}' to float for {trading_symbol}")
+                    result['ticksize'] = 0.01  # Default tick size for Indian markets
+            else:
+                self.logger.warning(f"Tick size is None or empty for {trading_symbol}. Using default.")
+                result['ticksize'] = 0.01  # Default tick size
+
+            return result
         
-        if not self.feed:
-            self.logger.error("Feed not initialized, cannot get expiry dates")
+        except Exception as e:
+            self.logger.error(f"Error getting symbol info for {trading_symbol} from cache: {e}", exc_info=True)
+            return None
+    
+    def get_lotsize(self, trading_symbol: str, exchange: Union[str, Enum]) -> Optional[float]:
+        if not self.feed or not hasattr(self.feed, 'symbol_cache'):
+            self.logger.error("Feed not initialized or does not support get_expiry_dates (no symbol_cache).")
+            return []
+        exchange_str = exchange.value if isinstance(exchange, Enum) else str(exchange)
+        if hasattr(self.feed, 'symbol_cache') and self.feed.symbol_cache:
+            try:
+                symbol_info = self.feed.symbol_cache.lookup_symbol(trading_symbol, exchange_str.upper())
+                if symbol_info and 'lotsize' in symbol_info:
+                    lotsize_val = symbol_info['lotsize']
+                    if lotsize_val is not None and lotsize_val != '': # Check for None or empty string
+                        try:
+                            lotsize_float = float(lotsize_val)
+                            self.logger.debug(f"Retrieved lot size for {trading_symbol} on {exchange_str}: {lotsize_float}")
+                            return lotsize_float
+                        except ValueError:
+                            self.logger.error(f"Could not convert lot size '{lotsize_val}' to float for {trading_symbol}")
+                            return None # Indicates conversion error
+                    else:
+                        self.logger.warning(f"Lot size is None or empty for {trading_symbol} in cache.")
+                        return 1.0 # Default to 1.0 if lotsize is explicitly None or empty in cache
+                else:
+                    self.logger.warning(f"Lot size not found in cache for symbol: {trading_symbol} on exchange: {exchange_str}. Defaulting to 1.0.")
+                    return 1.0 # Default to 1.0 if not found
+            except Exception as e:
+                self.logger.error(f"Error getting lot size for {trading_symbol} from cache: {e}", exc_info=True)
+                return None # Indicates error during lookup
+        else:
+            self.logger.warning("Symbol cache not available in the current feed to retrieve lot size. Cannot determine lot size.")
+            return None # Indicates cache not available
+        
+    def get_expiry_dates(self, symbol: str) -> List[date]: 
+        if not self.feed or not hasattr(self.feed, 'symbol_cache'):
+            self.logger.error("Feed not initialized or does not support get_expiry_dates (no symbol_cache).")
+            return []
+        try:
+            expiry_dates = self.feed.symbol_cache.get_combined_expiry_dates(symbol)
+            if expiry_dates: return sorted(expiry_dates)
+            self.logger.warning(f"No expiry dates found for {symbol} in FinvasiaFeed cache.")
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting expiry dates via FinvasiaFeed: {e}", exc_info=True)
             return []
             
-        # For Finvasia feed, use the symbol cache
-        if hasattr(self.feed, 'symbol_cache'):
-            try:
-                # Get expiry dates from symbol cache
-                expiry_dates = self.feed.symbol_cache.get_combined_expiry_dates(symbol)
-
-                # self.logger.debug(f"Expiry dates for {symbol}: {expiry_dates}")
-                if expiry_dates:
-                    return sorted(expiry_dates)  # Return sorted expiries
-                    
-                self.logger.warning(f"No expiry dates found for {symbol}")
-                
-                # Fallback to utility function if no expiries found in cache
-                from utils.expiry_utils import get_next_expiry
-                next_expiry = get_next_expiry(symbol)
-                return [next_expiry] if next_expiry else []
-                
-            except Exception as e:
-                self.logger.error(f"Error getting expiry dates: {e}")
-                
-                # Fallback to utility function
-                from utils.expiry_utils import get_next_expiry
-                next_expiry = get_next_expiry(symbol)
-                return [next_expiry] if next_expiry else []
-        else:
-            # Fallback to utility function if no symbol cache
-            from utils.expiry_utils import get_next_expiry
-            next_expiry = get_next_expiry(symbol)
-            return [next_expiry] if next_expiry else []
-            
     def subscribe_symbols(self, instruments: List[Instrument]) -> Dict[str, bool]:
-        """
-        Subscribe to multiple instruments at once
-        
-        Args:
-            instruments: List of instruments to subscribe to
-            
-        Returns:
-            Dict[str, bool]: Dictionary mapping instrument symbols to subscription success status
-        """       
-        
         if not self.feed:
             self.logger.error("Feed not initialized, cannot subscribe to instruments")
-            return {instrument.symbol: False for instrument in instruments}
-            
+            return {inst.instrument_id: False for inst in instruments}
         results = {}
-        
-        # For each instrument, call subscribe method
-        for instrument in instruments:
-            try:
-                # Use existing subscribe method
-                success = self.subscribe(instrument)
-                results[instrument.symbol] = success
-                
-                if not success:
-                    self.logger.warning(f"Failed to subscribe to {instrument.symbol} on {instrument.exchange}")
-                
-            except Exception as e:
-                self.logger.error(f"Error subscribing to {instrument.symbol}: {e}")
-                results[instrument.symbol] = False
-                
-        # Log summary
+        for instrument_obj in instruments:
+            results[instrument_obj.instrument_id] = self.subscribe(instrument_obj) 
         success_count = sum(1 for v in results.values() if v)
-        self.logger.info(f"Subscribed to {success_count}/{len(instruments)} instruments")
-        
+        self.logger.info(f"Subscription request summary: {success_count}/{len(instruments)} successful.")
         return results
     
     def unsubscribe_symbols(self, instruments: List[Instrument]) -> Dict[str, bool]:
-        """
-        Unsubscribe to multiple instruments at once
-        
-        Args:
-            instruments: List of instruments to unsubscribe from
-            
-        Returns:
-            Dict[str, bool]: Dictionary mapping instrument symbols to unsubscription success status
-        """       
-        
         if not self.feed:
-            self.logger.error("Feed not initialized, cannot unsubscribe to instruments")
-            return {instrument.symbol: False for instrument in instruments}
-            
+            self.logger.error("Feed not initialized, cannot unsubscribe instruments")
+            return {inst.instrument_id: False for inst in instruments}
         results = {}
-        
-        # For each instrument, call subscribe method
-        for instrument in instruments:
-            try:
-                # Use existing subscribe method
-                success = self.unsubscribe(instrument)
-                results[instrument.symbol] = success
-                
-                if not success:
-                    self.logger.warning(f"Failed to unsubscribe to {instrument.symbol} on {instrument.exchange}")
-                
-            except Exception as e:
-                self.logger.error(f"Error unsubscribing to {instrument.symbol}: {e}")
-                results[instrument.symbol] = False
-                
-        # Log summary
+        for instrument_obj in instruments:
+            results[instrument_obj.instrument_id] = self.unsubscribe(instrument_obj) 
         success_count = sum(1 for v in results.values() if v)
-        self.logger.info(f"Unsubscribed to {success_count}/{len(instruments)} instruments")
-        
+        self.logger.info(f"Unsubscription request summary: {success_count}/{len(instruments)} successful.")
         return results
 
-# Example usage
-# --- Example Usage (Updated) ---
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, # DEBUG for more detail
-        format='%(asctime)s - %(name)s - %(levelname)s - %(threadName)s - %(message)s'
-    )
-
-    # --- Credentials ---
-    FINVASIA_USER_ID = os.environ.get("FINVASIA_USER_ID", "YOUR_USER_ID")
-    FINVASIA_PASSWORD = os.environ.get("FINVASIA_PASSWORD", "YOUR_PASSWORD")
-    FINVASIA_API_KEY = os.environ.get("FINVASIA_API_KEY", "YOUR_API_KEY")
-    FINVASIA_TWOFA = os.environ.get("FINVASIA_TWOFA", "YOUR_TOTP_SECRET")
-    FINVASIA_VC = os.environ.get("FINVASIA_VC", "YOUR_VENDOR_CODE")
-
-    # --- Dynamic Symbol Finding (Example) ---
-    initial_instruments = []
-    try:
-        if not all([FINVASIA_USER_ID != "YOUR_USER_ID", FINVASIA_TWOFA != "YOUR_TOTP_SECRET"]):
-             raise ValueError("Credentials not set for dynamic symbol search.")
-
-        # Temp API login for search
-        temp_api = NorenApi(host="https://api.shoonya.com/NorenWClientTP/", websocket="")
-        login_resp = temp_api.login(FINVASIA_USER_ID, FINVASIA_PASSWORD, pyotp.TOTP(FINVASIA_TWOFA).now(), FINVASIA_VC, FINVASIA_API_KEY, str(uuid.uuid4()))
-
-        nifty_option_symbol = None
-        if login_resp and login_resp.get('stat') == 'Ok':
-             # Search for near-month NIFTY CE options
-             search_resp = temp_api.searchscrip(exchange='NFO', searchtext='NIFTY CE')
-             if search_resp and search_resp.get('stat') == 'Ok' and search_resp.get('values'):
-                  today_str = datetime.now().strftime('%Y%m%d')
-                  future_options = []
-                  for item in search_resp['values']:
-                       # Finvasia expiry format might be DDMMMYYYY
-                       exd_str = item.get('exd')
-                       tsym = item.get('tsym')
-                       optt = item.get('optt')
-                       if exd_str and tsym and optt == 'CE':
-                            try:
-                                 exd_dt = datetime.strptime(exd_str, '%d%b%Y') # Adjust format if needed
-                                 if exd_dt.strftime('%Y%m%d') >= today_str:
-                                      # Add strike price for sorting proximity
-                                      item['strike'] = float(item.get('strprc', 0))
-                                      future_options.append(item)
-                            except (ValueError, TypeError):
-                                 logging.warning(f"Could not parse expiry {exd_str} for {tsym}")
-
-                  if future_options:
-                       future_options.sort(key=lambda x: datetime.strptime(x['exd'], '%d%b%Y')) # Sort by date
-                       # Add logic here to find ATM/near-ATM strike if needed
-                       nifty_option_symbol = future_options[0]['tsym'] # Take nearest expiry
-                       logging.info(f"Dynamically found Nifty Option symbol: {nifty_option_symbol}")
-             else: logging.warning("Failed to search for Nifty option symbols.")
-        else: logging.warning(f"Temp login failed: {login_resp.get('emsg') if login_resp else 'No Response'}")
-
-        # Create Instrument object
-        if nifty_option_symbol:
-             # Get details to populate Instrument better
-             details = temp_api.searchscrip(exchange='NFO', searchtext=nifty_option_symbol)
-             inst_details = {}
-             if details and details.get('stat') == 'Ok' and details.get('values'):
-                  inst_details = details['values'][0]
-
-             nifty_option = Instrument(
-                 symbol=nifty_option_symbol,
-                 exchange=Exchange.NFO.value, # Use string value
-                 instrument_type=InstrumentType.OPTION,
-                 asset_class=AssetClass.OPTIONS,
-                 lot_size=float(inst_details.get('ls', 50)), # Get lot size if available
-                 tick_size=float(inst_details.get('ti', 0.05)), # Get tick size
-                 strike_price=float(inst_details.get('strprc', 0)),
-                 option_type=OptionType.CALL, # Since we searched for CE
-                 expiry_date=inst_details.get('exd') # Store expiry
-             )
-             initial_instruments.append(nifty_option)
-        else:
-             logging.warning("Using fallback static option symbol - VERIFY THIS IS CORRECT!")
-             fallback_symbol = "NIFTY 18APR2024 22500 CE" # !! MUST BE VALID !!
-             nifty_option = Instrument(symbol=fallback_symbol, exchange=Exchange.NFO.value, instrument_type=InstrumentType.OPTION)
-             initial_instruments.append(nifty_option)
-
-    except ImportError:
-         logging.error("pyotp library not found. Please install it (`pip install pyotp`). Cannot run example.")
-         initial_instruments = [] # Prevent feed start without pyotp
-    except Exception as e:
-         logging.error(f"Error during dynamic symbol finding: {e}", exc_info=True)
-         # Optionally add static fallback here if dynamic fails critically
-         initial_instruments = []
-
-
-    # --- Callback Function ---
-    def market_data_handler(event: MarketDataEvent):
-        """Handles incoming market data events."""
-        symbol = event.instrument.symbol
-        # Use enum values (uppercase strings) to access data
-        data = event.data
-        dtype = event.data_type # MarketDataType enum member
-
-        log_msg = f"[{dtype.value}] {symbol}: " # Use enum value
-        parts = []
-        # Access data using MarketDataType.XXX.value
-        if MarketDataType.LAST_PRICE.value in data: parts.append(f"LTP={data[MarketDataType.LAST_PRICE.value]:.2f}")
-        if MarketDataType.BID.value in data: parts.append(f"Bid={data[MarketDataType.BID.value]:.2f}")
-        if MarketDataType.ASK.value in data: parts.append(f"Ask={data[MarketDataType.ASK.value]:.2f}")
-        if MarketDataType.VOLUME.value in data: parts.append(f"Vol={data[MarketDataType.VOLUME.value]}")
-        if MarketDataType.OPEN_INTEREST.value in data: parts.append(f"OI={data[MarketDataType.OPEN_INTEREST.value]}")
-        if MarketDataType.OHLC.value in data:
-             ohlc = data[MarketDataType.OHLC.value]
-             parts.append(f"O={ohlc.get(MarketDataType.OPEN.value, 'N/A')} "
-                          f"H={ohlc.get(MarketDataType.HIGH.value, 'N/A')} "
-                          f"L={ohlc.get(MarketDataType.LOW.value, 'N/A')} "
-                          f"C={ohlc.get(MarketDataType.CLOSE.value, 'N/A')}")
-        logging.info(log_msg + ", ".join(parts))
-
-    # --- Initialize & Run FinvasiaFeed ---
-    if not all([FINVASIA_USER_ID != "YOUR_USER_ID", FINVASIA_PASSWORD != "YOUR_PASSWORD", FINVASIA_API_KEY != "YOUR_API_KEY", FINVASIA_TWOFA != "YOUR_TOTP_SECRET"]):
-         logging.error("Please set Finvasia credentials in environment variables or script before running.")
-    elif not initial_instruments:
-         logging.error("No initial instruments found or created. Cannot start feed.")
-    else:
-         feed = None
-         try:
-             feed = FinvasiaFeed(
-                 instruments=initial_instruments,
-                 callback=market_data_handler,
-                 user_id=FINVASIA_USER_ID, password=FINVASIA_PASSWORD, api_key=FINVASIA_API_KEY,
-                 twofa=FINVASIA_TWOFA, vc=FINVASIA_VC,
-                 debug=False # Set True for very detailed logs
-             )
-             feed.enable_persistence(enabled=True, path="./market_data_ticks", interval=60)
-             feed.set_max_ticks_in_memory(5000)
-             feed.start() # Start the feed
-
-             if feed.is_running:
-                 logging.info("Market data feed running. Press Ctrl+C to stop.")
-                 # Add dynamic subscriptions or other interactions here
-                 time.sleep(15)
-                 if feed.is_running:
-                      logging.info("--- Adding RELIANCE subscription ---")
-                      reliance_inst = Instrument(symbol="RELIANCE", exchange=Exchange.NSE.value, instrument_type=InstrumentType.EQUITY)
-                      feed.subscribe(reliance_inst)
-                 time.sleep(15)
-                 if feed.is_running:
-                      logging.info(f"--- Status: {feed.get_subscription_status()} ---")
-                      logging.info(f"--- Stats: {feed.get_tick_statistics()} ---")
-
-                 # Keep main thread alive while feed runs
-                 while feed.is_running: time.sleep(1)
-
-         except KeyboardInterrupt:
-             logging.info("KeyboardInterrupt received. Stopping feed...")
-         except Exception as main_e:
-             logging.error(f"An error occurred during feed execution: {main_e}", exc_info=True)
-         finally:
-             if feed and feed.is_running:
-                  feed.stop()
-             logging.info("Market data feed stopped.")

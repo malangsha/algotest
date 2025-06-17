@@ -214,16 +214,30 @@ class OptionManager:
                  return False
 
             instrument_type = InstrumentType.INDEX if underlying_symbol in SYMBOL_MAPPINGS.get("indices", []) else InstrumentType.EQUITY
-            asset_class = AssetClass.INDEX if instrument_type == InstrumentType.INDEX else AssetClass.EQUITY
-
+            asset_class = AssetClass.INDEX if instrument_type == InstrumentType.INDEX else AssetClass.EQUITY            
+            
+            trading_symbol_for_cache = underlying_symbol         
+            if hasattr(self.data_manager, 'market_data_feed') and self.data_manager.market_data_feed:
+                market_data_feed = self.data_manager.market_data_feed
+                lot_size, tick_size = self._get_validated_symbol_params(
+                    market_data_feed, 
+                    trading_symbol_str=trading_symbol_for_cache, 
+                    option_exchange=exchange
+                )                    
+                self.logger.debug(f"Using {trading_symbol_for_cache} on {exchange.value}: lotsize {lot_size}, tick_size {tick_size}")                
+            else:
+                self.logger.warning("MarketDataFeed not available in DataManager, cannot get lot size for underlying. Using default.")
+            
             instrument = Instrument(
                 symbol=underlying_symbol,
                 exchange=exchange,
                 instrument_type=instrument_type,
                 asset_class=asset_class,
-                instrument_id=f"{exchange.value}:{underlying_symbol}" # Ensure consistent key format
+                instrument_id=f"{exchange.value}:{underlying_symbol}",
+                lot_size=lot_size,
+                tick_size=tick_size
             )
-            # MODIFIED: Use DataManager's specific method for instrument feed subscription
+            
             if self.data_manager.subscribe_instrument(instrument):
                 self._subscribed_underlyings.add(underlying_symbol)
                 self.logger.info(f"OptionManager: Successfully requested DataManager to subscribe to underlying feed {underlying_symbol}")
@@ -343,6 +357,54 @@ class OptionManager:
         if strike_interval == 0: return price # Should not happen for options
         return round(price / strike_interval) * strike_interval
 
+    def _get_validated_symbol_params(self, market_data_feed, trading_symbol_str: str, option_exchange: str):
+        """
+        Get and validate symbol parameters with proper fallbacks for Indian markets.
+
+        Returns:
+            tuple: (lot_size, tick_size) with validated positive values
+        """
+        # Default values for Indian F&O markets
+        DEFAULT_LOT_SIZE = 1.0
+        DEFAULT_TICK_SIZE = 0.01  # Common for Indexes
+
+        try:
+            symbol_info = market_data_feed.get_symbol_info(
+                trading_symbol=trading_symbol_str,
+                exchange=option_exchange 
+            )
+
+            # Extract and validate lot_size
+            if symbol_info and isinstance(symbol_info, dict):
+                raw_lot_size = symbol_info.get('lotsize', DEFAULT_LOT_SIZE)
+                raw_tick_size = symbol_info.get('ticksize', DEFAULT_TICK_SIZE)
+            else:
+                raw_lot_size = DEFAULT_LOT_SIZE
+                raw_tick_size = DEFAULT_TICK_SIZE
+
+            # Validate lot_size - must be positive number
+            try:
+                lot_size = float(raw_lot_size)
+                if lot_size <= 0:
+                    lot_size = DEFAULT_LOT_SIZE
+            except (ValueError, TypeError):
+                lot_size = DEFAULT_LOT_SIZE
+
+            # Validate tick_size - must be positive number
+            try:
+                tick_size = float(raw_tick_size)
+                if tick_size <= 0:
+                    tick_size = DEFAULT_TICK_SIZE
+            except (ValueError, TypeError):
+                tick_size = DEFAULT_TICK_SIZE
+
+            return lot_size, tick_size
+
+        except Exception as e:
+            # Log the error and return defaults
+            print(f"Error fetching symbol info for {trading_symbol_str}: {e}")
+            return DEFAULT_LOT_SIZE, DEFAULT_TICK_SIZE
+    
     def _update_atm_subscriptions(self, underlying_symbol: str, new_atm_strike: float, old_atm_strike: Optional[float]):
         """Uses DataManager.subscribe_instrument/unsubscribe_instrument (Item 2.2 from todo.md)"""
         underlying_config = self.underlyings.get(underlying_symbol)
@@ -383,22 +445,29 @@ class OptionManager:
             for option_type in ['CE', 'PE']:  # Call and Put options
                 # Get the broker-specific option symbol                   
                 self.logger.debug(f"calling construct_trading_symbol with symbol: {str(mapped_underlying)}, expriy_date: {expiry_date}, instrument_type: {instrument_type}, option_type: {option_type}, exchange: {str(option_exchange.value)}")           
-                option_instrument =  market_data_feed.construct_trading_symbol(
+                option_trading_symbol_str =  market_data_feed.construct_trading_symbol(
                     symbol=str(mapped_underlying),
-                    expiry_date=expiry_date,
-                    instrument_type=instrument_type,
+                    expiry_date_str=expiry_date,
+                    instrument_type_str=instrument_type,
                     strike=strike,
                     option_type=option_type,
-                    exchange=str(option_exchange.value)
+                    exchange_str=str(option_exchange.value)
                 )
                 
-                if not option_instrument:
+                if not option_trading_symbol_str:
                     self.logger.error(f"Failed to construct option symbol for {underlying_symbol} {strike} {option_type}")
                     return None
             
+                lot_size, tick_size = self._get_validated_symbol_params(
+                    market_data_feed, 
+                    trading_symbol_str=option_trading_symbol_str, 
+                    option_exchange=option_exchange
+                )              
+                self.logger.debug(f"Using {option_trading_symbol_str} on {option_exchange.value}: lotsize {lot_size}, tick_size {tick_size}")
+            
                 # Create the Instrument object
                 instrument = Instrument(
-                    symbol=option_instrument, # The actual trading symbol
+                    symbol=option_trading_symbol_str, # The actual trading symbol
                     exchange=option_exchange,
                     asset_class=AssetClass.OPTIONS,
                     instrument_type=InstrumentType.OPTION,
@@ -407,7 +476,9 @@ class OptionManager:
                     option_type=option_type,
                     expiry_date=expiry_date, # Store expiry date object
                     # Use DataManager's preferred key format if available, else construct one
-                    instrument_id=f"{option_exchange.value}:{option_instrument}"
+                    instrument_id=f"{option_exchange.value}:{option_trading_symbol_str}",
+                    lot_size=lot_size,
+                    tick_size=tick_size
                 )
 
                 needed_option_keys.add(instrument.instrument_id)
@@ -523,22 +594,29 @@ class OptionManager:
                 expiry_date = expiry_dates[expiry_offset]
 
             # Construct the broker-specific trading symbol
-            option_symbol_str = market_data_feed.construct_trading_symbol(
+            option_trading_symbol_str = market_data_feed.construct_trading_symbol(
                 symbol=mapped_underlying, # Use mapped symbol for construction
-                expiry_date=expiry_date,
-                instrument_type="OPT", # Assuming OPT for options
+                expiry_date_str=expiry_date,
+                instrument_type_str="OPT", # Assuming OPT for options
                 option_type=option_type,
                 strike=strike,
-                exchange=derivative_exchange.value # Pass exchange value string
+                exchange_str=derivative_exchange.value # Pass exchange value string
             )
 
-            if not option_symbol_str:
+            if not option_trading_symbol_str:
                 self.logger.error(f"Failed to construct option symbol for {underlying_symbol} {strike} {option_type}")
                 return None
-
+            
+            lot_size, tick_size = self._get_validated_symbol_params(
+                    market_data_feed, 
+                    trading_symbol_str=option_trading_symbol_str, 
+                    option_exchange=derivative_exchange
+            )
+            self.logger.debug(f"Using {option_trading_symbol_str} on {derivative_exchange.value}: lotsize {lot_size}, tick_size {tick_size}")            
+           
             # Create the Instrument object
             instrument = Instrument(
-                symbol=option_symbol_str, # The actual trading symbol
+                symbol=option_trading_symbol_str, # The actual trading symbol
                 exchange=derivative_exchange,
                 asset_class=AssetClass.OPTIONS,
                 instrument_type=InstrumentType.OPTION,
@@ -547,7 +625,9 @@ class OptionManager:
                 option_type=option_type,
                 expiry_date=expiry_date, # Store expiry date object
                 # Use DataManager's preferred key format if available, else construct one
-                instrument_id=f"{derivative_exchange.value}:{option_symbol_str}"
+                instrument_id=f"{derivative_exchange.value}:{option_trading_symbol_str}",
+                lot_size=lot_size,
+                tick_size=tick_size
             )
             return instrument
 

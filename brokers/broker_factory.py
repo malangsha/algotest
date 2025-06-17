@@ -1,123 +1,88 @@
-from typing import Dict, Any, Type
 import importlib
-import logging
-from .broker_interface import BrokerInterface
+import inspect
+from typing import Dict, Any, Type, Optional
+
+from brokers.broker_interface import BrokerInterface
+from utils.exceptions import BrokerError
+from core.logging_manager import get_logger
 
 class BrokerFactory:
     """
     Factory class for creating broker instances.
     """
     _broker_registry: Dict[str, Type[BrokerInterface]] = {}
-    _logger = logging.getLogger("brokers.broker_factory")
+    _logger = get_logger("brokers.broker_factory")
 
     @classmethod
-    def register_broker(cls, broker_name: str, broker_class: Type[BrokerInterface]) -> None:
+    def register_broker(cls, broker_type: str, broker_class: Type[BrokerInterface]) -> None:
         """
         Register a broker implementation.
 
         Args:
-            broker_name: Name to register the broker under
+            broker_type: Name to register the broker under
             broker_class: Broker class implementing BrokerInterface
         """
-        cls._broker_registry[broker_name.lower()] = broker_class
-        cls._logger.info(f"Registered broker: {broker_name}")
+        cls._broker_registry[broker_type.lower()] = broker_class
+        cls._logger.info(f"Registered broker: {broker_type}")
 
     @classmethod
-    def create_broker(cls, broker_name: str, config: Dict[str, Any] = None, **kwargs) -> BrokerInterface:
+    def create_broker(cls, broker_type: str, config: Dict[str, Any], **kwargs) -> BrokerInterface:
         """
-        Create a broker instance by name.
-
+        Create a broker instance of the specified type.
+        
         Args:
-            broker_name: Name of the broker to create
-            config: Configuration dictionary containing broker settings
-            **kwargs: Additional configuration parameters for the broker
-
+            broker_type: Type of broker to create
+            config: Global configuration dictionary
+            **kwargs: Additional arguments to pass to the broker constructor
+            
         Returns:
-            BrokerInterface: Instantiated broker
-
+            BrokerInterface: Initialized broker instance
+            
         Raises:
-            ValueError: If broker_name is not registered
+            BrokerError: If broker type is not registered or initialization fails
         """
-        broker_name = broker_name.lower()
-        broker_config = {}
-
-        cls._logger.info(f"Creating broker instance: {broker_name}")
-        # Extract broker-specific config if available
-        if config and "broker" in config:
-            broker_list = config.get("broker", [])
-            # Find the broker config that matches the requested broker name
-            for broker_item in broker_list:
-                if broker_item.get("broker_name", "").lower() == broker_name:
-                    broker_config = broker_item
-                    break
-
-        # Merge kwargs with broker_config (kwargs take precedence)
-        broker_config.update(kwargs)
-
-        # First, check if the broker is already registered
-        if broker_name in cls._broker_registry:
-            broker_class = cls._broker_registry[broker_name]
-            cls._logger.info(f"Creating broker instance: {broker_name}")
+        broker_type = broker_type.lower()
+        
+        # Check if broker type is registered
+        if broker_type in cls._broker_registry:
+            broker_class = cls._broker_registry[broker_type]
+        else:
+            # Try to dynamically import the broker module
             try:
-                # Try to initialize with broker_config and pass the full config as well
-                # return broker_class(config=config, **broker_config)
-                return broker_class(config=config, **broker_config)
-            except TypeError as e:
-                cls._logger.error(f"Error creating broker instance '{broker_name}': {str(e)}")
-                # Fall back to just passing the full config object
-                try:
-                    return broker_class(config=config)
-                except TypeError:
-                    # Last resort: pass the specific broker config without named parameter
-                    return broker_class(broker_config)
-
-        # If not registered, try to dynamically import the broker module
+                module_name = f"brokers.{broker_type}_broker"
+                module = importlib.import_module(module_name)
+                
+                # Find the broker class in the module
+                for name, obj in inspect.getmembers(module, inspect.isclass):
+                    if issubclass(obj, BrokerInterface) and obj != BrokerInterface:
+                        broker_class = obj
+                        cls.register_broker(broker_type, broker_class)
+                        break
+                else:
+                    raise BrokerError(f"No broker class found in module: {module_name}")
+                    
+            except ImportError as e:
+                raise BrokerError(f"Failed to import broker module for type '{broker_type}': {e}")
+            except Exception as e:
+                raise BrokerError(f"Error finding broker class for type '{broker_type}': {e}")
+        
+        # Create broker instance
         try:
-            # Construct expected module path based on naming convention
-            module_name = f"brokers.{broker_name}_broker"
-            class_name = f"{broker_name.capitalize()}Broker"
-
-            cls._logger.info(f"config: {config}")
-            cls._logger.info(f"trying to import module: {module_name}, class: {class_name}")
-
-            # Check if module exists
-            spec = importlib.util.find_spec(module_name)
-            if spec is None:
-                cls._logger.error(f"Module {module_name} not found")
-                raise ValueError(f"Unknown broker: {broker_name}")
-
-            # Import the module
-            module = importlib.import_module(module_name)
-
-            # Get the broker class
-            if hasattr(module, class_name):
-                broker_class = getattr(module, class_name)
-                cls.register_broker(broker_name, broker_class)
-                cls._logger.info(f"Creating broker instance: {broker_name}")
-                try:
-                    # Try to initialize with broker_config and pass the full config as well
-                    return broker_class(config=config, **broker_config)
-                except TypeError as e:
-                    cls._logger.error(f"Error creating broker instance '{broker_name}': {str(e)}")
-                    # Fall back to just passing the full config object
-                    try:
-                        return broker_class(config=config)
-                    except TypeError:
-                        # Last resort: pass the specific broker config without named parameter
-                        return broker_class(broker_config)
-            else:
-                cls._logger.error(f"Class {class_name} not found in module {module_name}")
-                raise ValueError(f"Unknown broker class: {class_name}")
-
+            # Check if session_manager is provided in kwargs
+            # session_manager = kwargs.get('session_manager', None)
+            
+            # Initialize broker
+            broker = broker_class(config=config, **kwargs)
+            
+            # # Set session_manager if provided and broker supports it
+            # if session_manager and hasattr(broker, 'set_session_manager'):
+            #     broker.set_session_manager(session_manager)
+            #     cls._logger.info(f"Set shared session manager for broker: {broker_type}")
+            
+            return broker
+            
         except Exception as e:
-            cls._logger.error(f"Failed to dynamically load broker '{broker_name}': {str(e)}")
-
-            # If the broker is "finvasia" and the error is "PENDING", provide more helpful message
-            if broker_name == "finvasia" and str(e) == "PENDING":
-                cls._logger.warning("Finvasia broker is marked as PENDING implementation")
-                cls._logger.warning("Either implement the broker or remove it from configuration")
-
-            raise ValueError(f"Unknown broker: {broker_name}")
+            raise BrokerError(f"Failed to initialize broker of type '{broker_type}': {e}")
 
     @classmethod
     def get_available_brokers(cls) -> Dict[str, Type[BrokerInterface]]:

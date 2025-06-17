@@ -3,7 +3,7 @@
 # System Configuration
 system:
   name: "AlgoTrading Framework"
-  mode: "live"  # Options: "backtest", "live", "paper"
+  mode: "paper"  # Options: "backtest", "live", "paper"
   timezone: "Asia/Kolkata"
   log_level: "DEBUG"  # Options: "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
   log_dir: "logs"
@@ -58,24 +58,45 @@ broker_connections:
   # Primary connection to use for live/paper trading
   active_connection: "finvasia_live" # Name matching one of the connections below
 
+  # Session Manager Configuration
+  session_manager:
+    enabled: true  # Set to false to disable shared session management
+    refresh_interval_hours: 8  # How often to refresh the session token
+    auto_retry_on_expiry: true  # Whether to automatically retry on session expiry
+    max_retries: 3  # Maximum number of retries on session expiry
+
   connections:
     - connection_name: "finvasia_live"
-      broker_type: "finvasia" # Matches the factory name (lowercase)
-      secrets: "config/.env.finvasia" # Contains user_id, password, api_key, twofa, vc, imei
+      broker_type:    "finvasia"
+      secrets:        "config/.env.finvasia"
       api:
-        api_url: "https://api.shoonya.com/NorenWClientTP/"
-        timeout: 10
+        api_url:     "https://api.shoonya.com/NorenWClientTP/"
+        timeout:     10
         max_retries: 3
         retry_delay: 1
-        debug: false
+        debug:       false
 
     - connection_name: "simulated_broker"
-      broker_type: "simulated"
-      api:
-        timeout: 1
-        max_retries: 1
-        retry_delay: 0
+      broker_type:    "simulated"
+      latency_range_ms: [20, 100]
+      fill_realism:
+        slippage_pct: 0.0005
+      order_flow:
+        # A standard place_order will become OPEN, then COMPLETE
+        place_order: ["PENDING", "FILL"]
 
+        # To test a rejection:
+        # place_order: ["REJECT"] 
+
+        # To test a partial fill then full fill:
+        # place_order: ["OPEN", "PARTIAL_FILL", "COMPLETE"]
+
+        # To test a cancellation:
+        cancel_order: ["CANCELED"]
+
+        # To test a modification that then fills:
+        modify_order: ["OPEN", "COMPLETE"]
+           
 # --- Market Data Configuration --- 
 market_data:  
   persistence:
@@ -105,9 +126,9 @@ market_data:
     - "1h"
     - "1d"
   
-  live_feed_type: "finvasia_ws" # Options: "finvasia_ws", "simulated", "zerodha_ws", etc.  
+  live_feed_type: "finvasia" # Options: "finvasia", "simulated", "zerodha", etc.  
   feed_settings:
-    finvasia_ws:
+    finvasia:
       reconnect_interval: 5
       max_reconnect_attempts: 10
       enable_persistence: true
@@ -118,13 +139,16 @@ market_data:
       cache_expiry: 86400 # 24 hours
 
     simulated:
-      initial_prices: # Optional: Symbol -> Initial Price
-        RELIANCE-EQ: 2800.0
-      volatility: 0.002
-      tick_interval: 1.0
-      price_jump_probability: 0.05
-      max_price_jump: 0.02
-      risk_free_rate: 0.05
+      indices:
+        - name: "NIFTY INDEX"
+          exchange: "NSE"
+          spot_price: 24700
+          scenario: sideways     
+  
+        - name: "SENSEX"
+          exchange: "BSE"
+          spot_price: 81100
+          scenario: sideways
 
 # Redis configuration (used if market_data.use_redis is true)
 redis:
@@ -159,7 +183,7 @@ market:
     - symbol: "NIFTY INDEX"
       exchange: "NSE"
       derivative_exchange: "NFO"
-      strike_interval: 50
+      strike_interval: 100
       expiry: "weekly"
       atm_range: 1  # Number of strikes above and below ATM
       
@@ -243,13 +267,6 @@ live:
   paper_trading_settings:
     slippage: 0.0001  # 1 basis point of slippage
     commission: 0.0005  # 5 basis points of commission
-
-# Event manager configuration
-event_manager:
-  queue_size: 5000
-  process_sleep: 0.001
-  enable_monitoring: true
-  diagnostic_interval: 5
 
 excel_monitor:
   enabled: false  # Set to true to enable the dashboard, false to disable

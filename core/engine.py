@@ -25,7 +25,9 @@ from utils.exceptions import ConfigError, InitializationError
 from core.option_manager import OptionManager
 from core.strategy_manager import StrategyManager
 from core.excel_dashboard_monitor import ExcelDashboardMonitor
+from core.session_manager_factory import SessionManagerFactory
 from core.logging_manager import get_logger
+from utils.constants import MODES
 
 class UniverseHandler:
     """
@@ -162,10 +164,11 @@ class TradingEngine:
         
         # # Initialize position and portfolio management        
         self.position_manager = PositionManager(self.event_manager)        
-        self.portfolio = Portfolio(self.config, self.position_manager)
-        self.risk_manager = RiskManager(self.portfolio, self.config)
-        self.order_manager = OrderManager(self.event_manager, self.risk_manager)
-        self.performance_tracker = PerformanceTracker(self.portfolio, self.config)
+        self.portfolio = Portfolio(self.config, self.position_manager, self.event_manager)
+        self.risk_manager = RiskManager(self.portfolio, self.config, self.event_manager)
+        self.order_manager = OrderManager(self.event_manager, self.risk_manager, self.broker)
+        self.performance_tracker = PerformanceTracker(self.portfolio, self.config, 
+                                                      self.event_manager, self.position_manager)
 
         # Initialize OptionManager for option trading functionality
         self.option_manager = OptionManager(self.data_manager, 
@@ -273,56 +276,6 @@ class TradingEngine:
         
         self.logger.info("Trading Engine initialized")
 
-    # NOT USED
-    # def initialize(self):
-    #     """
-    #     Initialize the trading engine components.
-    #     """
-    #     self.logger.info("Initializing engine components")
-
-    #     # Only create the universe handler if it doesn't exist and is needed
-    #     # if not hasattr(self, 'universe_handler') or self.universe_handler is None:
-    #     #     self.universe_handler = UniverseHandler(self.data_source)
-
-    #     # Set the event manager for the broker
-    #     if self.broker:
-    #         if hasattr(self.broker, 'set_event_manager'):
-    #             self.broker.set_event_manager(self.event_manager)
-    #             self.logger.info("Event manager set for the broker")
-    #         else:
-    #              self.logger.warning("Broker does not have 'set_event_manager' method.")
-
-
-    #     # Load instruments
-    #     self._load_instruments()
-
-    #     # Start the event manager processing loop
-    #     self.event_manager.start()
-
-    #     # Set up event handlers within this engine
-    #     self._subscribe_to_events()
-
-    #     # Load strategies (initializes and gets active instruments)
-    #     self._load_strategies()
-
-    #     # Connect to broker
-    #     if self.broker and hasattr(self.broker, 'connect'):
-    #         try:
-    #             self.broker.connect()
-    #         except Exception as e:
-    #             self.logger.error(f"Error connecting to broker: {str(e)}")
-    #             # Consider if initialization should fail here
-
-    #     # Start ExecutionHandler if it has a start method
-    #     if hasattr(self.execution_handler, 'start'):
-    #          self.execution_handler.start()
-
-    #     # Start PaperTradingSimulator if it exists and has start method
-    #     if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'start'):
-    #         self.paper_trading_simulator.start()
-
-    #     self.logger.info("Engine initialization complete")
-
     def _initialize_broker(self):
         """Initialize the broker based on configuration."""
         # Initialize Broker Interface
@@ -342,12 +295,31 @@ class TradingEngine:
             if not active_broker_config:
                 raise InitializationError(f"Configuration for active broker connection '{active_connection_name}' not found.")
 
-            broker_type = active_broker_config.get('broker_type')
+            broker_type = active_broker_config.get('broker_type')            
             if not broker_type:
                 raise InitializationError(f"Missing 'broker_type' for connection '{active_connection_name}'.")
-
+            
+            # Check if session manager should be used
+            session_manager = None
+            session_manager_factory = SessionManagerFactory.get_instance()
+            if session_manager_factory:
+                session_manager = session_manager_factory.create_session_manager(self.config, active_broker_config)
+                if session_manager:
+                    self.logger.info(f"Using shared session manager for broker: {broker_type}")
+                    # Add session_manager to broker_config for BrokerFactory
+                    active_broker_config['session_manager'] = session_manager
+            
+            # create a copy of the active_broker_config
+            active_broker_config_copy = active_broker_config.copy()
+            active_broker_config_copy.pop('broker_type', None)
+            active_broker_config_copy.pop('connection_name', None)
+            
             # Pass config and specific connection details
-            self.broker = BrokerFactory.create_broker(broker_type, config=self.config, **active_broker_config)
+            self.broker = BrokerFactory.create_broker(broker_type, config=self.config, **active_broker_config_copy)
+
+            if self.broker and self.broker == MODES.SIMULATED:
+                self.broker.set_event_manager(self.event_manager)
+
             if not self.broker.is_connected:            
                raise InitializationError(f"Broker initialized failed: {broker_type}")
             self.logger.info(f"Broker interface initialized: {broker_type}")            
@@ -441,20 +413,14 @@ class TradingEngine:
         """Subscribe internal engine methods to relevant events."""
         self.logger.debug("Subscribing engine methods to events")
         
+        # TODO revisit events needed here.
         # Subscribe to events needed for local cache maintenance
         self.event_manager.subscribe(EventType.MARKET_DATA, self._on_market_data, component_name="TradingEngine")
         self.event_manager.subscribe(EventType.ORDER, self._on_order_event, component_name="TradingEngine")
         self.event_manager.subscribe(EventType.FILL, self._on_fill_event, component_name="TradingEngine")
-        
-        # Subscribe to system events for engine control
         self.event_manager.subscribe(EventType.SYSTEM, self._on_system_event, component_name="TradingEngine")
-        
-        # Subscribe to timer events for periodic tasks
-        self.event_manager.subscribe(EventType.TIMER, self._on_timer_event, component_name="TradingEngine")
-        
-        # Subscribe to signal events for order creation
-        self.event_manager.subscribe(EventType.SIGNAL, self._on_signal_event, component_name="TradingEngine")
-
+        self.event_manager.subscribe(EventType.TIMER, self._on_timer_event, component_name="TradingEngine")        
+       
     def _on_market_data(self, event: MarketDataEvent):
         """
         Handle market data events to maintain local cache.
@@ -466,7 +432,7 @@ class TradingEngine:
         try:
             # self.logger.debug(f"Received MarketDataEvent: {event}")
             # Basic validation
-            if not isinstance(event, MarketDataEvent) or not hasattr(event, 'instrument') or not hasattr(event.instrument, 'symbol'):
+            if not isinstance(event, MarketDataEvent) or not hasattr(event, 'instrument'):
                 self.logger.warning(f"Invalid MarketDataEvent received: {event}")
                 return
 
@@ -475,9 +441,7 @@ class TradingEngine:
             
             # Update local cache only
             if hasattr(event, 'data'):
-                self.market_data[symbol] = event.data
-            
-            # self.logger.debug(f"Updated market data cache for {symbol}: {event.data_type}")
+                self.market_data[symbol] = event.data         
 
         except Exception as e:
             self.logger.error(f"Error updating market data cache for {getattr(event, 'instrument', 'N/A')}: {e}", exc_info=True)
@@ -491,11 +455,11 @@ class TradingEngine:
             event: Order event
         """
         try:
-            if not isinstance(event, OrderEvent) or not hasattr(event, 'data') or not isinstance(event.data, Order):
+            if not isinstance(event, OrderEvent) or not hasattr(event, 'metadata'):
                 self.logger.warning(f"Invalid OrderEvent received: {event}")
                 return
 
-            order = event.data
+            order = event.metadata
             self.logger.debug(f"Updating order cache for {order.order_id}: Status {order.status}")
 
             # Update local order cache only
@@ -503,41 +467,7 @@ class TradingEngine:
 
         except Exception as e:
             self.logger.error(f"Error updating order cache for {getattr(event.data, 'order_id', 'N/A')}: {e}", exc_info=True)
-
-    def _on_signal_event(self, event: SignalEvent):
-        """
-        Handle strategy signal events directly.
-        Validates signal via RiskManager and converts to an OrderEvent via OrderManager.
-
-        Args:
-            event: Signal event generated by a strategy
-        """
-        try:
-            if not isinstance(event, SignalEvent):
-                self.logger.warning(f"Invalid SignalEvent received: {event}")
-                return
-                
-            # need to handle this event carefully, it will not have any data for ow.
-            return        
-            signal_data = event.data # Assuming event.data holds signal details
-            self.logger.debug(f"Processing signal event: {signal_data}")
-
-            # Check risk limits before creating order
-            if self.risk_manager.check_signal(signal_data): # Pass signal data directly
-                # Convert signal to order via OrderManager
-                order_event = self.order_manager.create_order_from_signal(signal_data) # Pass signal data
-                if order_event:
-                    # Publish the new OrderEvent for the ExecutionHandler to pick up
-                    self.event_manager.publish(order_event)
-                    self.logger.info(f"Signal converted to OrderEvent: {order_event.data.order_id}")
-                else:
-                     self.logger.warning(f"Signal could not be converted to order: {signal_data}")
-            else:
-                self.logger.info(f"Signal rejected by risk manager: {signal_data}")
-
-        except Exception as e:
-            self.logger.error(f"Error processing signal event from strategy {getattr(event, 'strategy_id', 'N/A')}: {e}", exc_info=True)
-
+    
     def _on_fill_event(self, event: FillEvent):
         """
         Handle fill events to update order status in local cache.
@@ -547,20 +477,19 @@ class TradingEngine:
             event: Fill event
         """
         try:
-            if not isinstance(event, FillEvent) or not hasattr(event, 'data'):
+            if not isinstance(event, FillEvent):
                 self.logger.warning(f"Invalid FillEvent received: {event}")
                 return
-
-            fill_data = event.data
-            self.logger.debug(f"Processing fill event for order cache: {fill_data}")
+                       
+            self.logger.debug(f"Processing fill event: {event}")
 
             # Update local order status cache if applicable
-            order_id = getattr(fill_data, 'order_id', None)
+            order_id = event.order_id
             if order_id and order_id in self.orders:
                 order = self.orders[order_id]
                 order.status = OrderStatus.FILLED 
-                order.executed_quantity = getattr(fill_data, 'quantity', order.quantity)
-                order.average_price = getattr(fill_data, 'price', order.average_price)
+                order.executed_quantity = event.quantity
+                order.average_price = event.price
 
         except Exception as e:
             self.logger.error(f"Error updating order cache for fill {getattr(event.data, 'order_id', 'N/A')}: {e}", exc_info=True)
@@ -582,7 +511,7 @@ class TradingEngine:
     def _on_system_event(self, event: SystemEvent):
         """Handle system events."""
         if event.event_type == EventType.SYSTEM:
-             self.logger.info(f"Processing system event: {getattr(event, 'system_event_type', 'N/A')} - {getattr(event, 'message', '')}")
+             self.logger.info(f"Processing system event: {getattr(event, 'system_action', 'N/A')} - {getattr(event, 'message', '')}")
              # Add specific handling if needed (e.g., reconfigure on settings change)
 
     def _run_engine(self):
@@ -648,14 +577,14 @@ class TradingEngine:
         """
         # Create system event
         event_data = {
-            'system_event_type': action,
+            'system_action': action,
             'message': f"System {action}",
             'severity': 'INFO',
-            'data': additional_data or {}
+            'metadata': additional_data or {}
         }
         
         # Add mode information if available in config
-        event_data['data']['mode'] = self.config.get('system', {}).get('mode', 'unknown')
+        event_data['metadata']['mode'] = self.config.get('system', {}).get('mode', 'unknown')
         
         # Create the event
         event = SystemEvent(
@@ -816,11 +745,15 @@ class TradingEngine:
             self.risk_manager.stop()
             
         if hasattr(self.portfolio, 'stop'): # If portfolio needs explicit stopping
-            self.portfolio.stop()
+            self.portfolio.stop()        
 
         # Stop ExecutionHandler (if it has a stop method)
         if hasattr(self.execution_handler, 'stop'):
             self.execution_handler.stop()
+
+        # Stop order manager thread
+        if hasattr(self.order_manager, 'stop'):
+            self.order_manager.stop()    
 
         # Stop PaperTradingSimulator (if applicable and has stop method)
         if self.paper_trading_simulator and hasattr(self.paper_trading_simulator, 'stop'):
@@ -938,6 +871,7 @@ class TradingEngine:
             return False
 
         
+        # TODO
         # again nothing for now, revisit this later
         return True
     
@@ -1040,13 +974,3 @@ class TradingEngine:
         return {
             "event_queue_size": self.event_manager.get_queue_size() if hasattr(self.event_manager, 'get_queue_size') else -1
         }
-
-    # Methods related to specific managers (like OptionManager) might be better accessed
-    # directly via the manager instance (e.g., engine.option_manager.get_option_chain(...))
-    # instead of adding pass-through methods here, unless there's a strong architectural reason.
-
-    # Example direct access:
-    # engine.option_manager.get_option_chain('NIFTY')
-    # engine.option_manager.get_atm_strike('NIFTY')
-    # engine.strategy_manager.get_strategy('my_strategy_id')
-    # engine.strategy_manager.get_strategy_status('my_strategy_id')

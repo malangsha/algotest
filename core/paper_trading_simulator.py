@@ -17,6 +17,7 @@ from models.trade import Trade as ModelTrade # Assuming Trade class is in models
 from brokers.broker_interface import BrokerInterface # FinvasiaBroker implements this
 from utils.constants import MarketDataType, OrderSide, InstrumentType
 from utils.config_loader import get_config_value # For initial capital
+from core.logging_manager import get_logger
 
 class PaperTradingSimulator:
     """
@@ -34,7 +35,7 @@ class PaperTradingSimulator:
             config: The main application configuration.
             excel_filename: Name of the Excel file for monitoring.
         """
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger(__name__)
         self.event_manager = event_manager
         self.broker_interface = broker_interface
         self.config = config
@@ -185,7 +186,7 @@ class PaperTradingSimulator:
                 elif order_side_upper == OrderSide.SELL.value and bid_price is not None and order.price is not None and bid_price >= order.price:
                     fill_price = max(bid_price, order.price) # Fill at bid or limit, whichever is better for seller (higher)
                     should_fill = True
-            elif order.order_type == OrderType.STOP:
+            elif order.order_type == OrderType.SL:
                 if order.stop_price is None: continue
                 if order_side_upper == OrderSide.BUY.value and last_price >= order.stop_price:
                     fill_price = ask_price # Market order once triggered
@@ -193,7 +194,7 @@ class PaperTradingSimulator:
                 elif order_side_upper == OrderSide.SELL.value and last_price <= order.stop_price:
                     fill_price = bid_price # Market order once triggered
                     should_fill = True
-            elif order.order_type == OrderType.STOP_LIMIT:
+            elif order.order_type == OrderType.SL_M:
                 if order.stop_price is None or order.price is None: continue
                 if order_side_upper == OrderSide.BUY.value:
                     if last_price >= order.stop_price and ask_price is not None and ask_price <= order.price:

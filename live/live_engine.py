@@ -4,15 +4,17 @@ import threading
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
-from core.engine import TradingEngine
-from models.events import MarketDataEvent, OrderEvent, TradeEvent, EventType
-from utils.exceptions import LiveTradingException
 from live.market_data_feeds import MarketDataFeed
 from models.instrument import Instrument
-from utils.constants import MarketDataType, InstrumentType
 from models.market_data import MarketData
 from models.market_data import Quote
+from models.events import MarketDataEvent, OrderEvent, TradeEvent, EventType
 from utils.config_loader import ConfigLoader
+from utils.exceptions import LiveTradingException
+from utils.constants import MarketDataType, InstrumentType
+from core.engine import TradingEngine
+from core.session_manager_factory import SessionManagerFactory
+from utils.constants import MODES
 from core.logging_manager import get_logger
 
 class LiveEngine(TradingEngine):
@@ -20,7 +22,6 @@ class LiveEngine(TradingEngine):
     Live trading engine implementation that orchestrates the entire trading process
     in a real-time production environment.
     """
-
     def __init__(self, config: Dict[str, Any], strategy_config: Dict[str, Any] = None):
         """
         Initialize the LiveEngine with configuration.
@@ -95,13 +96,46 @@ class LiveEngine(TradingEngine):
         market_data_config = self.config.get('market_data', {})
         feed_type = market_data_config.get('live_feed_type', 'simulated')  # Default to simulated if not specified
 
-        self.logger.info(f"Using market data feed type: {feed_type}")
+        self.logger.info(f"Using market data feed type: {feed_type}")        
 
         # Get feed-specific settings
         feed_settings = market_data_config.get('feed_settings', {}).get(feed_type, {})
 
+        # Check if session manager should be used
+        session_manager = None
+        broker_type = None
+
+        # Get active broker connection details
+        broker_connections = self.config.get('broker_connections', {})
+        self.logger.info(f"Broker connections: {broker_connections}")
+        active_connection_name = broker_connections.get('active_connection')
+        self.logger.info(f"Active connection name: {active_connection_name}")
+        
+
+        if active_connection_name:
+            for connection in broker_connections.get('connections', []):
+                if connection.get('connection_name') == active_connection_name:
+                    broker_type = connection.get('broker_type', '').lower()
+                    break
+        
+        self.logger.info(f"feed_type: {feed_type}")
+
+        # Check if broker and feed are compatible for session sharing
+        if broker_type and 'finvasia' in feed_type.lower() and broker_type.lower() == 'finvasia':
+            # Check if session manager is enabled
+            if broker_connections.get('session_manager', {}).get('enabled', False):
+                # Get session manager from factory
+                session_manager_factory = SessionManagerFactory.get_instance()
+                if session_manager_factory:
+                    session_manager = session_manager_factory.get_session_manager(broker_type)
+                    if session_manager:
+                        self.logger.info(f"Using shared session manager for market data feed: {feed_type}")
+                        # Add session_manager to feed_settings
+                        feed_settings['session_manager'] = session_manager                        
+        
+        
         # Merge broker API settings if needed
-        if self.broker:
+        if self.broker and broker_type != MODES.SIMULATED.value:
             feed_settings.update({
                 'user_id': self.broker.user_id,
                 'password': self.broker.password,
@@ -111,6 +145,8 @@ class LiveEngine(TradingEngine):
                 'api_url': self.broker.api_url,
                 'websocket_url': self.broker.ws_url
             })
+
+        self.logger.info(f"feed_settings: {feed_settings}")
 
         # Create the market data feed
         data_feed = MarketDataFeed(
@@ -142,16 +178,7 @@ class LiveEngine(TradingEngine):
         )
 
     # override the _on_market_data method to update the metrics
-    def _on_market_data(self, event: MarketDataEvent):
-        """
-        Called when market data is received.
-        This is a callback entry point that can be used by the MarketDataFeed.
-
-        Args:
-            event: Market data event
-        """
-        # self.logger.debug(f"Received MarketDataEvent: {event}")
-        # Update last tick time
+    def _on_market_data(self, event: MarketDataEvent):        
         self.metrics["last_tick_time"] = datetime.now()
         self.metrics["tick_count"] += 1
 
@@ -159,23 +186,17 @@ class LiveEngine(TradingEngine):
         # self.logger.info(f"forwarding market data event to parent engine for futher processing")
         super()._on_market_data(event)
 
+    def _on_order_event(self, event: OrderEvent):
+        self.metrics["last_tick_time"] = datetime.now()
+        self.metrics["order_count"] += 1
+
+        # forward to the normal event processing mechanism
+        # self.logger.info(f"forwarding order event to parent engine for futher processing")
+        super()._on_order_event(event)
+
     def _on_trade_event(self, event: TradeEvent):
         """Handle trade events."""
-        self.logger.info(f"Trade executed: {event.trade.trade_id}, instrument: {event.trade.instrument.symbol}")
-
-        # Update position
-        if hasattr(self.position_manager, 'apply_fill'):
-            self.position_manager.apply_fill(event)
-
-        # Update portfolio
-        if hasattr(self.portfolio, 'update'):
-            self.portfolio.update()
-
-        # Notify strategy of fill
-        if hasattr(event, 'strategy_id') and event.strategy_id in self.strategies:
-            strategy = self.strategies[event.strategy_id]
-            if hasattr(strategy, 'on_fill'):
-                strategy.on_fill(event)
+        self.logger.info(f"Trade executed: {event.trade.trade_id}, instrument: {event.trade.instrument.symbol}")     
 
         # Track metrics
         self.metrics["execution_count"] += 1
@@ -250,8 +271,12 @@ class LiveEngine(TradingEngine):
         try:
             # Start market data feed first
             if self.market_data_feed:
-                self.market_data_feed.start()
-                self.logger.info("Market data feed started successfully")
+                if self.market_data_feed.start():
+                    self.logger.info("Market data feed started successfully")
+                else:
+                    self.logger.error("Failed to start market data feed")
+                    self.stop()
+                    return False
             else:
                 self.logger.error("Market data feed not initialized")
                 self.stop()

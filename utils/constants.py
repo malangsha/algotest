@@ -6,6 +6,7 @@ class MODES(Enum):
     LIVE = "live"
     WEB = "web"
     PAPER = "paper"
+    SIMULATED = "simulated"
 
 class OrderType(Enum):
     MARKET = "MARKET"
@@ -29,14 +30,26 @@ class SignalType(Enum):
     ALERT = "ALERT"
     BUY_CALL = "BUY_CALL"
     BUY_PUT = "BUY_PUT"
+    SELL_CALL = "SELL_CALL"
+    SELL_PUT = "SELL_PUT"
+    BUY = "BUY"
+    SELL = "SELL"
 
 class OrderStatus(Enum):
-    PENDING = "PENDING"
-    OPEN = "OPEN"
+    CREATED = "CREATED"
+    SUBMITTED = "SUBMITTED"
+    SUBMITTING = "SUBMITTING"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
+    FILLED = "FILLED"    
+    PENDING = "PENDING"
+    CANCELED = "CANCELED"
+    CANCELLED = "CANCELLED"  # Alternative spelling for backward compatibility
     REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    OPEN = "OPEN"
+    PENDING_CANCEL = "PENDING_CANCEL"
+    PENDING_REPLACE = "PENDING_REPLACE"
+    UNKNOWN = "UNKNOWN"
 
 class TimeInForce(Enum):
     DAY = "DAY"
@@ -126,6 +139,7 @@ class EventType(Enum):
     RISK_BREACH = "risk_breach"
     EXECUTION = "execution"
     BAR = "bar"
+    SIMULATED_ORDER_UPDATE = 'SIMULATED_ORDER_UPDATE'
    
  # New Event Types for specific timeframes
 class TimeframeEventType(Enum):
@@ -182,6 +196,17 @@ class EventPriority(Enum):
     HIGH = 0      # Critical system events, immediate execution required
     NORMAL = 1    # Regular market data and signals
     LOW = 2       # Background tasks, non-critical updates
+
+class EventSource(Enum):
+    EXECUTION_HANDLER = "EH"
+    MARKET_DATA_FEED = "MDF"
+    ORDER_MANAGER = "OM" 
+
+class BufferWindowState(Enum):
+    NOT_STARTED = "NOT_STARTED"
+    ACTIVE = "ACTIVE"
+    CLOSED = "CLOSED"
+    EXPIRED = "EXPIRED"
 
 # NSE/BSE specific constants
 NSE_INDICES = [

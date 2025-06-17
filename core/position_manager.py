@@ -7,6 +7,7 @@ from models.position import Position
 from models.events import MarketDataEvent, FillEvent, EventType, TradeEvent, PositionEvent
 from models.instrument import Instrument
 from utils.constants import MarketDataType
+from core.logging_manager import get_logger
 
 class PositionManager:
     """Manages positions for all instruments in the trading system"""
@@ -18,7 +19,7 @@ class PositionManager:
         Args:
             event_manager: Optional event manager to publish position events
         """
-        self.logger = logging.getLogger("core.position_manager")
+        self.logger = get_logger("core.position_manager")
         self.event_manager = event_manager
 
         # Dictionary of positions by instrument
@@ -54,10 +55,18 @@ class PositionManager:
 
     def _on_market_data_event(self, event):
         """Handle market data events from the event manager."""
+        if not isinstance(event, MarketDataEvent):
+            self.logger.warning(f"Invalid market data event type received: {type(event)}")
+            return
+        
         self.update_market_prices(event)
 
     def _on_fill_event(self, event):
         """Handle fill events from the event manager."""
+        if not isinstance(event, FillEvent):
+            self.logger.warning(f"Invalid fill event type received: {type(event)}")
+            return
+        
         self.apply_fill(event)
 
     def add_instrument(self, instrument: Instrument) -> None:
@@ -218,6 +227,7 @@ class PositionManager:
 
         # Get or create position
         if instrument not in self.positions:
+            self.logger.debug(f"Instrument: {instrument} not found in self.positions. Creating one.")
             self.positions[instrument] = Position(instrument=instrument)
 
         # Update position with fill
@@ -231,6 +241,8 @@ class PositionManager:
         if not hasattr(self.positions[instrument], 'last_price') or self.positions[instrument].last_price is None:
             self.positions[instrument].update_market_price(price)
             self.logger.debug(f"Setting initial last_price for {symbol} to fill price: {price}")
+
+        self.logger.debug(f"self.positions: {self.positions}") # for debug purpose
 
         # Now publish the position event with the updated data
         self._publish_position_event(instrument, symbol, strategy_id)
@@ -343,27 +355,48 @@ class PositionManager:
             else:
                 unrealized_pnl = 0
                 
-            # Use entry_price or average_price
+            # Get average price from position
             avg_price = 0
-            if hasattr(position, 'entry_price'):
+            if hasattr(position, 'avg_price') and position.avg_price is not None:
+                avg_price = position.avg_price
+            elif hasattr(position, 'entry_price') and position.entry_price is not None:
                 avg_price = position.entry_price
-            elif hasattr(position, 'average_price'):
-                avg_price = position.average_price
             
-            # Add details of the last closing trade if available
-            last_closed_trade = getattr(position, 'last_closed_trade_details', None)
-
+            # Get realized PnL
+            realized_pnl = 0
+            if hasattr(position, 'realized_pnl'):
+                realized_pnl = position.realized_pnl
+                
+            # Calculate position value
+            position_value = None
+            if avg_price and position.quantity:
+                position_value = abs(position.quantity) * avg_price
+                
+            # Get last update time
+            last_update_time = None
+            if hasattr(position, 'last_update_time'):
+                last_update_time = position.last_update_time
+            
+            # Add any additional metadata (like closing trade details) to metadata dict
+            metadata = {}
+            if hasattr(position, 'last_closed_trade_details') and position.last_closed_trade_details:
+                metadata['closing_trade_details'] = position.last_closed_trade_details
+    
+            # Create PositionEvent with correct parameters
             position_event = PositionEvent(
                 event_type=EventType.POSITION,
                 timestamp=int(time.time() * 1000),
+                instrument=instrument,  # Pass the instrument object
                 symbol=symbol,
                 exchange=exchange,
                 quantity=position.quantity,
-                average_price=avg_price,
-                realized_pnl=position.realized_pnl if hasattr(position, 'realized_pnl') else 0,
+                avg_price=avg_price,  # Use avg_price instead of entry_price
+                realized_pnl=realized_pnl,
                 unrealized_pnl=unrealized_pnl,
-                strategy_id=strategy_id,               
-                closing_trade_details=last_closed_trade
+                position_value=position_value,
+                last_update_time=last_update_time,
+                strategy_id=strategy_id,
+                metadata=metadata  # Include any additional data in metadata
             )
             
             self.event_manager.publish(position_event)
@@ -372,6 +405,7 @@ class PositionManager:
             self.logger.error(f"Error publishing position event: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
+    
 
     def get_position(self, instrument_or_symbol) -> Optional[Position]:
         """

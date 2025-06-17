@@ -78,16 +78,10 @@ class DataManager:
         
         # In-memory caches for performance
         self.tick_cache = {}  # Symbol -> Recent ticks (circular buffer)
-        self.tick_cache_size = 1000  # Maximum ticks to cache per symbol
-
-        # Separate storage for 1-minute data for efficient persistence
-        self.one_minute_data = {}  # Symbol -> DataFrame of 1-minute bars with Greeks and OI       
+        self.tick_cache_size = 1000  # Maximum ticks to cache per symbol        
              
         # Initialize storage
-        self.one_minute_data = {}  # Symbol -> DataFrame
-        self.last_tick_data = {}  # Symbol -> Dict
-        self.data_locks = {}  # Symbol -> Lock
-        self.global_lock = threading.RLock()
+        self.one_minute_data = {}  # Symbol -> DataFrame      
         
         # --- Threading & Concurrency ---
         self.data_locks: Dict[str, threading.RLock] = defaultdict(threading.RLock)
@@ -99,8 +93,11 @@ class DataManager:
         
         # Store instrument objects for easy lookup
         self.instruments: Dict[str, Instrument] = {} # symbol_key -> Instrument
+        
         # Store the *converted* tick data (using MarketDataType keys)
         self.last_tick_data: Dict[str, Dict[str, Any]] = {} # symbol_key -> latest converted tick dict
+        self.last_validated_price: Dict[str, float] = {}  # Just validated prices
+
         # Store last cumulative volume for calculating tick volume from feeds like Finvasia
         self.last_cumulative_volume: Dict[str, int] = {} # symbol_key -> last value of cumulative volume field
         
@@ -328,7 +325,6 @@ class DataManager:
                 # Log the full exception details with traceback
                 self.logger.error(f"Error processing symbol events batch future: {str(e)}", exc_info=True)
 
-    
     def _process_symbol_events(self, symbol_key: str, events: List[MarketDataEvent]):
         """Processes all events for a single symbol sequentially."""
         with self.data_locks[symbol_key]: # Lock specific to this symbol
@@ -354,9 +350,15 @@ class DataManager:
                 return
 
             converted_tick_data = event.data
-            
-            # Store the converted tick data
             self.last_tick_data[symbol_key] = converted_tick_data
+
+            # Extract and store validated price separately
+            validated_price = self.timeframe_manager.extract_and_validate_price(symbol_key, converted_tick_data)
+            if validated_price is not None:
+                self.last_validated_price[symbol_key] = validated_price
+                # self.logger.debug(f"Stored validated price {validated_price} for {symbol_key}")
+            else:
+                self.logger.debug(f"No valid price extracted for {symbol_key}")
 
             # --- Calculate Tick Volume from Cumulative (if applicable) ---
             # The feed handler (_convert_tick_to_market_data) puts cumulative volume
@@ -801,20 +803,24 @@ class DataManager:
 
     # --- Data Retrieval ---
     def get_historical_data(self, symbol: str, timeframe: str, n_bars: Optional[int] = None, 
-                            start_time: Optional[Union[datetime, int]] = None, 
-                            end_time: Optional[Union[datetime, int]] = None) -> Optional[pd.DataFrame]:
+                        start_time: Optional[Union[datetime, int]] = None, 
+                        end_time: Optional[Union[datetime, int]] = None) -> Optional[pd.DataFrame]:
         """Fetches historical bar data, prioritizing TimeframeManager's cache, then persistence."""
         symbol_key = symbol # Assuming symbol is already the key, or convert if it's just symbol name
         # If symbol is not a key, need a lookup: inst = self.find_instrument(symbol); symbol_key = self._get_symbol_key(inst)
         
         self.logger.debug(f"Fetching historical data for {symbol_key}@{timeframe}. n_bars={n_bars}, start={start_time}, end={end_time}")
-
+    
         # 1. Try TimeframeManager's in-memory cache first
-        df = self.timeframe_manager.get_bars(symbol_key, timeframe, n_bars, start_time, end_time)
+        # df = self.timeframe_manager.get_bars(symbol_key, timeframe, n_bars, start_time, end_time)
+        df = self.timeframe_manager.get_bars(symbol_key, timeframe, n_bars)
         if df is not None and not df.empty:
             self.logger.info(f"Retrieved {len(df)} bars for {symbol_key}@{timeframe} from TimeframeManager cache.")
-            return df.copy() # Return a copy
-
+            df_copy = df.copy()
+            if 'timestamp' not in df_copy.columns:
+                df_copy['timestamp'] = df_copy.index.astype(np.int64) // 10**9
+            return df_copy
+    
         # 2. If persistence is enabled and not found in TFM, try loading from disk
         if self.persistence_enabled:
             self.logger.debug(f"No/insufficient data in TFM cache for {symbol_key}@{timeframe}. Trying persistence.")
@@ -830,7 +836,7 @@ class DataManager:
                 exchange = parts[0] if len(parts) > 1 else 'UNKNOWN_EX'
                 pure_symbol = parts[1] if len(parts) > 1 else symbol_key
                 safe_symbol = "".join(c if c.isalnum() else "_" for c in pure_symbol)
-
+    
                 # Determine date range to scan (this is complex)
                 # If start_time and end_time are given, iterate through those dates.
                 # If n_bars, try to go back from today.
@@ -842,28 +848,170 @@ class DataManager:
                 
                 if os.path.exists(file_path):
                     loaded_df = pd.read_parquet(file_path)
-                    if 'timestamp' not in loaded_df.index.names:
-                        loaded_df = loaded_df.set_index('timestamp', drop=False) # Ensure timestamp is index or column
+                    
+                    # Debug: Log the actual column names to understand the data structure
+                    self.logger.debug(f"Loaded DataFrame columns: {list(loaded_df.columns)}")
+                    self.logger.debug(f"DataFrame index: {loaded_df.index.names}")
+                    
+                    # Handle timestamp_hhmm index format specific to your data
+                    if loaded_df.index.name == 'timestamp_hhmm':
+                        # Convert HHMM format to full datetime timestamps
+                        try:
+                            # Get the date from the file path (target_date_str is in YYYY-MM-DD format)
+                            file_date = datetime.strptime(target_date_str, '%Y-%m-%d').date()
+                            
+                            # Convert HHMM index to full datetime timestamps
+                            timestamps = []
+                            # Import timezone handling
+                            import pytz
+                            ist = pytz.timezone('Asia/Kolkata')
+                            
+                            for hhmm in loaded_df.index:
+                                try:
+                                    # Debug: log what we're trying to parse
+                                    self.logger.debug(f"Parsing time value: '{hhmm}' (type: {type(hhmm)})")
+                                    
+                                    # Parse HHMM format (e.g., "09:19" -> 9:19)
+                                    # Handle both string and already parsed formats
+                                    if isinstance(hhmm, str):
+                                        if ':' in hhmm:
+                                            # Format like "09:19"
+                                            time_parts = hhmm.split(':')
+                                            hour = int(time_parts[0])
+                                            minute = int(time_parts[1])
+                                        else:
+                                            # Handle HHMM without colon (e.g., "0919" -> 09:19)
+                                            if len(hhmm) == 4 and hhmm.isdigit():
+                                                hour = int(hhmm[:2])
+                                                minute = int(hhmm[2:])
+                                            else:
+                                                self.logger.warning(f"Unexpected time format: '{hhmm}'")
+                                                continue
+                                    else:
+                                        # If it's already a time object or other format
+                                        hhmm_str = str(hhmm)
+                                        if ':' in hhmm_str:
+                                            time_parts = hhmm_str.split(':')
+                                            hour = int(time_parts[0])
+                                            minute = int(time_parts[1])
+                                        else:
+                                            self.logger.warning(f"Could not parse time format: '{hhmm}' (type: {type(hhmm)})")
+                                            continue
+                                        
+                                    # Validate hour and minute ranges
+                                    if not (0 <= hour <= 23):
+                                        self.logger.warning(f"Invalid hour {hour} for time '{hhmm}'")
+                                        continue
+                                    if not (0 <= minute <= 59):
+                                        self.logger.warning(f"Invalid minute {minute} for time '{hhmm}'")
+                                        continue
+                                    
+                                    # Create time object
+                                    from datetime import time
+                                    time_obj = time(hour, minute)
+                                    
+                                    # Combine with date to create full datetime
+                                    full_datetime = datetime.combine(file_date, time_obj)
+                                    
+                                    # Add IST timezone
+                                    full_datetime_ist = ist.localize(full_datetime)
+                                    
+                                    # Convert to timestamp (seconds since epoch)
+                                    timestamp_val = int(full_datetime_ist.timestamp())
+                                    
+                                    # Debug: verify the timestamp by converting back
+                                    verify_dt = datetime.fromtimestamp(timestamp_val, tz=ist)
+                                    self.logger.debug(f"'{hhmm}' -> {full_datetime_ist} -> {timestamp_val} -> verify: {verify_dt}")
+                                    
+                                    # Sanity check: ensure the hour matches what we expect
+                                    if verify_dt.hour != hour:
+                                        self.logger.error(f"Timestamp conversion error: expected hour {hour}, got {verify_dt.hour}")
+                                        continue
+                                    
+                                    timestamps.append(timestamp_val)
+                                    
+                                except ValueError as ve:
+                                    self.logger.warning(f"Could not parse time '{hhmm}': {ve}")
+                                    continue
+                                except Exception as e:
+                                    self.logger.error(f"Unexpected error parsing time '{hhmm}': {e}")
+                                    continue
+                                
+                            if timestamps:
+                                # Create new index with timestamps
+                                loaded_df.index = pd.to_datetime(timestamps, unit='s')
+                                # Also add timestamp as a column for compatibility
+                                loaded_df['timestamp'] = timestamps
+                                self.logger.debug(f"Converted {len(timestamps)} HHMM entries to timestamps for {symbol_key}")
+                            else:
+                                self.logger.warning(f"No valid timestamps could be created from HHMM data in {file_path}")
+                                return None
+                                
+                        except Exception as conv_error:
+                            self.logger.error(f"Error converting timestamp_hhmm to timestamps: {conv_error}")
+                            return None
+                            
+                    else:
+                        # Handle other timestamp column scenarios (fallback for different data formats)
+                        timestamp_col = None
+                        
+                        # Check for common timestamp column names
+                        possible_timestamp_cols = ['timestamp', 'time', 'datetime', 'ts', 'date']
+                        for col in possible_timestamp_cols:
+                            if col in loaded_df.columns:
+                                timestamp_col = col
+                                break
+                            
+                        # If timestamp is already in index
+                        if 'timestamp' in loaded_df.index.names or loaded_df.index.name == 'timestamp':
+                            # Timestamp is already the index
+                            pass
+                        elif timestamp_col:
+                            # Set the found timestamp column as index
+                            loaded_df = loaded_df.set_index(timestamp_col, drop=False)
+                        else:
+                            # If no timestamp column found, check if index is datetime-like
+                            if pd.api.types.is_datetime64_any_dtype(loaded_df.index):
+                                # Index is already datetime, assume it's timestamp
+                                loaded_df.index.name = 'timestamp'
+                                # Convert datetime index to timestamp (seconds since epoch)
+                                loaded_df['timestamp'] = loaded_df.index.astype('int64') // 10**9
+                            else:
+                                # Last resort: check if any column is datetime-like
+                                datetime_cols = [col for col in loaded_df.columns 
+                                               if pd.api.types.is_datetime64_any_dtype(loaded_df[col])]
+                                if datetime_cols:
+                                    timestamp_col = datetime_cols[0]
+                                    loaded_df = loaded_df.set_index(timestamp_col, drop=False)
+                                else:
+                                    self.logger.warning(f"No timestamp column found in {file_path}. Available columns: {list(loaded_df.columns)}")
+                                    return None  # Return None if no timestamp column found
                     
                     # Filter by start/end time if provided
                     if start_time: 
                         start_ts = start_time.timestamp() if isinstance(start_time, datetime) else int(start_time)
-                        loaded_df = loaded_df[loaded_df.index >= start_ts]
+                        loaded_df = loaded_df[loaded_df.index >= pd.to_datetime(start_ts, unit='s')]
                     if end_time:
                         end_ts = end_time.timestamp() if isinstance(end_time, datetime) else int(end_time)
-                        loaded_df = loaded_df[loaded_df.index <= end_ts]
+                        loaded_df = loaded_df[loaded_df.index <= pd.to_datetime(end_ts, unit='s')]
                     
                     if n_bars and not start_time : # if only n_bars is given, take last n_bars
                         loaded_df = loaded_df.tail(n_bars)
-
+    
                     if not loaded_df.empty:
                         self.logger.info(f"Loaded {len(loaded_df)} bars for {symbol_key}@{timeframe} from persistence file {file_path}")
                         # Optionally, warm up TimeframeManager with this data
                         # self.timeframe_manager.warmup_bars(symbol_key, timeframe, loaded_df)
-                        return loaded_df.copy()
+                        df_copy = loaded_df.copy()
+                        if 'timestamp' not in df_copy.columns:
+                            df_copy['timestamp'] = df_copy.index.astype(np.int64) // 10**9
+                        return df_copy
+                    else:
+                        self.logger.warning(f"DataFrame is empty after filtering for {symbol_key}@{timeframe}")
+                        
             except Exception as e:
                 self.logger.error(f"Error loading historical data for {symbol_key}@{timeframe} from persistence: {e}", exc_info=True)
-
+    
         self.logger.warning(f"No historical data found for {symbol_key}@{timeframe} after checking cache and persistence.")
         return None
 
@@ -871,9 +1019,35 @@ class DataManager:
         """Gets the currently forming bar from TimeframeManager."""
         return self.timeframe_manager.get_current_bar(symbol_key, timeframe)
 
+    def get_latest_validated_price(self, symbol_key: str) -> Optional[float]:
+        """Gets the most recent validated price for the symbol."""
+        price = self.last_validated_price.get(symbol_key)
+        self.logger.debug(f"Latest validated price for {symbol_key!r}: {price}")
+        return price
+
     def get_latest_tick(self, symbol_key: str) -> Optional[Dict[str, Any]]:
-         """Gets the most recent *converted* tick data stored."""
-         return self.last_tick_data.get(symbol_key)
+        """Gets the most recent *converted* tick data stored."""
+        last_tick = self.last_tick_data.get(symbol_key)
+        # log what we're about to return
+        self.logger.debug(f"Latest tick for {symbol_key!r}: {last_tick!r}")
+        return last_tick
+    
+    def get_latest_tick_with_validated_price(self, symbol_key: str) -> Optional[Dict[str, Any]]:
+        """
+        Gets the latest tick data enriched with validated price.
+        Returns None if no tick data exists.
+        """
+        last_tick = self.last_tick_data.get(symbol_key)
+        if not last_tick:
+            return None
+
+        # Add validated price if available
+        validated_price = self.last_validated_price.get(symbol_key)
+        enriched_tick = last_tick.copy()
+        enriched_tick['validated_price'] = validated_price
+
+        self.logger.debug(f"Latest tick with validated price for {symbol_key}: validated_price={validated_price}")
+        return enriched_tick   
     
     def _handle_system_event(self, event: Event):
         self.logger.debug(f"DataManager received system event: {event}")
@@ -1847,3 +2021,4 @@ if __name__ == '__main__':
     print(f"NIFTY INDEX in active_subscriptions: {'NSE:NIFTY INDEX' in dm.active_subscriptions}") # Should be False
 
     dm.shutdown()
+

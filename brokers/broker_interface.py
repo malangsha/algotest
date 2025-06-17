@@ -94,7 +94,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def get_orders(self, instrument: Optional[Instrument] = None) -> List[Order]:
         """
         Get all active orders, optionally filtered by instrument.
@@ -130,7 +130,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def get_market_data(self,
                        instrument: Instrument,
                        data_type: str,
@@ -152,7 +152,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def subscribe_market_data(self,
                              instrument: Instrument,
                              data_type: str,
@@ -170,7 +170,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def unsubscribe_market_data(self, subscription_id: str) -> bool:
         """
         Unsubscribe from market data updates.
@@ -183,7 +183,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def get_trading_hours(self, instrument: Instrument) -> Dict[str, datetime]:
         """
         Get trading hours for an instrument.
@@ -196,7 +196,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def get_instrument_details(self, instrument: Instrument) -> Dict[str, Any]:
         """
         Get detailed information about an instrument.
@@ -209,7 +209,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def get_account_positions_summary(self) -> Dict[str, Any]:
         """
         Get summary of account positions, P&L, margin requirements, etc.
@@ -219,7 +219,7 @@ class BrokerInterface(ABC):
         """
         pass
 
-    @abstractmethod
+    # @abstractmethod
     def get_execution_history(self,
                             start_time: Optional[datetime] = None,
                             end_time: Optional[datetime] = None,

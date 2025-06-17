@@ -8,10 +8,11 @@ from datetime import datetime
 
 from models.position import Position
 from models.instrument import Instrument
-from models.events import Event, EventType, PositionEvent, AccountEvent
+from models.events import Event, EventType, PositionEvent, AccountEvent, FillEvent
 from utils.exceptions import PortfolioError
 from utils.constants import OrderSide
 from core.position_manager import PositionManager
+from core.logging_manager import get_logger
 
 class Portfolio:
     """
@@ -27,7 +28,7 @@ class Portfolio:
             position_manager: Position manager instance
             event_manager: Event manager instance
         """
-        self.logger = logging.getLogger(__name__)
+        self.logger = get_logger(__name__)
         self.config = config
         self.position_manager = position_manager
         self.event_manager = event_manager
@@ -54,6 +55,9 @@ class Portfolio:
         self.max_position_size = portfolio_config.get("max_position_size", 0.1)
         self.max_position_value = portfolio_config.get("max_position_value", self.initial_capital * 0.1)
         
+        # Initialize instruments dictionary
+        self.instruments = {}
+        
         # Register with event manager if available
         if self.event_manager:
             self._register_event_handlers()
@@ -76,7 +80,7 @@ class Portfolio:
         
         self.logger.info("Registered with Event Manager")
     
-    def _on_position_event(self, event: Event):
+    def _on_position_event(self, event: PositionEvent):
         """
         Handle position events from the event manager.
         Updates portfolio state based on position changes.
@@ -84,18 +88,17 @@ class Portfolio:
         Args:
             event: Position event
         """
+        self.logger.debug(f"Processing position event: {event}")
         if not isinstance(event, PositionEvent) and not hasattr(event, 'symbol'):
             return
             
-        self.logger.debug(f"Processing position event: {event}")
-        
         # Update portfolio value based on position events
         self._recalculate_portfolio_value()
         
         # Publish account update to reflect position changes
         self._publish_account_event()
     
-    def _on_fill_event(self, event: Event):
+    def _on_fill_event(self, event: FillEvent):
         """
         Handle fill events from the event manager.
         Updates cash and calculates transaction costs.
@@ -103,11 +106,16 @@ class Portfolio:
         Args:
             event: Fill event
         """
-        if not hasattr(event, 'symbol') or not hasattr(event, 'quantity') or not hasattr(event, 'price'):
-            return
-            
         self.logger.debug(f"Processing fill event: {event}")
+
+        if not isinstance(event, FillEvent):
+            self.logger.warning(f"Invalid fill event type received: {type(event)}")
+            return
         
+        if not hasattr(event, 'symbol') or not hasattr(event, 'quantity') or not hasattr(event, 'price'):
+            self.logger.warning(f"Fill event missing required fields: {event}")
+            return
+      
         quantity = getattr(event, 'quantity', 0)
         price = getattr(event, 'price', 0)
         side = getattr(event, 'side', None)
@@ -144,7 +152,14 @@ class Portfolio:
         
         # Get all positions from position manager if available
         if self.position_manager:
-            for symbol, position in self.position_manager.get_all_positions().items():
+            all_positions = self.position_manager.get_all_positions()
+            # Handle both dict and list return types
+            if isinstance(all_positions, dict):
+                positions_list = list(all_positions.values())
+            else:
+                positions_list = all_positions
+                
+            for position in positions_list:
                 if position.quantity != 0 and hasattr(position, 'last_price') and position.last_price is not None and position.last_price > 0:
                     self.positions_value += position.quantity * position.last_price
         
@@ -250,6 +265,9 @@ class Portfolio:
             
         position = self.position_manager.get_position(symbol)
         if not position or not hasattr(position, 'quantity') or not hasattr(position, 'last_price'):
+            return 0.0
+            
+        if position.last_price is None:
             return 0.0
             
         return position.quantity * position.last_price
@@ -361,12 +379,14 @@ class Portfolio:
 
     def add_instrument(self, instrument: Instrument) -> None:
         """Add an instrument to the portfolio"""
-        if instrument.id in self.instruments:
-            self.logger.warning(f"Instrument {instrument.id} already exists in portfolio")
+        instrument_id = getattr(instrument, 'instrument_id', getattr(instrument, 'symbol', str(instrument)))
+        
+        if instrument_id in self.instruments:
+            self.logger.warning(f"Instrument {instrument_id} already exists in portfolio")
             return
 
-        self.instruments[instrument.id] = instrument
-        self.logger.info(f"Added instrument to portfolio: {instrument.id} ({instrument.symbol})")
+        self.instruments[instrument_id] = instrument
+        self.logger.info(f"Added instrument to portfolio: {instrument_id} ({getattr(instrument, 'symbol', 'N/A')})")
 
     def remove_instrument(self, instrument_id: str) -> bool:
         """Remove an instrument from the portfolio"""
@@ -375,7 +395,7 @@ class Portfolio:
             return False
 
         # Check if there are any open positions for this instrument
-        open_positions = self.position_manager.get_open_positions()
+        open_positions = self.get_open_positions()
         for position in open_positions:
             if position.instrument_id == instrument_id:
                 self.logger.error(f"Cannot remove instrument {instrument_id} with open positions")
@@ -391,18 +411,42 @@ class Portfolio:
 
     def get_position(self, position_id: str) -> Optional[Position]:
         """Get a position by its ID"""
+        if not self.position_manager:
+            return None
         return self.position_manager.get_position(position_id)
 
     def get_positions_by_strategy(self, strategy_id: str) -> List[Position]:
         """Get all positions for a given strategy"""
-        return self.position_manager.get_positions_by_strategy(strategy_id)
+        if not self.position_manager:
+            return []
+            
+        all_positions = self.position_manager.get_all_positions()
+        # Handle both dict and list return types
+        if isinstance(all_positions, dict):
+            positions_list = list(all_positions.values())
+        else:
+            positions_list = all_positions
+            
+        return [pos for pos in positions_list if hasattr(pos, 'strategy_id') and pos.strategy_id == strategy_id]
 
     def get_positions_by_instrument(self, instrument_id: str) -> List[Position]:
         """Get all positions for a given instrument"""
-        return self.position_manager.get_positions_by_instrument(instrument_id)
+        if not self.position_manager:
+            return []
+            
+        all_positions = self.position_manager.get_all_positions()
+        # Handle both dict and list return types
+        if isinstance(all_positions, dict):
+            positions_list = list(all_positions.values())
+        else:
+            positions_list = all_positions
+            
+        return [pos for pos in positions_list if pos.instrument_id == instrument_id]
 
     def get_open_positions(self) -> List[Position]:
         """Get all open positions"""
+        if not self.position_manager:
+            return []
         return self.position_manager.get_open_positions()    
 
     def calculate_portfolio_value(self) -> float:
@@ -410,8 +454,9 @@ class Portfolio:
         open_positions = self.get_open_positions()
 
         open_positions_value = sum([
-            p.quantity * p.current_price
+            p.quantity * (p.last_price or 0)  # Use last_price instead of current_price
             for p in open_positions
+            if p.last_price is not None
         ])
 
         total_value = self.cash + open_positions_value
@@ -423,12 +468,20 @@ class Portfolio:
 
     def calculate_realized_pnl(self) -> float:
         """Calculate total realized profit and loss"""
+        if not self.position_manager:
+            return 0.0
+            
         all_positions = self.position_manager.get_all_positions()
+        # Handle both dict and list return types
+        if isinstance(all_positions, dict):
+            positions_list = list(all_positions.values())
+        else:
+            positions_list = all_positions
         
         return sum([
             p.realized_pnl
-            for p in all_positions
-            if hasattr(p, 'is_closed') and p.is_closed() and hasattr(p, 'realized_pnl') and p.realized_pnl is not None
+            for p in positions_list
+            if hasattr(p, 'realized_pnl') and p.realized_pnl is not None
         ])
 
     def calculate_unrealized_pnl(self) -> float:
@@ -436,9 +489,27 @@ class Portfolio:
         open_positions = self.get_open_positions()
 
         return sum([
-            p.calculate_pnl()
+            self._calculate_position_unrealized_pnl(p)
             for p in open_positions
         ])
+
+    def _calculate_position_unrealized_pnl(self, position: Position) -> float:
+        """Calculate unrealized PnL for a single position"""
+        if not hasattr(position, 'quantity') or not hasattr(position, 'average_price') or not hasattr(position, 'last_price'):
+            return 0.0
+            
+        if position.quantity == 0 or position.last_price is None or position.average_price == 0:
+            return 0.0
+            
+        # Check if position has unrealized_pnl method or property
+        if hasattr(position, 'unrealized_pnl'):
+            if callable(position.unrealized_pnl):
+                return position.unrealized_pnl()
+            else:
+                return position.unrealized_pnl
+        
+        # Calculate manually if no unrealized_pnl method/property
+        return position.quantity * (position.last_price - position.average_price)
 
     def get_portfolio_summary(self) -> Dict:
         """Get a summary of the portfolio"""
@@ -455,7 +526,7 @@ class Portfolio:
             "unrealized_pnl": unrealized_pnl,
             "total_pnl": realized_pnl + unrealized_pnl,
             "open_positions_count": len(self.get_open_positions()),
-            "total_positions_count": len(self.position_manager.get_all_positions()),
+            "total_positions_count": len(self.position_manager.get_all_positions()) if self.position_manager else 0,
             "last_updated": self.last_updated
         }
 
@@ -464,7 +535,6 @@ class Portfolio:
         self.calculate_portfolio_value()
         self.last_updated = datetime.now()
 
-    # Add this to the Portfolio class
     def save(self, filepath: str) -> None:
         """
         Save portfolio state to a file.
@@ -478,13 +548,16 @@ class Portfolio:
     
             # Get open positions
             open_positions = self.get_open_positions()
+            for position in open_positions.copy():
+                self.logger.debug(f"Position: {position}")
+                self.logger.debug(f"Position quantity: {position.quantity}")
+                self.logger.debug(f"Position average price: {position.average_price}")
+                self.logger.debug(f"Position last price: {position.last_price}")
+                self.logger.debug(f"Position market value: {position.quantity * (position.last_price or 0)}")
+                self.logger.debug(f"Position unrealized PnL: {self._calculate_position_unrealized_pnl(position)}")
             
-            # Calculate realized PnL without using position_manager.get_closed_positions()
-            realized_pnl = 0.0
-            all_positions = self.position_manager.get_all_positions()
-            for position in all_positions:
-                if hasattr(position, 'is_closed') and position.is_closed() and hasattr(position, 'realized_pnl'):
-                    realized_pnl += position.realized_pnl or 0.0
+            # Calculate realized PnL
+            realized_pnl = self.calculate_realized_pnl()
             
             # Prepare serializable data
             portfolio_data = {
@@ -493,10 +566,10 @@ class Portfolio:
                 'positions': {
                     position.instrument_id: {
                         'quantity': position.quantity,
-                        'average_price': position.entry_price,
-                        'market_price': position.current_price,
-                        'market_value': position.quantity * position.current_price,
-                        'unrealized_pnl': position.calculate_pnl()
+                        'average_price': position.average_price,  # Use average_price instead of entry_price
+                        'market_price': position.last_price,     # Use last_price instead of current_price
+                        'market_value': position.quantity * (position.last_price or 0),
+                        'unrealized_pnl': self._calculate_position_unrealized_pnl(position)
                     } for position in open_positions
                 },
                 'realized_pnl': realized_pnl,
@@ -511,19 +584,14 @@ class Portfolio:
     
         except Exception as e:
             self.logger.error(f"Error saving portfolio: {str(e)}")
-
-    def calculate_realized_pnl(self) -> float:
-        """Calculate total realized profit and loss"""
-        all_positions = self.position_manager.get_all_positions()
-        
-        return sum([
-            p.realized_pnl
-            for p in all_positions
-            if hasattr(p, 'is_closed') and p.is_closed() and hasattr(p, 'realized_pnl') and p.realized_pnl is not None
-        ])           
     
     @property
     def total_value(self):
         """Calculate total portfolio value (cash + positions)."""
-        positions_value = sum(pos.market_value for pos in self.get_open_positions()) if hasattr(self, 'positions') else 0
+        open_positions = self.get_open_positions()
+        positions_value = sum([
+            p.quantity * (p.last_price or 0)
+            for p in open_positions
+            if p.last_price is not None
+        ])
         return self.cash + positions_value

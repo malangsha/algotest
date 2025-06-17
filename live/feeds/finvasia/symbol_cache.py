@@ -62,8 +62,8 @@ TRACKED_INDICES = {
 # BSE Symbol data (for the index itself, derivatives are in BFO)
 BSE_SYMBOLS_DATA = [
     ["Exchange", "Token", "LotSize", "Symbol", "TradingSymbol", "Instrument", "TickSize"],
-    ["BSE", "1", "1", "SENSEX", "SENSEX", "UNDIND", "0.05"],
-    ["BSE", "12", "1", "BANKEX", "BANKEX", "UNDIND", "0.05"]
+    ["BSE", "1", "1", "SENSEX", "SENSEX", "UNDIND", "0.01"],
+    ["BSE", "12", "1", "BANKEX", "BANKEX", "UNDIND", "0.01"]
 ]
 
 @dataclass
@@ -971,18 +971,16 @@ class SymbolCache:
 
         # Use uppercase symbol for lookup (cache keys are stored as uppercase)
         cache_key = symbol.upper()
-        self.logger.debug(f"Looking up '{cache_key}' in '{exchange_upper}' cache")
+        # self.logger.debug(f"Looking up '{cache_key}' in '{exchange_upper}' cache")
 
         cached_info = exchange_cache.get(cache_key)
 
         if cached_info:
-            self.logger.debug(f"Found '{symbol}' on '{exchange_upper}' in local cache")
+            # self.logger.debug(f"Found '{symbol}' on '{exchange_upper}' in local cache")
             return cached_info.copy()  # Return a copy to prevent modification of cache
         else:
             self.logger.debug(f"'{symbol}' on '{exchange_upper}' not found in local cache")
             return None
-
-    # --- Expiry Date Interface Methods ---
 
     def get_all_expiry_dates(self, index_name: str) -> Dict[str, List[str]]:
         """
@@ -1027,7 +1025,6 @@ class SymbolCache:
             "monthly": valid_monthly
         }
 
-    # --- NEW METHOD: Get combined list of all expiry dates ---
     def get_combined_expiry_dates(self, index_name: str) -> List[str]:
         """
         Get a single sorted list of all stored expiry dates (weekly and monthly)
@@ -1051,9 +1048,7 @@ class SymbolCache:
         unique_sorted_list = sorted(list(set(combined_list)))
 
         return unique_sorted_list
-    # --- End New Method ---
-
-
+   
     def get_nearest_expiry(self, index_name: str, expiry_type: str = "weekly") -> Optional[str]:
         """
         Get the nearest upcoming expiry date for an index (on or after today)
@@ -1161,8 +1156,6 @@ class SymbolCache:
             return None
 
         return future_expiries[offset]
-
-    # --- UPDATE 2: Replace with user's construct_trading_symbol and add helper ---
 
     def format_expiry_for_symbol(self, expiry_date_str: str) -> Optional[str]:
         """

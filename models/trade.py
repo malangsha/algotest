@@ -15,7 +15,8 @@ class Trade:
         timestamp: Optional[datetime] = None,
         commission: float = 0.0,
         fees: float = 0.0,
-        strategy_id: Optional[str] = None
+        strategy_id: Optional[str] = None,
+        profit: float = 0.0
     ):
         self.trade_id = str(uuid.uuid4())
         self.order_id = order_id
@@ -27,6 +28,7 @@ class Trade:
         self.commission = commission
         self.fees = fees
         self.strategy_id = strategy_id
+        self.profit = profit
         
     def __str__(self):
         return (f"Trade(id={self.trade_id}, instrument={self.instrument_id}, "
@@ -56,5 +58,6 @@ class Trade:
             "fees": self.fees,
             "strategy_id": self.strategy_id,
             "value": self.value,
-            "total_cost": self.total_cost
+            "total_cost": self.total_cost,
+            "profile": self.profit
         }
